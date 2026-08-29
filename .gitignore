@@ -1,0 +1,9 @@
+# 二进制与本地数据
+*.exe
+*.db
+*.db-shm
+*.db-wal
+tmp-smoke/
+
+# 本地配置（含密钥）
+setting.json

@@ -1,0 +1,46 @@
+{
+    "port": "8091",
+    "http-timeout-seconds": 30,
+    "rate-limit": 120,
+    "ws-port": 8092,
+    "remote-config-url": "",
+    "remote-ignore-config": [],
+    "cors": "",
+    "trusted-proxies": "",
+    "api-base-url": {
+        "DualStack": [
+            {
+                "label": "中国 江苏 移动",
+                "id": "cn-jiangsu",
+                "url": "https://cn-jiangsu.api-ipw.wsmdn.top/",
+                "ws": false
+            }
+        ],
+        "IPv4": [],
+        "IPv6": []
+    },
+    "ip-location-api": [
+        {
+            "label": "中国 江苏 移动",
+            "id": "cn-jiangsu",
+            "url": "https://cn-jiangsu.api-ipw.wsmdn.top/"
+        }
+    ],
+    "api-keys": {},
+    "ws-keys": {},
+
+    "database": {
+        "driver": "sqlite",
+        "dsn": "boce.db",
+        "max-open-conns": 0,
+        "max-idle-conns": 0
+    },
+    "admin-token": "",
+    "data-retention-days": 30,
+    "stats-flush-seconds": 30,
+
+    "report-url": "",
+    "report-token": "",
+    "report-interval-seconds": 15,
+    "report-probes": true
+}
