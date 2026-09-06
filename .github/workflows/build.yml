@@ -1,11 +1,10 @@
-# ==================== 自动构建（build）====================
-# 触发：push 到 main / tag（v*）/ 手动 workflow_dispatch。
-# 作用：不部署、不改环境，仅把后端二进制 + 前端静态产物构建出来，
-#       分别上传为 GitHub Actions artifact（可下载核对或交 CI/CD 后续消费）。
+# ==================== 自动构建 + Release（build）====================
+# 触发：push 到 main（仅构建产 artifact）/ tag v*（构建 + 发 GitHub Release）/ 手动。
 # 说明：
-#   - 后端产物：Windows(ipw-boce.exe) 与 Linux(ipw-boce-linux-amd64)，带 VERSION/COMMIT/BUILD_TIME ldflags。
-#   - 前端产物：web/dist 整体压缩（后端不 embed，前端独立部署）。
-#   - VERSION 注入：tag push 取 tag 名；非 tag 取短 commit 作为 dev 版。
+#   - 仅构建后端；前端 web/dist 由原项目 lemon-ipw 的 frontend-ssr.yml 单独负责，这里不重复编译。
+#   - 目标架构对齐原项目（lemon-ipw build_and_release.yml 中 src/middleware-go 的跨平台矩阵）。
+#   - 产物带 VERSION/COMMIT/BUILD_TIME ldflags；tag 取 tag 名，非 tag 取短 commit 作 dev 版。
+#   - tag v* 时额外创建 GitHub Release（附全平台产物 + setting.json.example），对齐原项目形态。
 name: build
 
 on:
@@ -20,7 +19,7 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend (Go build + vet)
+    name: Backend (cross compile + release)
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: '0'
@@ -47,60 +46,88 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
-      - name: Build (windows/amd64)
+      - name: Build for Linux
         run: |
-          GOOS=windows GOARCH=amd64 go build \
-            -ldflags "-X main.VERSION=${{ steps.ver.outputs.version }} \
-                      -X main.COMMIT=$(git rev-parse --short HEAD) \
-                      -X main.BUILD_TIME=$(date -u +%FT%TZ)" \
-            -o ipw-boce.exe .
+          LDFLAGS="-X main.VERSION=${{ steps.ver.outputs.version }} \
+                   -X main.COMMIT=$(git rev-parse --short HEAD) \
+                   -X main.BUILD_TIME=$(date -u +%FT%TZ)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=386   go build -ldflags "$LDFLAGS" -o ipw-boce-linux-386
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o ipw-boce-linux-amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o ipw-boce-linux-arm64
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "$LDFLAGS" -o ipw-boce-linux-armv7
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 go build -ldflags "$LDFLAGS" -o ipw-boce-linux-armv6
+          CGO_ENABLED=0 GOOS=linux GOARCH=loong64 go build -ldflags "$LDFLAGS" -o ipw-boce-linux-loong64
 
-      - name: Build (linux/amd64)
+      - name: Build for Windows
         run: |
-          GOOS=linux GOARCH=amd64 go build \
-            -ldflags "-X main.VERSION=${{ steps.ver.outputs.version }} \
-                      -X main.COMMIT=$(git rev-parse --short HEAD) \
-                      -X main.BUILD_TIME=$(date -u +%FT%TZ)" \
-            -o ipw-boce-linux-amd64 .
+          LDFLAGS="-X main.VERSION=${{ steps.ver.outputs.version }} \
+                   -X main.COMMIT=$(git rev-parse --short HEAD) \
+                   -X main.BUILD_TIME=$(date -u +%FT%TZ)"
+          CGO_ENABLED=0 GOOS=windows GOARCH=386   go build -ldflags "$LDFLAGS" -o ipw-boce-windows-386.exe
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o ipw-boce-windows-amd64.exe
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o ipw-boce-windows-arm64.exe
+
+      - name: Build for macOS
+        run: |
+          LDFLAGS="-X main.VERSION=${{ steps.ver.outputs.version }} \
+                   -X main.COMMIT=$(git rev-parse --short HEAD) \
+                   -X main.BUILD_TIME=$(date -u +%FT%TZ)"
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o ipw-boce-darwin-amd64
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o ipw-boce-darwin-arm64
+
+      - name: Build for FreeBSD
+        run: |
+          LDFLAGS="-X main.VERSION=${{ steps.ver.outputs.version }} \
+                   -X main.COMMIT=$(git rev-parse --short HEAD) \
+                   -X main.BUILD_TIME=$(date -u +%FT%TZ)"
+          CGO_ENABLED=0 GOOS=freebsd GOARCH=386   go build -ldflags "$LDFLAGS" -o ipw-boce-freebsd-386
+          CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build -ldflags "$LDFLAGS" -o ipw-boce-freebsd-amd64
+          CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build -ldflags "$LDFLAGS" -o ipw-boce-freebsd-arm64
+
+      # tag v*：创建 GitHub Release 并附全平台产物 + 示例配置文件
+      - name: Release (tag only)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          token: ${{ github.token }}
+          generate_release_notes: true
+          body: |
+            ## 配置文件说明
+
+            Release 附带一份示例配置（**.example** 后缀用于标识，需重命名后使用）：
+
+            | 发布文件 | 重命名为 | 放置位置 |
+            |----------|----------|----------|
+            | `setting.json.example` | `setting.json` | 与主程序 `ipw-boce*` 同目录 |
+
+            ```bash
+            cp setting.json.example setting.json
+            ```
+
+          files: |
+            ipw-boce-linux-386
+            ipw-boce-linux-amd64
+            ipw-boce-linux-arm64
+            ipw-boce-linux-armv7
+            ipw-boce-linux-armv6
+            ipw-boce-linux-loong64
+            ipw-boce-windows-386.exe
+            ipw-boce-windows-amd64.exe
+            ipw-boce-windows-arm64.exe
+            ipw-boce-darwin-amd64
+            ipw-boce-darwin-arm64
+            ipw-boce-freebsd-386
+            ipw-boce-freebsd-amd64
+            ipw-boce-freebsd-arm64
+            setting.json.example
 
       - name: Upload backend artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ipw-boce-backend
           path: |
-            ipw-boce.exe
-            ipw-boce-linux-amd64
-          if-no-files-found: error
-
-  frontend:
-    name: Frontend (web/dist)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build
-        run: pnpm build
-
-      - name: Upload frontend artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ipw-boce-web-dist
-          path: web/dist
+            ipw-boce-*
+            setting.json.example
           if-no-files-found: error
