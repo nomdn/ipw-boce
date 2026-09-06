@@ -43,18 +43,21 @@ type NodeEvent struct {
 	CreatedAt time.Time `gorm:"index" json:"createdAt"`
 }
 
-// ProbeResult 拨测结果（tcping/udping/speed，WS 通道与 HTTP 转发两条链路都落库）
+// ProbeResult 拨测结果（detail/ssl/dns/tcping/speed，WS 通道与 HTTP 转发两条链路都落库）
 type ProbeResult struct {
-	ID        uint      `gorm:"primaryKey" json:"-"`
+	ID uint `gorm:"primaryKey" json:"-"`
+	// TaskID 归属的定时拨测任务（source=sched 时有效；手动/节点上报无任务归 0）。
+	// SLA 聚合按 task_id 精确归属，避免不同任务(即使同 api_type/同目标)相互污染。
+	TaskID    uint      `gorm:"index:idx_probe_task;default:0" json:"taskId,omitempty"`
 	RequestID string    `gorm:"size:64;index" json:"requestId,omitempty"`
 	NodeID    string    `gorm:"index:idx_probe_node,priority:1;size:128" json:"nodeId"`
-	APIType   string    `gorm:"index:idx_probe_type,priority:1;size:32" json:"apiType"` // tcping | udping | speed
+	APIType   string    `gorm:"index:idx_probe_type,priority:1;size:32" json:"apiType"` // detail|ssl|dns|tcping|speed
 	Raw       string    `gorm:"size:512" json:"raw"`                                    // 拨测目标（域名/IP）
 	Query     string    `gorm:"size:512" json:"query,omitempty"`                        // url-encoded query
 	Status    int       `json:"status"`                                                 // 上游/节点返回的 HTTP 状态码；0 = 请求失败
 	LatencyMs int64     `json:"latencyMs"`                                              // 端到端耗时（中间件侧）
 	Error     string    `gorm:"size:512" json:"error,omitempty"`
-	Source    string    `gorm:"size:16" json:"source"`            // ws | http
+	Source    string    `gorm:"size:16" json:"source"`            // ws|http 节点上报 / sched 定时 / biz 手动一键
 	Origin    string    `gorm:"size:128" json:"origin,omitempty"` // 数据来源实例（外部上报方标识；空 = 本机观测）
 	Body      string    `gorm:"type:text" json:"body,omitempty"`
 	CreatedAt time.Time `gorm:"index:idx_probe_created;index:idx_probe_node,priority:2" json:"createdAt"`
@@ -83,7 +86,7 @@ type NodeConfig struct {
 }
 
 // allModels AutoMigrate 的全部模型
-var allModels = []any{&Node{}, &NodeEvent{}, &ProbeResult{}, &RequestStat{}, &NodeConfig{}}
+var allModels = []any{&Node{}, &NodeEvent{}, &ProbeResult{}, &RequestStat{}, &NodeConfig{}, &ProbeTask{}, &User{}, &AppNotice{}}
 
 // ==================== 数据库初始化 ====================
 

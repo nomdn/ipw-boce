@@ -135,7 +135,7 @@ func runWS(url, nodeID, key, reportFile string) error {
 func runHTTPUpstream(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[mocknode] http hit %s query=%s reporter=%q", r.URL.Path, r.URL.RawQuery, r.Header.Get("X-Boce-Reporter"))
+		log.Printf("[mocknode] http hit %s query=%s", r.URL.Path, r.URL.RawQuery)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":     true,

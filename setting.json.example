@@ -36,11 +36,33 @@
         "max-idle-conns": 0
     },
     "admin-token": "",
+    "jwt-secret": "",              // JWT HMAC 密钥；与 admin-password 齐备才启用 JWT 登录
+    "jwt-expiry-seconds": 86400,   // JWT 有效秒（缺省 86400）
+    "admin-user": "admin",         // 登录用户名（缺省 admin）
+    "admin-password": "",          // 登录口令；空 = 不启用 JWT 登录
     "data-retention-days": 30,
-    "stats-flush-seconds": 30,
 
-    "report-url": "",
     "report-token": "",
-    "report-interval-seconds": 15,
-    "report-probes": true
+
+    // SMTP 掉线告警（见 alert.go）：收件人按任务 owner 动态解析（所有者有邮箱才走邮件）
+    "smtp": {
+        "host": "",              // SMTP 服务器地址；空 = 邮件路径禁用
+        "port": 465,             // 端口；465 = SSL/TLS
+        "user": "",              // 发信账号
+        "password": "",          // 授权码/口令
+        "from": "",              // 发件人地址（缺省用 user）
+        "fromName": "",          // 发件人显示名（可选）
+        "ssl": true,             // true = 直接 TLS（典型 465）
+        "startTLS": false,       // true = 先明文再 STARTTLS（典型 587）
+        "insecure": false,       // true = 跳过证书校验（仅内网/测试）
+        "timeoutSec": 10         // 单次发信超时秒
+    },
+    // 掉线告警策略：任务连续 downThreshold 轮整组 down → 通知其「所有者」：
+    //   所有者有邮箱→发邮件；无邮箱→站内信(铃铛)；任务无归属(静态token建的旧任务)→不通知。
+    // 收件人不再用 to 字段兜底（保留仅为兼容旧配置，实际不读取）。
+    "alert": {
+        "enabled": true,          // 总开关
+        "to": "",                 // 已弃用：告警按任务 owner 送达，本字段不再作为收件人
+        "downThreshold": 3        // 连续 N 轮任务全 down 才告警（缺省 3）
+    }
 }

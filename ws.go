@@ -20,7 +20,7 @@ import (
 // 现有 HTTP 接口（/v1/* /middleware/*）完全不变，WS 是独立端口上的新增数据面。
 //
 // 相比原版新增：注册/断开写入 nodes + node_events（在线快照与历史），
-// 心跳批量刷新 last_seen_at，probe_result 经异步通道落 probe_results。
+// 心跳批量刷新 last_seen_at；节点经本通道发 report 消息上报统计与拨测明细（见 report.go）。
 //
 // 消息信封（JSON 文本帧）：{ "type": "...", "nodeId": "...", "ts": <unix秒>, "data": {...} }
 //   - 节点 → middleware：register / probe_result / pong / command
@@ -41,6 +41,9 @@ type wsProbeRequest struct {
 	APIType   string            `json:"apiType"`
 	Raw       string            `json:"raw"`
 	Query     map[string]string `json:"query,omitempty"`
+	// Scheduler=true 表示本次拨测由收集中心(本机定时/手动一键)主动调度下发，
+	// 节点侧识别后跳过把这次执行计入 stats/明细上报，避免与本地落库(source=sched/biz)双算。
+	Scheduler bool `json:"scheduler,omitempty"`
 }
 
 type wsProbeResult struct {
@@ -109,8 +112,17 @@ func (s *wsServer) Handler(w http.ResponseWriter, r *http.Request) {
 			if !registered {
 				log.Printf("[ws] peer closed before register")
 			} else {
-				log.Printf("[ws] node %s disconnected: %v", peer.id, err)
-				recordNodeOffline(peer.id, err.Error())
+				// 仅当仍是被 peers 引用的当前连接才置离线——同 id 新连接替换旧连接时，
+				// 旧连接读错误属正常收尾，不能把刚注册的新连接误标离线。
+				s.mu.Lock()
+				cur, isCur := s.peers[peer.id]
+				s.mu.Unlock()
+				if !isCur || cur != peer {
+					log.Printf("[ws] node %s old connection closed (replaced), ignore", peer.id)
+				} else {
+					log.Printf("[ws] node %s disconnected: %v", peer.id, err)
+					recordNodeOffline(peer.id, err.Error())
+				}
 			}
 			break
 		}
@@ -220,7 +232,11 @@ func (s *wsServer) sendJSON(c *websocket.Conn, msg wsMessage) error {
 }
 
 // RequestProbe 通过 WS 通道向指定节点发送拨测请求并等待结果（超时返回错误）。
-func (s *wsServer) RequestProbe(nodeID, apiType, raw string, query map[string]string, timeout time.Duration) (int, []byte, error) {
+// RequestProbe 通过 WS 通道向单个节点下发拨测请求并等待结果。
+// scheduler=true 表示本次为收集中心主动调度拨测（定时/手动一键），报文带 Scheduler 标记，
+// 节点识别后跳过把该次执行计入 stats/明细上报（避免与本地落库双算）；
+// scheduler=false 用于 middlewareHandler 转发真实业务（forwardWSProbe），节点照常上报。
+func (s *wsServer) RequestProbe(nodeID, apiType, raw string, query map[string]string, timeout time.Duration, scheduler bool) (int, []byte, error) {
 	s.mu.Lock()
 	peer, ok := s.peers[nodeID]
 	s.mu.Unlock()
@@ -239,7 +255,7 @@ func (s *wsServer) RequestProbe(nodeID, apiType, raw string, query map[string]st
 		s.probeMu.Unlock()
 	}()
 
-	payload := wsProbeRequest{RequestID: reqID, APIType: apiType, Raw: raw, Query: query}
+	payload := wsProbeRequest{RequestID: reqID, APIType: apiType, Raw: raw, Query: query, Scheduler: scheduler}
 	if err := s.sendJSON(peer.conn, wsMessage{Type: "probe", NodeID: nodeID, TS: time.Now().Unix(), Data: mustRaw(payload)}); err != nil {
 		// 连接已死（写失败立刻可知），直接返回错误，不再让请求干等满超时
 		s.statMu.Lock()

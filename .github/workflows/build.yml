@@ -1,0 +1,106 @@
+# ==================== 自动构建（build）====================
+# 触发：push 到 main / tag（v*）/ 手动 workflow_dispatch。
+# 作用：不部署、不改环境，仅把后端二进制 + 前端静态产物构建出来，
+#       分别上传为 GitHub Actions artifact（可下载核对或交 CI/CD 后续消费）。
+# 说明：
+#   - 后端产物：Windows(ipw-boce.exe) 与 Linux(ipw-boce-linux-amd64)，带 VERSION/COMMIT/BUILD_TIME ldflags。
+#   - 前端产物：web/dist 整体压缩（后端不 embed，前端独立部署）。
+#   - VERSION 注入：tag push 取 tag 名；非 tag 取短 commit 作为 dev 版。
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Go build + vet)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 统一注入版本信息（tag → 版本号，否则 dev+短哈希）
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Build (windows/amd64)
+        run: |
+          GOOS=windows GOARCH=amd64 go build \
+            -ldflags "-X main.VERSION=${{ steps.ver.outputs.version }} \
+                      -X main.COMMIT=$(git rev-parse --short HEAD) \
+                      -X main.BUILD_TIME=$(date -u +%FT%TZ)" \
+            -o ipw-boce.exe .
+
+      - name: Build (linux/amd64)
+        run: |
+          GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-X main.VERSION=${{ steps.ver.outputs.version }} \
+                      -X main.COMMIT=$(git rev-parse --short HEAD) \
+                      -X main.BUILD_TIME=$(date -u +%FT%TZ)" \
+            -o ipw-boce-linux-amd64 .
+
+      - name: Upload backend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipw-boce-backend
+          path: |
+            ipw-boce.exe
+            ipw-boce-linux-amd64
+          if-no-files-found: error
+
+  frontend:
+    name: Frontend (web/dist)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Upload frontend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipw-boce-web-dist
+          path: web/dist
+          if-no-files-found: error

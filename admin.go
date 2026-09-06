@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // ==================== 节点远端配置托管 ====================
@@ -84,18 +86,23 @@ func mustJSON(v any) []byte {
 
 // ==================== 管理 API ====================
 
-// registerAdminRoutes 注册 /admin/* 路由；配置 admin-token 时校验 Authorization: Bearer
+// registerAdminRoutes 注册 /admin/* 路由；配置 admin-token 或 jwt-secret 时校验 Authorization: Bearer
 func registerAdminRoutes(router *gin.Engine) {
-	admin := router.Group("/admin")
-	if ADMIN_TOKEN != "" {
-		admin.Use(func(c *gin.Context) {
-			if c.GetHeader("Authorization") != "Bearer "+ADMIN_TOKEN {
-				apiError(c, http.StatusUnauthorized, "Unauthorized")
-				c.Abort()
-				return
-			}
-		})
+	// 登录端点（免鉴权）：校验 admin-user/admin-password 签发 JWT，见 auth.go
+	if jwtEnabled() {
+		router.POST("/admin/login", loginHandler)
+		// 公开自助注册（邮箱验证码）——依赖 JWT 启用（注册出的账号需能登录），见 register.go
+		registerPublicRoutes(router)
 	}
+
+	admin := router.Group("/admin")
+	if ADMIN_TOKEN != "" || jwtEnabled() {
+		admin.Use(adminAuthMiddleware())
+	}
+
+	// 运维/管理类接口（节点拓扑、节点配置托管、全站流量大盘）仅 admin 可见；
+	// 其余登录接口（拨测工具 / 自己任务 / 站内信 / 个人资料）user 亦可用。
+	restricted := admin.Group("", adminOnly())
 
 	// 服务状态：版本 / 运行时长 / WS 在线数 / 数据库驱动 / 队列堆积
 	admin.GET("/status", func(c *gin.Context) {
@@ -116,8 +123,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		})
 	})
 
-	// 节点在线快照（nodes 表）
-	admin.GET("/nodes", func(c *gin.Context) {
+	// 节点在线快照（nodes 表）—— admin only
+	restricted.GET("/nodes", func(c *gin.Context) {
 		ctx, cancel := dbCtx()
 		defer cancel()
 		var nodes []Node
@@ -128,8 +135,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, nodes)
 	})
 
-	// 节点在线/离线历史
-	admin.GET("/nodes/:nodeId/events", func(c *gin.Context) {
+	// 节点在线/离线历史 —— admin only
+	restricted.GET("/nodes/:nodeId/events", func(c *gin.Context) {
 		limit := clampLimit(c.Query("limit"), 100)
 		ctx, cancel := dbCtx()
 		defer cancel()
@@ -142,17 +149,54 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, events)
 	})
 
-	// 拨测记录（probe_results）
+	// 一键拨测：对节点池全部（或 body.nodes 子集）同步批量下发拨测并聚合返回（见 admin_probe.go）
+	admin.POST("/nodes/probe/:apiType/*raw", batchProbeHandler)
+
+	// 拨测记录（probe_results）；cat=类别过滤：sched=定时拨测(source=sched)，biz=业务拨测(source!=sched)
+	// user 只能看"自己创建任务"的定时拨测明细（source=sched 且 task_id 归自己）；biz/ws/http/他人 sched 一律不可见。
 	admin.GET("/probes", func(c *gin.Context) {
 		limit := clampLimit(c.Query("limit"), 100)
 		ctx, cancel := dbCtx()
 		defer cancel()
+		uid, role, _ := currentUserFromCtx(c)
 		q := db.WithContext(ctx).Model(&ProbeResult{})
+		if role == RoleUser {
+			ownIDs, err := ownTaskIDs(db.WithContext(ctx), uid)
+			if err != nil {
+				apiError(c, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if len(ownIDs) == 0 {
+				// 该用户没有任何任务 → 无可见 sched 明细
+				c.JSON(http.StatusOK, []ProbeResult{})
+				return
+			}
+			q = q.Where("source = ? AND task_id IN ?", sourceSched, ownIDs)
+		}
 		if v := c.Query("node"); v != "" {
 			q = q.Where("node_id = ?", v)
 		}
 		if v := c.Query("type"); v != "" {
 			q = q.Where("api_type = ?", v)
+		}
+		if v := c.Query("cat"); v != "" {
+			switch v {
+			case "sched":
+				if role != RoleUser {
+					q = q.Where("source = ?", sourceSched)
+				}
+			case "biz":
+				if role != RoleUser {
+					q = q.Where("source <> ?", sourceSched)
+				} else {
+					// user 已强制只看自己 sched，biz 请求无可见行
+					c.JSON(http.StatusOK, []ProbeResult{})
+					return
+				}
+			default:
+				apiError(c, http.StatusBadRequest, "invalid cat (sched|biz)")
+				return
+			}
 		}
 		if v := c.Query("since"); v != "" {
 			if t, err := time.Parse(time.RFC3339, v); err == nil {
@@ -167,8 +211,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, rows)
 	})
 
-	// 统计汇总：按 API 类型 / 节点维度聚合（request_stats）
-	admin.GET("/stats/summary", func(c *gin.Context) {
+	// 统计汇总：按 API 类型 / 节点维度聚合（request_stats）—— admin only（user 大盘走自己的任务报告）
+	restricted.GET("/stats/summary", func(c *gin.Context) {
 		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
 		since := time.Now().UTC().Add(-time.Duration(hours*float64(time.Hour))).Unix() / 60
 		ctx, cancel := dbCtx()
@@ -201,8 +245,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, gin.H{"hours": hours, "byApiType": byAPI, "byNode": byNode})
 	})
 
-	// 统计时间序列（按分钟桶）
-	admin.GET("/stats/timeseries", func(c *gin.Context) {
+	// 统计时间序列（按分钟桶）—— admin only
+	restricted.GET("/stats/timeseries", func(c *gin.Context) {
 		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
 		since := time.Now().UTC().Add(-time.Duration(hours*float64(time.Hour))).Unix() / 60
 		ctx, cancel := dbCtx()
@@ -223,8 +267,8 @@ func registerAdminRoutes(router *gin.Engine) {
 
 	// ===== 节点配置 CRUD =====
 
-	// 列出全部托管配置（含 global）
-	admin.GET("/node-configs", func(c *gin.Context) {
+	// 列出全部托管配置（含 global）—— admin only
+	restricted.GET("/node-configs", func(c *gin.Context) {
 		ctx, cancel := dbCtx()
 		defer cancel()
 		var rows []NodeConfig
@@ -239,8 +283,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, out)
 	})
 
-	// 读取某节点配置原文
-	admin.GET("/node-configs/:nodeId", func(c *gin.Context) {
+	// 读取某节点配置原文 —— admin only
+	restricted.GET("/node-configs/:nodeId", func(c *gin.Context) {
 		var row NodeConfig
 		ctx, cancel := dbCtx()
 		defer cancel()
@@ -251,8 +295,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.Data(http.StatusOK, "application/json", []byte(row.Config))
 	})
 
-	// 写入/更新某节点配置（body 须为合法 JSON 对象；nodeId=global 即全局缺省配置）
-	admin.PUT("/node-configs/:nodeId", func(c *gin.Context) {
+	// 写入/更新某节点配置（body 须为合法 JSON 对象；nodeId=global 即全局缺省配置）—— admin only
+	restricted.PUT("/node-configs/:nodeId", func(c *gin.Context) {
 		nodeID := c.Param("nodeId")
 		body, err := c.GetRawData()
 		if err != nil {
@@ -276,8 +320,8 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, gin.H{"nodeId": nodeID, "updated": true, "sizeBytes": len(normalized)})
 	})
 
-	// 删除某节点配置
-	admin.DELETE("/node-configs/:nodeId", func(c *gin.Context) {
+	// 删除某节点配置 —— admin only
+	restricted.DELETE("/node-configs/:nodeId", func(c *gin.Context) {
 		ctx, cancel := dbCtx()
 		defer cancel()
 		res := db.WithContext(ctx).Where("node_id = ?", c.Param("nodeId")).Delete(&NodeConfig{})
@@ -287,6 +331,289 @@ func registerAdminRoutes(router *gin.Engine) {
 		}
 		c.JSON(http.StatusOK, gin.H{"nodeId": c.Param("nodeId"), "deleted": res.RowsAffected > 0})
 	})
+
+	// ===== 定时拨测任务 CRUD（SLA 数据源；调度器见 probe_task.go） =====
+
+	// 任务可用拨测类型元信息（前端表单选项用）
+	admin.GET("/tasks/meta", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"types": knownProbeTaskTypes(), "defaultInterval": 60, "minInterval": 10})
+	})
+
+	// 列表全部任务（user 仅见自己创建的；admin/静态 token 见全量）
+	admin.GET("/tasks", func(c *gin.Context) {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		q := db.WithContext(ctx).Model(&ProbeTask{})
+		if uid, role, _ := currentUserFromCtx(c); role == RoleUser {
+			q = q.Where("owner_id = ?", uid)
+		}
+		var rows []ProbeTask
+		if err := q.Order("id asc").Find(&rows).Error; err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, tasksWithOwner(rows))
+	})
+
+	// 读取单个任务（user 仅自己创建的）
+	admin.GET("/tasks/:id", func(c *gin.Context) {
+		var t ProbeTask
+		ctx, cancel := dbCtx()
+		defer cancel()
+		if err := db.WithContext(ctx).First(&t, idParam(c)).Error; err != nil {
+			apiError(c, http.StatusNotFound, "task not found")
+			return
+		}
+		if taskOwnedByUserButNot(c, &t) {
+			apiError(c, http.StatusForbidden, "not your task")
+			return
+		}
+		c.JSON(http.StatusOK, taskWithOwner(&t))
+	})
+
+	// 新建任务（创建者 = 当前登录用户；静态 token/无 uid 视为无归属 ownerId=0）
+	admin.POST("/tasks", func(c *gin.Context) {
+		// 邮箱未验证的普通用户禁止建 SLA 任务（其掉线告警邮件需可靠邮箱）
+		if msg := emailVerifiedBlocked(c); msg != "" {
+			apiError(c, http.StatusForbidden, msg)
+			return
+		}
+		var t ProbeTask
+		if err := c.ShouldBindJSON(&t); err != nil {
+			apiError(c, http.StatusBadRequest, "invalid body: "+err.Error())
+			return
+		}
+		if msg := validateTask(&t); msg != "" {
+			apiError(c, http.StatusBadRequest, msg)
+			return
+		}
+		uid, _, _ := currentUserFromCtx(c)
+		t.OwnerID = uid // 创建者即所有者
+		ctx, cancel := dbCtx()
+		defer cancel()
+		if err := db.WithContext(ctx).Create(&t).Error; err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, t)
+	})
+
+	// 更新任务（全量覆盖；user 仅自己创建的）
+	admin.PUT("/tasks/:id", func(c *gin.Context) {
+		var t ProbeTask
+		ctx, cancel := dbCtx()
+		defer cancel()
+		if err := db.WithContext(ctx).First(&t, idParam(c)).Error; err != nil {
+			apiError(c, http.StatusNotFound, "task not found")
+			return
+		}
+		if taskOwnedByUserButNot(c, &t) {
+			apiError(c, http.StatusForbidden, "not your task")
+			return
+		}
+		var in ProbeTask
+		if err := c.ShouldBindJSON(&in); err != nil {
+			apiError(c, http.StatusBadRequest, "invalid body: "+err.Error())
+			return
+		}
+		in.ID = t.ID
+		if msg := validateTask(&in); msg != "" {
+			apiError(c, http.StatusBadRequest, msg)
+			return
+		}
+		in.CreatedAt = t.CreatedAt
+		in.OwnerID = t.OwnerID // 编辑不改所有者（保持创建者）
+		if err := db.WithContext(ctx).Save(&in).Error; err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, taskWithOwner(&in))
+	})
+
+	// 启停单个任务（前端开关；只改 enabled，保留其余配置；user 仅自己创建的）
+	admin.PATCH("/tasks/:id/enabled", func(c *gin.Context) {
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			apiError(c, http.StatusBadRequest, "invalid body")
+			return
+		}
+		// 未验证邮箱的 user 不允许"启用"任务（停用放行）
+		if body.Enabled {
+			if msg := emailVerifiedBlocked(c); msg != "" {
+				apiError(c, http.StatusForbidden, msg)
+				return
+			}
+		}
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var t ProbeTask
+		if err := db.WithContext(ctx).First(&t, idParam(c)).Error; err != nil {
+			apiError(c, http.StatusNotFound, "task not found")
+			return
+		}
+		if taskOwnedByUserButNot(c, &t) {
+			apiError(c, http.StatusForbidden, "not your task")
+			return
+		}
+		res := db.WithContext(ctx).Model(&ProbeTask{}).Where("id = ?", idParam(c)).
+			Update("enabled", body.Enabled)
+		if res.Error != nil {
+			apiError(c, http.StatusInternalServerError, res.Error.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"id": idParam(c), "enabled": body.Enabled, "updated": res.RowsAffected > 0})
+	})
+
+	// 删除任务（user 仅自己创建的）
+	admin.DELETE("/tasks/:id", func(c *gin.Context) {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var t ProbeTask
+		if err := db.WithContext(ctx).First(&t, idParam(c)).Error; err != nil {
+			apiError(c, http.StatusNotFound, "task not found")
+			return
+		}
+		if taskOwnedByUserButNot(c, &t) {
+			apiError(c, http.StatusForbidden, "not your task")
+			return
+		}
+		res := db.WithContext(ctx).Delete(&ProbeTask{}, idParam(c))
+		if res.Error != nil {
+			apiError(c, http.StatusInternalServerError, res.Error.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"deleted": res.RowsAffected > 0})
+	})
+
+	// SLA 聚合读取（source=sched；解析 detail/ssl 双栈与特殊字段，见 sla.go）
+	registerTaskSlaRoutes(admin)
+
+	// 我的任务时序曲线（普通用户大盘趋势，见 tasks_series.go）
+	registerTaskMineSeriesRoutes(admin)
+
+	// 用户管理（仅 admin，见 users.go）
+	registerUserRoutes(admin)
+
+	// 站内信（本人通知；铃铛入口，见 notices.go）
+	registerNoticeRoutes(admin)
+
+	// 个人资料（本人邮箱/口令，登录即可，见 profile.go）
+	registerProfileRoutes(admin)
+}
+
+// ownTaskIDs 返回某 uid 拥有(owner_id=uid)的全部定时任务 id。role=admin 时通常不调用(admin 看全量)。
+func ownTaskIDs(g *gorm.DB, uid uint) ([]uint, error) {
+	var ids []uint
+	if err := g.Model(&ProbeTask{}).Where("owner_id = ?", uid).Pluck("id", &ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// taskOwnedByUserButNot 返回 true 表示"当前是普通 user 且不是该任务 owner"，应拒绝访问。
+// admin / 静态 token(role=admin) 一律可访问；role=user 仅 owner_id == 自己 uid 可访问。
+func taskOwnedByUserButNot(c *gin.Context, t *ProbeTask) bool {
+	uid, role, _ := currentUserFromCtx(c)
+	if role != RoleUser {
+		return false
+	}
+	return t.OwnerID != uid
+}
+
+
+// ownerUsernames 批量查一组 users.id → username（用于任务返回 owner 名；查询失败返回空 map）
+func ownerUsernames(ids []uint) map[uint]string {
+	out := map[uint]string{}
+	seen := map[uint]bool{}
+	var keep []uint
+	for _, id := range ids {
+		if id == 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		keep = append(keep, id)
+	}
+	if len(keep) == 0 || db == nil {
+		return out
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	var rows []User
+	if err := db.WithContext(ctx).Select("id, username").Where("id IN ?", keep).Find(&rows).Error; err != nil {
+		return out
+	}
+	for i := range rows {
+		out[rows[i].ID] = rows[i].Username
+	}
+	return out
+}
+
+// taskWithOwner 单条任务 → JSON（附 ownerUsername；ownerId=0 或无此用户时为 ""）
+func taskWithOwner(t *ProbeTask) map[string]any {
+	h := t.toGinH()
+	names := ownerUsernames([]uint{t.OwnerID})
+	h["ownerUsername"] = names[t.OwnerID]
+	return h
+}
+
+// tasksWithOwner 任务列表 → JSON 数组（各自附 ownerUsername）
+func tasksWithOwner(rows []ProbeTask) []map[string]any {
+	ids := make([]uint, 0, len(rows))
+	for i := range rows {
+		ids = append(ids, rows[i].OwnerID)
+	}
+	names := ownerUsernames(ids)
+	out := make([]map[string]any, 0, len(rows))
+	for i := range rows {
+		h := rows[i].toGinH()
+		h["ownerUsername"] = names[rows[i].OwnerID]
+		out = append(out, h)
+	}
+	return out
+}
+
+// idParam 解析 :id 为 uint（非法返回 0，交由查询自然匹配不到）
+func idParam(c *gin.Context) uint {
+	n, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	return uint(n)
+}
+
+// validateTask 校验任务字段，返回错误文案（空 = 合法）
+func validateTask(t *ProbeTask) string {
+	if strings.TrimSpace(t.Name) == "" {
+		return "name is required"
+	}
+	validType := false
+	for _, k := range knownProbeTaskTypes() {
+		if t.APIType == k {
+			validType = true
+			break
+		}
+	}
+	if !validType {
+		return "apiType must be one of " + strings.Join(knownProbeTaskTypes(), ",")
+	}
+	if strings.TrimSpace(t.Target) == "" {
+		return "target is required"
+	}
+	if t.Interval <= 0 {
+		return "intervalSec is required"
+	}
+	if t.Interval < 10 {
+		t.Interval = 10
+	}
+	if t.NodeScope != "custom" {
+		t.NodeScope = "all"
+	}
+	if t.ExpectStatus == "" {
+		t.ExpectStatus = "2xx"
+	}
+	if t.SlowMs < 0 {
+		t.SlowMs = 0
+	}
+	return ""
 }
 
 // clampLimit 解析 limit 参数（缺省 def，上限 1000）

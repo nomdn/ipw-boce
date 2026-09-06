@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,21 +12,22 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// ==================== 数据上报（多入口冗余汇聚） ====================
+// ==================== 节点上报（收集端） ====================
 //
-// 同一后端节点可能被多个入口访问（原 Go 中间件、前端内置 TS 中间件、边缘函数），
-// 请求不保证经过本中间件。汇聚方式：各入口把"自己观测到的"统计/拨测主动上报到
-// 本收集中心，按 (分钟 × 节点 × apiType) 冲突累加，天然合并多入口视角。
+// 统计与拨测明细由拨测节点自己上报，中间件不在转发路径上采集：
+//   - 节点连着 WS 通道 → 经 WS 发 {"type":"report","data":{...}}（须先 register）
+//   - 节点没有 WS（纯 HTTP 节点）→ POST /report
 //
-// 上报协议 v1（HTTP 与 WS 同构）：
+// 汇聚口径：按 (分钟 × 节点 × apiType) 冲突累加，多份上报自然合并。
+//
+// 上报协议 v1（两条通道报文同构）：
 //   POST /report   body = {"instance":"上报方标识","stats":[...],"probes":[...]}
-//   WS 消息        {"type":"report","data":{... 同 body ...}}（须先 register）
+//   WS 消息        {"type":"report","data":{... 同 body ...}}
 //
-// 上报语义（防双算）：
-//   - 只上报"第一方观测"：自己转发的请求；不得转播从别处收到的数据
-//   - stats 是增量计数（每次上报携带自上次以来的增量），收集器按累加入库
-//   - 收集中心自身不要配 report-url 指向自己（会造成本地+上报双份）
-//   - 上报为 at-most-once（失败丢弃并记日志），不重试，避免重试导致的重复累加
+// 语义约束：
+//   - 上报方只报"自己第一方观测"的（自己处理的请求），不得转播从别处收到的数据
+//   - stats 是增量计数，收集端按累加入库；上报为 at-most-once（失败丢弃并记日志），
+//     不重试——统计是累加语义，重试会导致重复计算
 
 // reportStat 单条统计增量（一分钟桶）
 type reportStat struct {
@@ -46,7 +44,7 @@ type reportStat struct {
 type reportProbe struct {
 	RequestID string          `json:"requestId,omitempty"`
 	NodeID    string          `json:"nodeId"`
-	APIType   string          `json:"apiType"` // tcping | udping | speed
+	APIType   string          `json:"apiType"` // 拨测类：detail | ssl | dns | tcping | speed
 	Raw       string          `json:"raw"`
 	Query     string          `json:"query,omitempty"`
 	Status    int             `json:"status"`
@@ -71,27 +69,15 @@ const (
 	reportMaxBody   = 4 << 20 // 4MB
 )
 
-// ==================== 入库 ====================
-
-var (
-	boceInstanceName string
-	boceInstanceOnce sync.Once
-)
-
-// boceInstance 本实例标识（hostname，缓存）：转发标记头 X-Boce-Reporter 与上报 instance 共用
-func boceInstance() string {
-	boceInstanceOnce.Do(func() {
-		host, err := os.Hostname()
-		if err != nil || host == "" {
-			host = "unknown"
-		}
-		boceInstanceName = host
-	})
-	return boceInstanceName
+// statVal 统计增量（写入 request_stats 时的一组聚合值）
+type statVal struct {
+	total, errs, latSum, latMax int64
 }
 
-// ingestReport 校验并入库一份数据上报，返回 (接受统计条数, 接受拨测条数)。
-// 非法条目跳过（计入拒绝），不整体失败；结构性错误（超容量）返回 error。
+// ==================== 入库 ====================
+
+// ingestReport 校验并入库一份上报，返回 (接受统计条数, 接受拨测条数)。
+// 非法条目跳过（不计入接受数），不整体失败；结构性错误（超容量）返回 error。
 func ingestReport(payload *reportPayload) (int, int, error) {
 	if db == nil {
 		return 0, 0, fmt.Errorf("store unavailable")
@@ -177,9 +163,9 @@ func normalizeReportBody(raw json.RawMessage) string {
 
 // ==================== HTTP 上报接口 ====================
 
-// registerReportRoutes 注册 POST /report。
+// registerReportRoutes 注册 POST /report（无 WS 通道的节点走这里）。
 // 鉴权：report-token，未配置回退 admin-token，两者都空 = 开放（仅限内网/受信环境）。
-// 该路由不在限流组内——前端内置中间件是"调一次上报一次"，不能被转发限流误伤。
+// 该路由不在限流组内——节点是"处理一次上报一次"，不能被转发限流误伤。
 func registerReportRoutes(router *gin.Engine) {
 	router.POST("/report", reportAuth(), func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, reportMaxBody)
@@ -220,173 +206,6 @@ func reportAuth() gin.HandlerFunc {
 	}
 }
 
-// ==================== 上报客户端（report-url 配置后本实例成为上报方） ====================
-
-// reportClient 把本实例第一方观测（统计快照 + 拨测明细）定期批量推给收集中心。
-// 通道满/发送失败一律丢弃并计数（at-most-once），绝不重试——统计是累加语义，重试会双算。
-type reportClient struct {
-	url      string
-	token    string
-	instance string
-
-	statsCh chan reportStat
-	probeCh chan reportProbe
-
-	dropMu     sync.Mutex
-	droppedN   int64
-	httpC      *http.Client
-	stopCh     chan struct{}
-	stopWait   sync.WaitGroup
-	withProbes bool
-}
-
-var reporter *reportClient // 非 nil 表示本实例开启了上报
-
-func newReportClient() *reportClient {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		host = "unknown"
-	}
-	return &reportClient{
-		url:        REPORT_URL,
-		token:      REPORT_TOKEN,
-		instance:   host,
-		statsCh:    make(chan reportStat, 4096),
-		probeCh:    make(chan reportProbe, 2048),
-		httpC:      &http.Client{Timeout: 10 * time.Second},
-		stopCh:     make(chan struct{}),
-		withProbes: REPORT_PROBES,
-	}
-}
-
-func (r *reportClient) Start() {
-	r.stopWait.Add(1)
-	go r.loop()
-	log.Printf("[report] client enabled -> %s (instance=%s, interval=%ds, probes=%v)",
-		r.url, r.instance, REPORT_INTERVAL, r.withProbes)
-}
-
-// outStats 把一次 Flush 的统计快照转成上报条目（本实例"自己统计上报"的统计侧出口）
-func (r *reportClient) outStats(snap map[statKey]*statVal, minute int64) {
-	for k, v := range snap {
-		r.send(reportStat{
-			Minute: minute, NodeID: k.Node, APIType: k.API,
-			Total: v.total, Errors: v.errs, LatencySumMs: v.latSum, LatencyMaxMs: v.latMax,
-		})
-	}
-}
-
-// outProbe 拨测明细出口（recordProbeResult 钩子）
-func (r *reportClient) outProbe(pr probeResult) {
-	if !r.withProbes {
-		return
-	}
-	// body 以 JSON 字符串传输（收集端 normalizeReportBody 解回原文），保证任意文本 round-trip
-	body, err := json.Marshal(pr.Body)
-	if err != nil {
-		body = nil
-	}
-	r.sendProbe(reportProbe{
-		RequestID: pr.RequestID, NodeID: pr.NodeID, APIType: pr.APIType,
-		Raw: pr.Raw, Query: pr.Query, Status: pr.Status, LatencyMs: pr.LatencyMs,
-		Error: pr.Error, Source: pr.Source, Body: body,
-		CreatedAt: time.Now().Unix(),
-	})
-}
-
-func (r *reportClient) send(st reportStat) {
-	select {
-	case r.statsCh <- st:
-	default:
-		r.markDropped()
-	}
-}
-
-func (r *reportClient) sendProbe(p reportProbe) {
-	select {
-	case r.probeCh <- p:
-	default:
-		r.markDropped()
-	}
-}
-
-func (r *reportClient) markDropped() {
-	r.dropMu.Lock()
-	r.droppedN++
-	n := r.droppedN
-	r.dropMu.Unlock()
-	if n%100 == 1 {
-		log.Printf("[report] WARN upstream queue full, dropped %d records so far", n)
-	}
-}
-
-// loop 定期把积累的统计/拨测批量 POST 给收集中心
-func (r *reportClient) loop() {
-	defer r.stopWait.Done()
-	ticker := time.NewTicker(time.Duration(REPORT_INTERVAL) * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			r.flushAll()
-		case <-r.stopCh:
-			r.flushAll()
-			return
-		}
-	}
-}
-
-func (r *reportClient) flushAll() {
-	for {
-		payload := reportPayload{Instance: r.instance}
-		statsN, probesN := 0, 0
-		for len(r.statsCh) > 0 && statsN < reportMaxStats {
-			payload.Stats = append(payload.Stats, <-r.statsCh)
-			statsN++
-		}
-		if r.withProbes {
-			for len(r.probeCh) > 0 && probesN < reportMaxProbes {
-				payload.Probes = append(payload.Probes, <-r.probeCh)
-				probesN++
-			}
-		}
-		if statsN == 0 && probesN == 0 {
-			return
-		}
-		if err := r.post(&payload); err != nil {
-			// at-most-once：失败丢弃（数据仍在本地库），不重试避免统计双算
-			log.Printf("[report] ERROR post to collector: %v (dropped stats=%d probes=%d)", err, statsN, probesN)
-		}
-		if statsN < reportMaxStats && probesN < reportMaxProbes {
-			return
-		}
-	}
-}
-
-func (r *reportClient) post(payload *reportPayload) error {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest(http.MethodPost, r.url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if r.token != "" {
-		req.Header.Set("Authorization", "Bearer "+r.token)
-	}
-	resp, err := r.httpC.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("collector returned status %d", resp.StatusCode)
-	}
-	return nil
-}
-
 // ==================== WS 上报（ws.go 的 report 消息走这里） ====================
 
 // handleWSReport 处理已注册节点经 WS 通道发来的 report 消息
@@ -412,7 +231,7 @@ func handleWSReport(nodeID string, data json.RawMessage) {
 	}
 }
 
-// upsertStatDelta 单条统计增量 upsert（Flush 与 ingestReport 共用）。
+// upsertStatDelta 单条统计增量 upsert（节点上报的唯一落库口）。
 // latency_max 取历史与新值较大者；SQLite 无 GREATEST，用标量 max(a,b)。
 func upsertStatDelta(g *gorm.DB, minute int64, nodeID, apiType string, v statVal) error {
 	row := RequestStat{

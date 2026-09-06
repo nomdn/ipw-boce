@@ -64,6 +64,27 @@ type dbConfig struct {
 	MaxIdleConns int    `json:"max-idle-conns"` // 缺省 sqlite=1，其余=5
 }
 
+// smtpConfig SMTP 告警发信配置（setting.json "smtp" 段）
+type smtpConfig struct {
+	Host       string `json:"host"`       // SMTP 服务器地址
+	Port       int    `json:"port"`       // 端口；465 = SSL/TLS，其余按 Ssl/StartTLS 决定
+	User       string `json:"user"`       // 发信账号
+	Password   string `json:"password"`   // 授权码/口令
+	From       string `json:"from"`       // 发件人地址（缺省用 User）
+	FromName   string `json:"fromName"`   // 发件人显示名（可选）
+	Ssl        bool   `json:"ssl"`        // true = 直接 TLS（典型 465）
+	StartTLS   bool   `json:"startTLS"`   // true = 先明文再 STARTTLS（典型 587）；与 Ssl 互斥
+	Insecure   bool   `json:"insecure"`   // true = 跳过证书校验（仅内网/测试）
+	TimeoutSec int    `json:"timeoutSec"` // 单次发信超时（秒），缺省 10
+}
+
+// alertConfig 掉线告警配置（setting.json "alert" 段）
+type alertConfig struct {
+	Enabled       bool   `json:"enabled"`       // 总开关
+	To            string `json:"to"`            // 保留兼容字段，已不再作为收件人：告警按任务 owner 送达（见 alert.go）
+	DownThreshold int    `json:"downThreshold"` // 连续 N 轮任务全 down 才告警（缺省 3）
+}
+
 // middlewareConfig 仅用于解析 setting.json（JSON 键名统一用连接线，如 http-timeout-seconds）
 // 节点池结构：APIBaseURL 含 {IPv6,IPv4,DualStack} 三栈；IPLocationAPI 为纯数组（无栈区分）。
 type middlewareConfig struct {
@@ -84,13 +105,19 @@ type middlewareConfig struct {
 	Database          dbConfig `json:"database"`            // GORM 数据库（缺省 sqlite ./boce.db）
 	AdminToken        string   `json:"admin-token"`         // /admin/* 鉴权 Bearer token；空 = 不鉴权（仅内网使用）
 	DataRetentionDays int      `json:"data-retention-days"` // 拨测/统计/事件保留天数，0 = 永久保留（缺省 30）
-	StatsFlushSeconds int      `json:"stats-flush-seconds"` // 统计计数器落库间隔秒（缺省 30）
 
-	// ===== 本项目新增：数据上报（多入口冗余汇聚，协议见 report.go） =====
-	ReportURL             string `json:"report-url"`              // 上报目标收集器地址（空 = 本实例不上报，仅作为收集中心）
-	ReportToken           string `json:"report-token"`            // /report 鉴权 token（服务端校验与客户端携带共用）；空回退 admin-token
-	ReportIntervalSeconds int    `json:"report-interval-seconds"` // 主动上报间隔秒（缺省 15）
-	ReportProbes          *bool  `json:"report-probes"`           // 是否随报文携带拨测明细（缺省 true）
+	// ===== 本项目新增：JWT 登录（见 auth.go） =====
+	JWTSecret        string `json:"jwt-secret"`         // HMAC 密钥；与 admin-password 齐备才启用 JWT 登录
+	JWTExpirySeconds int    `json:"jwt-expiry-seconds"` // token 有效秒，缺省 86400
+	AdminUser        string `json:"admin-user"`         // 登录用户名，缺省 admin
+	AdminPassword    string `json:"admin-password"`     // 登录口令；空 = 不启用 JWT 登录
+
+	// ===== 本项目新增：节点上报接收（协议见 report.go） =====
+	ReportToken string `json:"report-token"` // /report 鉴权 token；空回退 admin-token，都空 = 开放
+
+	// ===== 本项目新增：SMTP 掉线告警（见 alert.go） =====
+	Smtp  smtpConfig  `json:"smtp"`  // SMTP 发信配置（空 host = 告警禁用）
+	Alert alertConfig `json:"alert"` // 掉线告警策略
 }
 
 // stringOrNumber 兼容 JSON 中的字符串与数字（如 "8080" 或 8080）
@@ -117,11 +144,9 @@ var (
 	DB_CONF              dbConfig          // 数据库配置
 	ADMIN_TOKEN          string            // /admin/* 鉴权 token（空 = 不鉴权）
 	DATA_RETENTION_DAYS  int               // 数据保留天数（0 = 永久）
-	STATS_FLUSH_SECONDS  int               // 统计落库间隔秒
-	REPORT_URL           string            // 上报目标收集器地址（空 = 本实例不上报）
 	REPORT_TOKEN         string            // /report 鉴权 token（空回退 ADMIN_TOKEN）
-	REPORT_INTERVAL      int               // 上报间隔秒
-	REPORT_PROBES        bool              // 是否随报文携带拨测明细
+	SMTP_CONF            smtpConfig        // SMTP 告警发信配置
+	ALERT_CONF           alertConfig       // 掉线告警策略
 	STARTED_AT           = time.Now()      // 进程启动时间（统计用）
 )
 
@@ -249,21 +274,9 @@ func fetchURL(target string, headers map[string]string, query url.Values) (int, 
 }
 
 // forwardUpstream 转发上游结果：网络层错误返回 502，上游任意状态码与 body 原样透传。
-// 同时收集统计与（拨测类）结果持久化。
-func forwardUpstream(c *gin.Context, backendID, apiType, raw, apiBaseUrl string, headers map[string]string, query url.Values) error {
-	start := time.Now()
+// 统计与拨测明细不在本函数采集——由节点自己上报（协议见 report.go）。
+func forwardUpstream(c *gin.Context, apiBaseUrl string, headers map[string]string, query url.Values) error {
 	status, data, err := fetchURL(apiBaseUrl, headers, query)
-	latency := time.Since(start)
-
-	recordAPIRequest(backendID, apiType, status, latency, err != nil || status >= 500, sourceHTTP)
-	if isProbeType(apiType) {
-		recordProbeResult(probeResult{
-			NodeID: backendID, APIType: apiType, Raw: raw,
-			Query: query.Encode(), Status: status, LatencyMs: latency.Milliseconds(),
-			Source: sourceHTTP,
-		}, err, data)
-	}
-
 	if err != nil {
 		log.Printf("Error fetching from %s: %v", apiBaseUrl, err)
 		apiError(c, http.StatusBadGateway, "Backend unreachable")
@@ -356,8 +369,8 @@ func middlewareHandler(c *gin.Context) {
 	apiKey := lookupAPIKey(backendID)
 
 	// 构造转发给上游的请求头：不透传客户端 Origin，避免上游 CORS 误判。
-	// X-Boce-Reporter 标记头：告知节点"本请求已由中间件侧计数上报"，节点据此跳过统计（防双算，协议见 report.go）
-	authHeaders := map[string]string{"X-Boce-Reporter": boceInstance()}
+	// 统计与拨测明细由节点自己上报（WS 通道或 /report），中间件不再在转发路径上计数
+	authHeaders := map[string]string{}
 	if apiKey != "" {
 		authHeaders["Authorization"] = "Bearer " + apiKey
 	}
@@ -388,10 +401,10 @@ func middlewareHandler(c *gin.Context) {
 		}
 
 		// 上游错误原样透传（状态码 + body），网络错误返回 502
-		forwardUpstream(c, backendID, apiType, raw, apiBaseUrl+"v1/"+apiType+"/"+raw, authHeaders, nil)
+		forwardUpstream(c, apiBaseUrl+"v1/"+apiType+"/"+raw, authHeaders, nil)
 
-	case "tcping", "udping", "speed":
-		// tcping/udping/speed 统一走 APIBaseURL 节点池
+	case "tcping", "speed":
+		// tcping/speed 统一走 APIBaseURL 节点池
 		pool := flattenStack(API_BASE_URLS)
 
 		// 转发 query 参数（过滤空值，等价于 TS 中 URLSearchParams 过滤 undefined）
@@ -420,7 +433,7 @@ func middlewareHandler(c *gin.Context) {
 		}
 
 		// 上游错误原样透传（状态码 + body），网络错误返回 502
-		forwardUpstream(c, backendID, apiType, raw, apiBaseUrl+"v1/"+apiType+"/"+raw, authHeaders, queryString)
+		forwardUpstream(c, apiBaseUrl+"v1/"+apiType+"/"+raw, authHeaders, queryString)
 
 	default:
 		apiError(c, http.StatusBadRequest, "Invalid API type")
@@ -434,22 +447,8 @@ func forwardWSProbe(c *gin.Context, backendID, apiType, raw string, query map[st
 		c.String(http.StatusBadGateway, "Node %s is WS-only but WS channel is disabled (ws-port=0 or bind failed)", backendID)
 		return
 	}
-	start := time.Now()
-	status, body, err := wsSrv.RequestProbe(backendID, apiType, raw, query, wsProbeTimeout())
-	latency := time.Since(start)
-
-	recordAPIRequest(backendID, apiType, status, latency, err != nil, sourceWS)
-	if isProbeType(apiType) {
-		pr := probeResult{NodeID: backendID, APIType: apiType, Raw: raw, Status: status, LatencyMs: latency.Milliseconds(), Source: sourceWS}
-		for k, v := range query {
-			if pr.Query != "" {
-				pr.Query += "&"
-			}
-			pr.Query += k + "=" + url.QueryEscape(v)
-		}
-		recordProbeResult(pr, err, body)
-	}
-
+	// scheduler=false：这是中间件转发真实业务，节点应正常上报（节点是唯一记录者，见 report.go）
+	status, body, err := wsSrv.RequestProbe(backendID, apiType, raw, query, wsProbeTimeout(), false)
 	if err != nil {
 		c.String(http.StatusBadGateway, "WS probe failed: %s", err.Error())
 		return
@@ -522,6 +521,11 @@ func corsMiddleware() gin.HandlerFunc {
 	allowAll := len(ACCEPT_DOMAINS) == 0
 	allowed := make(map[string]bool, len(ACCEPT_DOMAINS))
 	for _, d := range ACCEPT_DOMAINS {
+		if d == "*" {
+			// 显式通配视为允许所有来源（配合鉴权头须回显具体 origin，不能回 "*"）
+			allowAll = true
+			continue
+		}
 		allowed[strings.ToLower(d)] = true
 	}
 	return func(c *gin.Context) {
@@ -542,7 +546,7 @@ func corsMiddleware() gin.HandlerFunc {
 			if allow {
 				c.Header("Access-Control-Allow-Origin", origin)
 				c.Header("Vary", "Origin")
-				c.Header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
+				c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
 				c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
 				c.Header("Access-Control-Max-Age", "86400")
 			}
@@ -769,44 +773,75 @@ func readConfig() error {
 	} else {
 		mw.DataRetentionDays = 30
 	}
-	// stats-flush-seconds：统计计数器落库间隔；缺省 30
-	if v := os.Getenv("STATS_FLUSH_SECONDS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("parse env STATS_FLUSH_SECONDS: %w", err)
-		}
-		mw.StatsFlushSeconds = n
-	} else if viper.IsSet("stats-flush-seconds") {
-		mw.StatsFlushSeconds = viper.GetInt("stats-flush-seconds")
-	} else {
-		mw.StatsFlushSeconds = 30
-	}
-
-	// ===== 数据上报（report-url / report-token / report-interval-seconds / report-probes） =====
-	if v := os.Getenv("REPORT_URL"); v != "" {
-		mw.ReportURL = v
-	} else {
-		mw.ReportURL = viper.GetString("report-url")
-	}
+	// ===== 节点上报接收（report-token：/report 鉴权） =====
 	if v := os.Getenv("REPORT_TOKEN"); v != "" {
 		mw.ReportToken = v
 	} else {
 		mw.ReportToken = viper.GetString("report-token")
 	}
-	if v := os.Getenv("REPORT_INTERVAL_SECONDS"); v != "" {
+
+	// ===== SMTP 掉线告警（smtp / alert 段） =====
+	// smtp：env JSON > setting.json > 缺省关闭
+	if err := envJSON("SMTP", &mw.Smtp); err != nil {
+		return err
+	}
+	if mw.Smtp.Host == "" && viper.Get("smtp") != nil {
+		if err := viperValue("smtp", &mw.Smtp); err != nil {
+			return fmt.Errorf("parse smtp: %w", err)
+		}
+	}
+	if mw.Smtp.TimeoutSec <= 0 {
+		mw.Smtp.TimeoutSec = 10
+	}
+	// alert：env JSON > setting.json > 缺省 {enabled:true, threshold:3}
+	haveAlertEnv := os.Getenv("ALERT") != ""
+	if err := envJSON("ALERT", &mw.Alert); err != nil {
+		return err
+	}
+	if !haveAlertEnv {
+		if !viper.IsSet("alert") {
+			mw.Alert = alertConfig{Enabled: true, DownThreshold: 3}
+		} else if err := viperValue("alert", &mw.Alert); err != nil {
+			return fmt.Errorf("parse alert: %w", err)
+		}
+	}
+	if mw.Alert.DownThreshold <= 0 {
+		mw.Alert.DownThreshold = 3
+	}
+
+	// ===== JWT 登录（见 auth.go） =====
+	// jwt-secret：HMAC 密钥；与 admin-password 齐备才启用 JWT 登录，env > setting.json
+	if v := os.Getenv("JWT_SECRET"); v != "" {
+		mw.JWTSecret = v
+	} else {
+		mw.JWTSecret = viper.GetString("jwt-secret")
+	}
+	// jwt-expiry-seconds：token 有效秒，缺省 86400
+	if v := os.Getenv("JWT_EXPIRY_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Errorf("parse env REPORT_INTERVAL_SECONDS: %w", err)
+			return fmt.Errorf("parse env JWT_EXPIRY_SECONDS: %w", err)
 		}
-		mw.ReportIntervalSeconds = n
-	} else if viper.IsSet("report-interval-seconds") {
-		mw.ReportIntervalSeconds = viper.GetInt("report-interval-seconds")
+		mw.JWTExpirySeconds = n
+	} else if viper.IsSet("jwt-expiry-seconds") {
+		mw.JWTExpirySeconds = viper.GetInt("jwt-expiry-seconds")
 	} else {
-		mw.ReportIntervalSeconds = 15
+		mw.JWTExpirySeconds = 86400
 	}
-	if viper.IsSet("report-probes") {
-		b := viper.GetBool("report-probes")
-		mw.ReportProbes = &b
+	// admin-user：登录用户名，缺省 admin
+	if v := os.Getenv("ADMIN_USER"); v != "" {
+		mw.AdminUser = v
+	} else {
+		mw.AdminUser = viper.GetString("admin-user")
+	}
+	if mw.AdminUser == "" {
+		mw.AdminUser = "admin"
+	}
+	// admin-password：登录口令，空 = 不启用 JWT 登录
+	if v := os.Getenv("ADMIN_PASSWORD"); v != "" {
+		mw.AdminPassword = v
+	} else {
+		mw.AdminPassword = viper.GetString("admin-password")
 	}
 
 	// 节点池结构：api-base-url 与 ip-location-api（env JSON > setting.json）
@@ -887,16 +922,14 @@ func readConfig() error {
 	DB_CONF = mw.Database
 	ADMIN_TOKEN = mw.AdminToken
 	DATA_RETENTION_DAYS = mw.DataRetentionDays
-	STATS_FLUSH_SECONDS = mw.StatsFlushSeconds
-	REPORT_URL = mw.ReportURL
 	REPORT_TOKEN = mw.ReportToken
-	if mw.ReportIntervalSeconds <= 0 {
-		REPORT_INTERVAL = 15
-	} else {
-		REPORT_INTERVAL = mw.ReportIntervalSeconds
-	}
-	// 拨测明细随报文上报，缺省开
-	REPORT_PROBES = mw.ReportProbes == nil || *mw.ReportProbes
+	SMTP_CONF = mw.Smtp
+	ALERT_CONF = mw.Alert
+	// JWT 登录全局（auth.go 定义）
+	JWT_SECRET = mw.JWTSecret
+	JWT_EXPIRY = mw.JWTExpirySeconds
+	ADMIN_USER = mw.AdminUser
+	ADMIN_PASSWORD = mw.AdminPassword
 	CONFIG_SOURCE = viper.ConfigFileUsed()
 	return nil
 }
@@ -936,12 +969,10 @@ func main() {
 	store.Start()
 	defer store.Stop()
 
-	// 数据上报客户端：配置 report-url 后，本实例把自己观测的统计/拨测定期推给收集中心
-	// （收集中心自身不要配 report-url 指向自己，否则本地+上报双份）
-	if REPORT_URL != "" {
-		reporter = newReportClient()
-		reporter.Start()
-	}
+	// 首次启动 seed 初始 admin（users 表空时），见 users.go
+	seedUsers()
+	// 兼容迁移：为已存在(Email 非空)的账号补齐邮箱已验证标记，避免老账号被误限（见 users.go backfillEmailVerified）
+	backfillEmailVerified()
 
 	// WS 服务端（端口由配置 ws-port / 环境变量 WS_PORT 决定，缺省 8092，0 = 关闭）。
 	// 后端节点作为 WS 客户端连入；节点配置 "ws": true 时拨测请求改走 WS 通道。现有 HTTP 路由不受影响。
@@ -953,6 +984,9 @@ func main() {
 	} else {
 		log.Printf("[ws] ws channel disabled (wsPort=0)")
 	}
+
+	// 服务节点掉线看门狗（HTTP 版每 1h 探 url 根/health、WS 版看心跳），见 nodeHealth.go
+	startNodeWatcher()
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
@@ -982,10 +1016,9 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// 中间件路由，对应前端 server/routes/middleware/[...slug].get.ts
-	// 同时兼容 /v1/... 与 /middleware/... 两种前缀。
-	// 限流只挂在转发路由上：/report（前端内置中间件"调一次上报一次"）、/admin、/remote-config
-	// 不受限流影响，否则上报会被转发限流误伤。
+	// 转发路由：/{prefix}/{backendID}/{apiType}/{raw}，同时兼容 /v1/... 与 /middleware/... 两种前缀。
+	// 限流只挂在转发路由上：/report（节点上报）、/admin、/remote-config 不在限流组内，
+	// 否则节点上报会被转发限流误伤。
 	router.Use(corsMiddleware())
 	if RATE_LIMIT > 0 {
 		limited := router.Group("", rateLimitMiddleware(newRateLimiter(RATE_LIMIT)))
@@ -996,7 +1029,7 @@ func main() {
 		router.GET("/middleware/*slug", middlewareHandler)
 	}
 
-	// 数据上报接口（HTTP 主动上报入口，协议见 report.go）
+	// 节点上报接口（无 WS 通道的节点走 HTTP，协议见 report.go）
 	registerReportRoutes(router)
 
 	// 节点远端配置托管：本服务作为节点 remote-config-url 的提供方（见 admin.go）
@@ -1004,6 +1037,9 @@ func main() {
 
 	// 管理 API：节点列表 / 统计 / 拨测记录 / 节点配置 CRUD（见 admin.go）
 	registerAdminRoutes(router)
+
+	// 浏览器控制台实时推送 WS（/console/sla，与 HTTP 同端口升级；避开 /ws 前缀，与节点通道 8092 解耦）
+	registerConsoleSlaRoute(router)
 
 	// 监听地址优先级: 环境变量 PORT > setting.json port（readConfig 已写入全局 PORT）> 默认 8080
 	if v := os.Getenv("PORT"); v != "" {
