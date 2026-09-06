@@ -189,15 +189,15 @@ func computeTaskSla(taskID uint, dur time.Duration) (*slaTaskResp, error) {
 		ev := evalSample(&t, r.Status, r.Body, r.LatencyMs)
 		a.Samples++
 		total++
-		if !ev.invalid {
-			latBuckets[r.NodeID] = append(latBuckets[r.NodeID], r.LatencyMs)
-		}
 		if ev.invalid {
 			a.Invalid++
 			continue // invalid 不进 up/down，也不进延迟统计
 		}
 		if ev.up {
 			a.Up++
+			// 延迟统计只认可达(up)样本：不可达(down)的延迟无意义（DNS 失败/连不上落库为 0），
+			// 若计入平均/p95 会把假数值混进"到目标延迟"，因此排除。
+			latBuckets[r.NodeID] = append(latBuckets[r.NodeID], r.LatencyMs)
 		} else {
 			a.Down++
 		}
@@ -267,14 +267,53 @@ func evalSample(t *ProbeTask, linkStatus int, body string, latMs int64) sampleEv
 		ev.up = up
 		ev.invalid = invalid
 	default:
-		// tcping / speed：无双栈 body，用链路 HTTP 状态命中判定
-		if linkStatus == 0 {
-			ev.invalid = true // 链路请求失败且无 body，无法判定 → invalid
-		} else {
-			ev.up = statusIsExpected(linkStatus, t.ExpectStatus)
-		}
+		// tcping / speed：body 扁平（speed 顶层字段、tcping 由 ipv4 包裹）。
+		// 优先解析节点 body 的真实可达性（is_reachable / ipv4.success），
+		// 链路 HTTP 状态恒为转发层的 200，不可信；仅当 body 拿不到可达性信号时才回退链路命中。
+		ev.up, ev.invalid = evalFlatBody(t, body, linkStatus)
 	}
 	return ev
+}
+
+// evalFlatBody 判定 tcping/speed 类样本（无双栈 body）。
+// 返回 (up, invalid)。invalid=true 表示 body 无法解析且链路也失败，不进成败。
+//
+// 各类型 body 可达性信号：
+//   - speed：顶层布尔 is_reachable（false=目标不可达/DNS 失败，即使转发链路 200 也应判 down）
+//   - tcping：ipv4.success（成功探测次数，>0 视为可达）
+//   - 命中可达性信号后，speed 再叠加 http_status_code 是否命中期望（tcping 无状态码，不看）
+//
+// 回退链路状态仅用于：body 为空 / 非 JSON / 不含可达性信号且结构不可识别的极端情况。
+func evalFlatBody(t *ProbeTask, body string, linkStatus int) (up bool, invalid bool) {
+	var root map[string]any
+	jsonOK := body != "" && json.Unmarshal([]byte(body), &root) == nil
+	if jsonOK {
+		// speed：顶层 is_reachable 存在 → 以其为最终判定依据
+		if reachable, ok := root["is_reachable"].(bool); ok {
+			if !reachable {
+				return false, false // 明确不可达（DNS 失败等）→ down，计入失败
+			}
+			// 可达 → 再校验真实状态码命中期望；无状态码则按可达即 up
+			if code, ok := numOf(root, "http_status_code"); ok && code > 0 {
+				return statusIsExpected(code, t.ExpectStatus), false
+			}
+			return true, false
+		}
+		// tcping：解析 ipv4.success（成功探测次数 >0 = 可达）
+		if ipv4, ok := root["ipv4"].(map[string]any); ok {
+			if succ, ok := numOf(ipv4, "success"); ok && succ > 0 {
+				return true, false
+			}
+			// 有 ipv4 结构但成功数为 0：视为不可达（down）而非 invalid，如实反映失败
+			return false, false
+		}
+		// JSON 可解析但结构不识别的非标准 body → 回落链路判定（不武断判 down）
+	}
+	// 兜底：body 空/非 JSON/结构未知 → 用链路状态（转发层 200 只在节点正常时出现）
+	if linkStatus == 0 {
+		return false, true // 链路请求失败且无有效 body，无法判定 → invalid
+	}
+	return statusIsExpected(linkStatus, t.ExpectStatus), false
 }
 
 // evalDualStack 解析 detail/ssl 双栈 body 判定 up。
@@ -403,14 +442,16 @@ func extractSpecial(t *ProbeTask, body string) map[string]any {
 	return out
 }
 
-// trueLatencyMs 从 detail/ssl 双栈 body 提取节点实测的真实延迟(ms)——各可达栈 total_time 的平均。
-// total_time 是节点侧对目标站点做 HTTP(S) 探测的全程耗时，不含"控制台→节点"的中间链路往返，
-// 与 SLA 曲线/平均延迟想表达的"到目标的真实延迟"一致。无任何可用 total_time 时返回 ok=false，
-// 由调用方回退为端到端耗时。
+// trueLatencyMs 从节点 body 提取**节点实测**的真实延迟(ms)——不含"控制台→节点"的中间链路往返，
+// 与 SLA 曲线/平均延迟想表达的"到目标的真实延迟"一致。按拨测类型取不同字段：
+//
+//   - detail/ssl：ipv4/ipv6 栈 total_time（节点对目标 HTTP(S) 探测全程耗时）取可达栈平均；
+//   - tcping：栈 avg_rtt（节点 ping 往返，可达 >0，DNS 失败为 -1）；
+//   - speed：顶层 total_time（节点下载/探测耗时）。
+//
+// 返回 (ms, ok)。目标不可达/链路失败（无可用延迟字段，如 DNS 失败 avg_rtt=-1、total_time=0/缺失）
+// 时返回 (0, false)——由调用方把延迟落 0（不可达无延迟），而非回退成控制台端到端耗时。
 func trueLatencyMs(t *ProbeTask, body string) (int64, bool) {
-	if t.APIType != "detail" && t.APIType != "ssl" {
-		return 0, false // tcping/speed 无双栈 body 延迟字段，交调用方回退
-	}
 	if body == "" {
 		return 0, false
 	}
@@ -418,22 +459,39 @@ func trueLatencyMs(t *ProbeTask, body string) (int64, bool) {
 	if json.Unmarshal([]byte(body), &root) != nil {
 		return 0, false
 	}
-	var sum int64
-	var n int
-	for _, k := range []string{"ipv4", "ipv6"} {
-		o, ok := root[k].(map[string]any)
-		if !ok {
-			continue
+	switch t.APIType {
+	case "detail", "ssl", "tcping":
+		// 双栈/ipv4 包裹：对"存在的栈"取真实延迟字段，仅累加可达栈（字段值>0）。
+		// detail/ssl 看 total_time，tcping 看 avg_rtt。
+		field := "total_time"
+		if t.APIType == "tcping" {
+			field = "avg_rtt"
 		}
-		if v, ok := numOf(o, "total_time"); ok && v > 0 {
-			sum += int64(v)
-			n++
+		var sum int64
+		var n int
+		for _, k := range []string{"ipv4", "ipv6"} {
+			o, ok := root[k].(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, ok := numOf(o, field); ok && v > 0 {
+				sum += int64(v)
+				n++
+			}
 		}
-	}
-	if n == 0 {
+		if n == 0 {
+			return 0, false
+		}
+		return int64(math.Round(float64(sum) / float64(n))), true
+	case "speed":
+		// speed body 顶层扁平，total_time 为节点真实耗时（不可达时=0/缺失）
+		if v, ok := numOf(root, "total_time"); ok && v > 0 {
+			return int64(v), true
+		}
+		return 0, false
+	default:
 		return 0, false
 	}
-	return int64(math.Round(float64(sum) / float64(n))), true
 }
 
 // numOf 从 map 取数值字段（兼容 float64 / json.Number）

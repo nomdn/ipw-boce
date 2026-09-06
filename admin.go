@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -467,6 +468,8 @@ func registerAdminRoutes(router *gin.Engine) {
 	})
 
 	// 删除任务（user 仅自己创建的）
+	// 级联清退该任务的历史拨测数据（source=sched 样本全部删掉，含 body），
+	// 避免任务删了、SLA 明细与明细页仍残留孤儿样本；先删数据后删任务，DB 失败不影响任务已删结果。
 	admin.DELETE("/tasks/:id", func(c *gin.Context) {
 		ctx, cancel := dbCtx()
 		defer cancel()
@@ -479,11 +482,19 @@ func registerAdminRoutes(router *gin.Engine) {
 			apiError(c, http.StatusForbidden, "not your task")
 			return
 		}
-		res := db.WithContext(ctx).Delete(&ProbeTask{}, idParam(c))
+		taskID := idParam(c)
+		// 清退该任务全部定时样本（task_id 归属，只有 source=sched 会打 task_id；手动 biz 为 0 不受影响）
+		if err := db.WithContext(ctx).Where("task_id = ?", taskID).Delete(&ProbeResult{}).Error; err != nil {
+			log.Printf("[task] DELETE task#%d samples cleanup error: %v", taskID, err)
+		}
+		res := db.WithContext(ctx).Delete(&ProbeTask{}, taskID)
 		if res.Error != nil {
 			apiError(c, http.StatusInternalServerError, res.Error.Error())
 			return
 		}
+		// 清内存态：释放该任务重入锁、复位掉线告警计数/已触发标记，避免残留占用或误告警
+		taskEndRun(taskID)
+		resetTaskAlerts(taskID)
 		c.JSON(http.StatusOK, gin.H{"deleted": res.RowsAffected > 0})
 	})
 

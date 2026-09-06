@@ -18,10 +18,10 @@
         </select>
       </div>
       <div class="form-field">
-        <label>接口类型</label>
+        <label>拨测方案</label>
         <select class="ak-select" v-model="f.type">
           <option value="">全部</option>
-          <option v-for="t in types" :key="t" :value="t">{{ t }}</option>
+          <option v-for="t in typeOpts" :key="t.value" :value="t.value">{{ t.label }}</option>
         </select>
       </div>
       <div class="form-field">
@@ -41,20 +41,23 @@
         <table class="ak-table">
           <thead>
             <tr>
-              <th>时间</th><th>节点</th><th>类型</th><th>目标 raw</th><th>状态</th><th>延迟</th><th>来源</th>
+              <th>时间</th><th>节点</th><th>拨测方案</th><th>方式</th><th>目标</th><th>状态</th><th>延迟</th><th>来源</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="p in probes" :key="p.id">
               <td class="mono nowrap">{{ fmtTime(p.createdAt) }}</td>
               <td class="mono nowrap">{{ p.nodeId }}</td>
-              <td><span class="ak-tag ch">{{ p.apiType }}</span></td>
-              <td class="mono" style="word-break:break-all;max-width:340px">{{ p.raw }}</td>
+              <td><span class="ak-tag ch">{{ apiLabel(p.apiType) }}</span></td>
+              <td>
+                <span v-if="parseRow(p).kind" class="ak-tag ch kind">{{ parseRow(p).kind }}</span>
+              </td>
+              <td class="mono" style="word-break:break-all;max-width:360px">{{ parseRow(p).target }}</td>
               <td><span class="mono" :class="p.status >= 200 && p.status < 300 ? 'ok-200' : (p.error ? 'err' : 'dim')">{{ p.status || '—' }}</span></td>
               <td class="mono nowrap">{{ p.latencyMs }}ms</td>
               <td><span class="ak-tag ch" :class="srcClass(p.source)">{{ srcLabel(p.source) }}</span></td>
             </tr>
-            <tr v-if="!probes.length && !loading"><td colspan="7" class="dim">暂无{{ curLabel }}明细</td></tr>
+            <tr v-if="!probes.length && !loading"><td colspan="8" class="dim">暂无{{ curLabel }}明细</td></tr>
           </tbody>
         </table>
       </div>
@@ -66,12 +69,14 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { fetchProbes, fetchNodes } from '../api/boce.js'
 import { fmtTime } from '../utils/format.js'
+import { apiOptions, apiLabel, parseProbeRaw } from '../utils/probeMeta.js'
 
 const cats = [
   { value: 'sched', label: '定时拨测' },
   { value: 'biz', label: '业务拨测' },
 ]
-const types = ['detail', 'ssl', 'dns', 'tcping', 'speed']
+// 拨测方案下拉：value 是后端 apiType slug，label 是面向用户的中文方案名（见 utils/probeMeta.js）
+const typeOpts = apiOptions
 const cat = ref('sched') // 当前页签
 const f = reactive({ node: '', type: '', limit: 100 })
 const probes = ref([])
@@ -79,6 +84,19 @@ const knownNodes = ref([])
 const loading = ref(false)
 
 const curLabel = computed(() => cats.find((c) => c.value === cat.value)?.label || '')
+
+// 解析每条样本的 raw → { kind, target }（speed 拆 v4/v6，dns 拆记录类型）
+// 缓存解析结果（同一 raw 重复出现时省一次正则）
+const parsedCache = new Map()
+function parseRow(p) {
+  const key = `${p.apiType}::${p.raw}`
+  let r = parsedCache.get(key)
+  if (!r) {
+    r = parseProbeRaw(p.apiType, p.raw)
+    parsedCache.set(key, r)
+  }
+  return r
+}
 
 // source → 可读来源标签
 const srcLabelMap = {
@@ -146,5 +164,11 @@ async function load() {
   background: var(--ak-signal-info);
   color: #fff;
   font-weight: 600;
+}
+.ak-tag.ch.kind {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: var(--ak-text-secondary);
+  font-size: 0.72rem;
 }
 </style>

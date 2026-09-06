@@ -56,6 +56,15 @@ var (
 	alertFired  = map[uint]bool{} // taskID → 是否已就本次故障触发过告警
 )
 
+// resetTaskAlerts 任务被删除时清掉其掉线告警内存态（连续计数 + 已触发标记），
+// 防止内存里残留的 map 条目占用；下次同 id 复用任务也不会误触发旧告警。
+func resetTaskAlerts(id uint) {
+	alertMu.Lock()
+	delete(alertStreak, id)
+	delete(alertFired, id)
+	alertMu.Unlock()
+}
+
 // judgeRoundDown 判定本轮是否"整组 down"。rows 为刚落库(或待落库)的一轮 sched 样本。
 // 返回 (roundDown, hasValid)。roundDown=true 仅当有有效样本且无任何节点 up。
 func judgeRoundDown(t *ProbeTask, rows []ProbeResult) (bool, bool) {

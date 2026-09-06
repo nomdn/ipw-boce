@@ -220,9 +220,11 @@ func (s *dataStore) runTaskSamples(t *ProbeTask) {
 		if len(r.body) > 0 {
 			body = string(r.body)
 		}
-		// 延迟口径：detail/ssl 从 body 提取节点实测的 total_time 作为真延迟（不含控制台→节点链路），
-		// 提取不到(如链路失败无 body、tcping/speed)才回退为控制台端到端耗时 r.latMs。
-		lat := r.latMs
+		// 延迟口径：从 body 提取**节点实测**的真实延迟（不含控制台→节点链路）——
+		//   detail/ssl → ipv4/ipv6 栈 total_time；tcping → 栈 avg_rtt；speed → 顶层 total_time。
+		// 提取不到即"目标不可达/无有效延迟"（DNS 失败、连不上等），延迟无意义，落 0，
+		// 而非回退成控制台端到端耗时 r.latMs 冒充到站延迟；down 样本的 0 在聚合层被排除。
+		lat := int64(0)
 		if real, ok := trueLatencyMs(t, body); ok {
 			lat = real
 		}

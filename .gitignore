@@ -4,6 +4,9 @@
 *.db-shm
 *.db-wal
 tmp-smoke/
+# 交叉编译产物（本机编译后按目标平台部署，不入库）
+ipw-boce-linux-arm64
+ipw-boce-*
 
 # 本地配置（含密钥）
 setting.json

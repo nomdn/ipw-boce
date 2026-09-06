@@ -129,17 +129,20 @@
 import { ref, reactive, computed } from 'vue'
 import { runBatchProbe } from '../api/boce.js'
 import ResultFieldView from '../components/ResultFieldView.vue'
+import { apiOptions } from '../utils/probeMeta.js'
 
+// typeMeta：UI 元数据 (label/hint/def) 沿用 apiOptions 顺序与命名，
+// 仅补前端表单字段（hint/def/defDomain/defType）保持向后兼容。
 const typeMeta = [
-  { value: 'tcping', label: 'tcping · TCP 连通', hint: 'host，如 1.1.1.1', def: '1.1.1.1' },
-  { value: 'speed', label: 'speed · 测速', hint: '测速文件 URL，如 https://host/file', def: 'https://speed.cloudflare.com/__down?bytes=1000000' },
-  { value: 'detail', label: 'detail · 网站检查', hint: '完整 URL，如 https://www.qq.com', def: 'https://www.qq.com' },
-  { value: 'ssl', label: 'ssl · 证书检查', hint: '完整 URL 或域名', def: 'https://www.qq.com' },
-  { value: 'dns', label: 'dns · 域名解析', hint: '', def: '', defDomain: 'example.com', defType: 'a' },
-  { value: 'whois', label: 'whois · 域名', hint: '域名，如 example.com', def: 'example.com' },
-  { value: 'dnssec', label: 'dnssec · 签名校验', hint: '域名', def: 'cloudflare.com' },
-  { value: 'location', label: 'location · IP 定位', hint: 'IP', def: '8.8.8.8' },
-  { value: 'asn', label: 'asn · 归属', hint: 'IP', def: '8.8.8.8' },
+  { value: 'tcping',   label: 'TCPing · 端口连通',   hint: 'host，如 1.1.1.1', def: '1.1.1.1' },
+  { value: 'speed',    label: 'Speed · 下载速度',    hint: '测速文件 URL，如 https://host/file', def: 'https://speed.cloudflare.com/__down?bytes=1000000' },
+  { value: 'detail',   label: '综合详情 · 网站检查', hint: '完整 URL，如 https://www.qq.com', def: 'https://www.qq.com' },
+  { value: 'ssl',      label: 'SSL · 证书检测',      hint: '完整 URL 或域名', def: 'https://www.qq.com' },
+  { value: 'dns',      label: 'DNS · 域名解析',      hint: '', def: '', defDomain: 'example.com', defType: 'a' },
+  { value: 'whois',    label: 'Whois · 域名注册',    hint: '域名，如 example.com', def: 'example.com' },
+  { value: 'dnssec',   label: 'DNSSEC · 签名校验',   hint: '域名', def: 'cloudflare.com' },
+  { value: 'location', label: 'Location · IP 归属地', hint: 'IP', def: '8.8.8.8' },
+  { value: 'asn',      label: 'ASN · 自治域',        hint: 'IP', def: '8.8.8.8' },
 ]
 
 // dns 域名解析可选的记录类型（value 为节点侧 /dns/:type 的 slug）

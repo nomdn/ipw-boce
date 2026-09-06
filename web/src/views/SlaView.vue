@@ -21,80 +21,21 @@
     </div>
     <div v-if="loading" class="loading-center"><span class="ak-loading"></span></div>
 
-    <!-- 新建 / 编辑任务表单 -->
-    <section v-if="editing" class="panel" style="margin-bottom:16px">
-      <h2 class="panel-title">{{ form.id ? '编辑任务' : '新建任务' }} <span class="hl">/ probe task</span></h2>
-      <div class="form-row" style="margin-bottom:10px">
-        <div class="form-field">
-          <label>任务名</label>
-          <input class="ak-input" v-model.trim="form.name" placeholder="如 ssl-zakoflare" style="width:180px" />
-        </div>
-        <div class="form-field">
-          <label>拨测类型</label>
-          <select class="ak-select" v-model="form.apiType" style="width:120px">
-            <option v-for="t in types" :key="t" :value="t">{{ t }}</option>
-          </select>
-        </div>
-        <div class="form-field" style="flex:1;min-width:220px">
-          <label>拨测目标</label>
-          <input class="ak-input" v-model.trim="form.target" :placeholder="targetHint" />
-        </div>
-        <div class="form-field" v-if="form.apiType === 'speed'">
-          <label>栈</label>
-          <select class="ak-select" v-model="form.stack" style="width:90px">
-            <option value="">默认 v4</option>
-            <option value="v4">v4</option>
-            <option value="v6">v6</option>
-          </select>
-        </div>
-        <div class="form-field">
-          <label>间隔 (秒)</label>
-          <input class="ak-input" type="number" v-model.number="form.intervalSec" style="width:90px" />
-        </div>
-        <div class="form-field">
-          <label>慢阈值 (ms)</label>
-          <input class="ak-input" type="number" v-model.number="form.slowMs" placeholder="0=不判慢" style="width:110px" />
-        </div>
-      </div>
-
-      <div class="form-row">
-        <div class="form-field">
-          <label>期望状态码</label>
-          <input class="ak-input" v-model.trim="form.expectStatus" placeholder="2xx 或 200,301" style="width:130px" />
-        </div>
-        <div class="form-field">
-          <label>节点范围</label>
-          <select class="ak-select" v-model="form.nodeScope" style="width:110px">
-            <option value="all">全部节点</option>
-            <option value="custom">指定节点</option>
-          </select>
-        </div>
-        <div class="form-field" v-if="form.nodeScope === 'custom'" style="flex:1;min-width:200px">
-          <label>节点 id（逗号分隔）</label>
-          <input class="ak-input" v-model.trim="form.nodeIds" placeholder="test-node-1,test-http" />
-        </div>
-        <label class="chk" v-if="form.apiType === 'detail'">
-          <input type="checkbox" v-model="form.bothProtocols" /> http 与 https 都命中才算成功
-        </label>
-        <label class="chk" v-if="form.apiType === 'detail' || form.apiType === 'ssl'">
-          <input type="checkbox" v-model="form.requireAllStacks" /> 双栈全通才算可用
-        </label>
-        <label class="chk" v-if="form.apiType === 'ssl'">
-          <input type="checkbox" v-model="form.certExpiredDown" /> 证书过期视为不可用
-        </label>
-        <span style="flex:1"></span>
-        <button class="ak-button ak-button--outline" @click="cancelEdit">取消</button>
-        <button class="ak-button ak-button--action" @click="save" :disabled="saving">保存</button>
-      </div>
-      <div v-if="formMsg" :class="formErr ? 'err' : 'ok-200'" style="margin-top:8px;font-size:.8rem">{{ formMsg }}</div>
-    </section>
+    <!-- 新建任务表单（编辑任务的表单插入到对应任务卡下方，详见 sla-stack 内） -->
+    <TaskFormPanel
+      v-if="editingId === 0"
+      :form="form" :target-hint="targetHint"
+      :saving="saving" :msg="formMsg" :err="formErr"
+      @submit="save" @cancel="cancelEdit"
+    />
 
     <!-- 每任务一张 SLA 卡 -->
     <div v-if="!loading" class="sla-stack">
-      <section v-for="tk in taskCards" :key="tk.task.id" class="panel sla-card">
+      <template v-for="tk in taskCards" :key="tk.task.id">
+      <section class="panel sla-card">
         <div class="sla-head">
           <div class="sla-title">
-            <span class="ak-tag ch type-tag">{{ tk.task.apiType }}</span>
+            <span class="ak-tag ch type-tag">{{ apiLabel(tk.task.apiType) }}</span>
             <span class="mono name">{{ tk.task.name }}</span>
             <span class="dim tgt">{{ tk.task.target }}</span>
             <span class="dim gap">{{ every(tk.task) }} · 慢&gt;{{ tk.task.slowMs || 0 }}ms</span>
@@ -157,6 +98,14 @@
         </div>
         <div v-else class="dim empty">该窗口暂无定时样本：{{ tk.sla?.samples || 0 }} 条（确认任务已启用、间隔合理且节点可达）</div>
       </section>
+      <!-- 编辑当前任务时把表单插入到该任务卡下方，而不是跳到列表顶部 -->
+      <TaskFormPanel
+        v-if="editingId === tk.task.id"
+        :form="form" :target-hint="targetHint"
+        :saving="saving" :msg="formMsg" :err="formErr"
+        @submit="save" @cancel="cancelEdit"
+      />
+    </template>
     </div>
   </div>
 </template>
@@ -171,10 +120,13 @@ import { WS_BASE } from '../config.js'
 import { fmtTime } from '../utils/format.js'
 import { useDialog } from '../composables/useDialog.js'
 import EChart from '../components/EChart.vue'
+import TaskFormPanel from '../components/TaskFormPanel.vue'
+import { apiOptions, apiLabel } from '../utils/probeMeta.js'
 
 const dialog = useDialog()
 const hours = ref(24)
-const types = ref(['tcping', 'speed', 'ssl', 'detail'])
+// 拨测方案候选：fetchTaskMeta 返回的 types 可覆盖（追加业务后端新增的探针类）
+const types = ref(apiOptions.map((o) => o.value))
 const tasks = ref([])
 const slaMap = ref({}) // taskId -> sla resp
 const seriesMap = ref({}) // taskId -> 分桶时序（延迟曲线）
@@ -186,10 +138,12 @@ const saving = ref(false)
 const formMsg = ref('')
 const formErr = ref(false)
 const form = ref(blankForm())
+// 当前编辑的是哪个任务：0 = 新建任务（顶部表单）；其他 = 编辑该任务（表单插到对应卡片下方）
+const editingId = ref(0)
 
 function blankForm() {
   return {
-    id: null, name: '', apiType: 'ssl', target: '', stack: '', nodeScope: 'all', nodeIds: '',
+    id: null, name: '', apiType: 'detail', target: '', stack: '', nodeScope: 'all', nodeIds: '',
     intervalSec: 60, slowMs: 0, expectStatus: '2xx',
     bothProtocols: true, requireAllStacks: true, certExpiredDown: true,
   }
@@ -458,17 +412,27 @@ function slaTrendOption(series) {
     const v = typeof s.avgMs === 'number' && s.avgMs > 0 ? s.avgMs : null
     return t == null || v == null ? null : [t, v]
   })
-  // 失败段：连续 down>0 的桶聚成区间（相邻桶共享起始/结束时间戳）
+  // 失败段：把连续 down>0 的桶聚成区间。区间左边界 = 段内首桶起点；
+  // 右边界 = 段内末桶的下一个桶起点（若无下一个桶则用末桶起点），确保整段连续失败被完整覆盖。
+  // （旧实现只在段首设 endI 不随段内更新，连续失败段被压成单桶宽，红线几乎不可见。）
   const areas = []
-  let start = null
-  let endI = -1
-  for (let i = 0; i <= rows.length; i++) {
-    const isFail = i < rows.length ? rows[i].down > 0 : false
-    if (isFail && start === null) { start = xv[i]; endI = i }
-    else if (!isFail && start !== null) {
-      areas.push([{ name: '失败', xAxis: start }, { xAxis: xv[endI] }])
-      start = null
+  let segStart = null // 当前失败段首桶起点（ms）
+  let lastFailT = null // 当前失败段末桶起点（ms）
+  for (let i = 0; i < rows.length; i++) {
+    const fail = rows[i].down > 0
+    if (fail) {
+      if (segStart === null) segStart = xv[i]
+      lastFailT = xv[i]
+    } else if (segStart !== null) {
+      // 段结束：右边界取到失败段紧邻的下一个桶起点，覆盖完整
+      areas.push([{ name: '失败', xAxis: segStart }, { xAxis: xv[i] }])
+      segStart = null
+      lastFailT = null
     }
+  }
+  if (segStart !== null) {
+    // 段延伸到末尾：无下一桶，右边界取末桶起点（仍有宽度 > 0）
+    areas.push([{ name: '失败', xAxis: segStart }, { xAxis: lastFailT }])
   }
   return {
     color: [CH.cyan],
@@ -526,6 +490,7 @@ function slaTrendOption(series) {
 function openCreate() {
   form.value = blankForm()
   editing.value = true
+  editingId.value = 0 // 新建：顶部表单
   formMsg.value = ''
 }
 function openEdit(t) {
@@ -536,9 +501,10 @@ function openEdit(t) {
     bothProtocols: t.bothProtocols, requireAllStacks: t.requireAllStacks, certExpiredDown: t.certExpiredDown,
   }
   editing.value = true
+  editingId.value = t.id // 编辑：该任务卡下方插入表单
   formMsg.value = ''
 }
-function cancelEdit() { editing.value = false; formMsg.value = '' }
+function cancelEdit() { editing.value = false; editingId.value = 0; formMsg.value = '' }
 
 async function save() {
   saving.value = true
@@ -556,7 +522,7 @@ async function save() {
     if (form.value.id) await updateTask(form.value.id, payload)
     else await createTask(payload)
     formMsg.value = '已保存'
-    editing.value = false
+    cancelEdit()
     await load()
   } catch (e) {
     formErr.value = true
@@ -575,7 +541,7 @@ async function toggle(t) {
 async function remove(t) {
   const ok = await dialog.confirm({
     title: `删除任务「${t.name}」？`,
-    message: '仅删除任务定义，历史样本保留。',
+    message: '任务定义及其全部历史拨测数据将被清退，操作不可撤销。',
     kind: 'danger',
     confirmText: '删除',
     cancelText: '取消',

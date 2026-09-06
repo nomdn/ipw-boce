@@ -97,12 +97,13 @@ func rowsToSeries(taskByID map[uint]*ProbeTask, rows []ProbeResult, stepMin int)
 		}
 		b.samples++
 		if !ev.invalid {
-			b.valid++
-			b.sumMs += r.LatencyMs
-			b.nLat++
+			b.valid++ // 可用率分母：有明确 up/down 判定的样本
 		}
 		if ev.up {
 			b.up++
+			// 延迟只认可达(up)样本：不可达(down)延迟无意义(落库为 0)，不计入曲线平均
+			b.sumMs += r.LatencyMs
+			b.nLat++
 		} else if !ev.invalid {
 			b.down++
 		}
@@ -183,11 +184,12 @@ func rowsToRoundSeries(t *ProbeTask, rows []ProbeResult) []gin.H {
 		g.samples++
 		if !ev.invalid {
 			g.valid++
-			g.sumMs += r.LatencyMs
-			g.nLat++
 		}
 		if ev.up {
 			g.up++
+			// 延迟只认可达(up)样本：不可达(down)延迟无意义(落库为 0)，不计入曲线平均
+			g.sumMs += r.LatencyMs
+			g.nLat++
 		} else if !ev.invalid {
 			g.down++
 		}
