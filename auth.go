@@ -19,9 +19,11 @@ import (
 // 管理控制台登录：POST /admin/login 校验 admin-user/admin-password 后签发 HMAC-SHA256 JWT，
 // 前端持 JWT 以 Authorization: Bearer <jwt> 访问 /admin/*。
 //
-// 鉴权双轨（向后兼容，不破坏既有脚本）：
+// 鉴权三轨（向后兼容，不破坏既有脚本）：
 //   - 静态 admin-token（Bearer <admin-token>）原样放行；
-//   - 合法且未过期的 JWT 放行。
+//   - 合法且未过期的 JWT 放行；
+//   - 个人 API Token（Bearer ipt_…，profile.go 生成）：等价其账号登录身份（权限随角色），
+//     不受 JWT 过期限制，吊销立即失效；库里只存 bcrypt 哈希（见 userByAPIToken）。
 //
 // 未配置 jwt-secret（同时无 admin-password）时 JWT 登录禁用，仅静态 admin-token 可用。
 // JWT 使用纯标准库实现（HMAC-SHA256 + exp），零第三方依赖。
@@ -106,11 +108,38 @@ func parseJWT(token string) (*jwtClaims, error) {
 
 func base64urlDecode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
-// validAuth 判定请求是否通过鉴权：静态 admin-token 或有效 JWT 皆可
+// userByAPIToken 个人 API Token 校验：遍历持有 token 的用户做 bcrypt 比对（持有者数量少，可接受；
+// token 带 ipt_ 前缀，未命中前缀的请求不会走到这里）。命中且账号启用 → 返回用户。
+func userByAPIToken(token string) *User {
+	if db == nil {
+		return nil
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	var users []User
+	if err := db.WithContext(ctx).Where("api_token_hash <> ''").Find(&users).Error; err != nil {
+		return nil
+	}
+	for i := range users {
+		if verifyPassword(users[i].APITokenHash, token) {
+			if !users[i].Enabled {
+				return nil
+			}
+			return &users[i]
+		}
+	}
+	return nil
+}
+
+// validAuth 判定请求是否通过鉴权：静态 admin-token、有效 JWT 或个人 API Token 皆可
 func validAuth(token string) bool {
 	// 静态 admin-token 兼容（向后不破坏既有调用）
 	if ADMIN_TOKEN != "" && token == ADMIN_TOKEN {
 		return true
+	}
+	// 个人 API Token（ipt_ 前缀；JWT 永不以 ipt_ 开头，先查避免无效 JWT 报错噪音）
+	if strings.HasPrefix(token, "ipt_") {
+		return userByAPIToken(token) != nil
 	}
 	if jwtEnabled() {
 		if _, err := parseJWT(token); err == nil {
@@ -121,10 +150,17 @@ func validAuth(token string) bool {
 }
 
 // identityOfAuthToken 解析 token → (uid, role)。静态 admin-token 视为 uid=0/role=admin；
-// 有效 JWT 取其 uid/role（旧 token 无 role 时保守给 user）。token 无效返回 ok=false。
+// 有效 JWT 取其 uid/role（旧 token 无 role 时保守给 user）；个人 API Token 等价其账号身份。
+// token 无效返回 ok=false。
 func identityOfAuthToken(token string) (uid uint, role string, ok bool) {
 	if ADMIN_TOKEN != "" && token == ADMIN_TOKEN {
 		return 0, RoleAdmin, true
+	}
+	if strings.HasPrefix(token, "ipt_") {
+		if u := userByAPIToken(token); u != nil {
+			return u.ID, u.Role, true
+		}
+		return 0, "", false
 	}
 	if jwtEnabled() {
 		if cl, err := parseJWT(token); err == nil {
@@ -215,14 +251,24 @@ func loginHandler(c *gin.Context) {
 	apiError(c, http.StatusUnauthorized, "invalid username or password")
 }
 
-// adminAuthMiddleware /admin/* 鉴权（双轨：静态 admin-token 或有效 JWT）。
+// restStyleError /api/v1 前缀的请求按 REST 语法糖层的错误体返回（{"error":{code,message}}），
+// 其余路径维持内部 apiError 形态（前端读 statusCode/statusMessage）。
+func restStyleError(c *gin.Context) bool {
+	return strings.HasPrefix(c.Request.URL.Path, "/api/v1/")
+}
+
+// adminAuthMiddleware /admin/* 鉴权（三轨：静态 admin-token / JWT / 个人 API Token）。
 // JWT 命中时将 {uid, role, username} 写入 gin 上下文，供 adminOnly/currentUser 使用；
 // 静态 admin-token 不携带角色，视为 role=admin（全权）。
 func adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h := c.GetHeader("Authorization")
 		if !strings.HasPrefix(h, "Bearer ") {
-			apiError(c, http.StatusUnauthorized, "Unauthorized")
+			if restStyleError(c) {
+				restError(c, http.StatusUnauthorized, "unauthorized", "missing bearer token")
+			} else {
+				apiError(c, http.StatusUnauthorized, "Unauthorized")
+			}
 			c.Abort()
 			return
 		}
@@ -231,6 +277,21 @@ func adminAuthMiddleware() gin.HandlerFunc {
 		if ADMIN_TOKEN != "" && token == ADMIN_TOKEN {
 			c.Set(ctxUserKey, ctxUser{ID: 0, Role: RoleAdmin, Username: "admin-token"})
 			c.Next()
+			return
+		}
+		// 个人 API Token（ipt_ 前缀）：等价其账号登录身份（权限随角色）；JWT 永不以 ipt_ 开头
+		if strings.HasPrefix(token, "ipt_") {
+			if u := userByAPIToken(token); u != nil {
+				c.Set(ctxUserKey, ctxUser{ID: u.ID, Role: u.Role, Username: u.Username})
+				c.Next()
+				return
+			}
+			if restStyleError(c) {
+				restError(c, http.StatusUnauthorized, "unauthorized", "invalid or revoked token")
+			} else {
+				apiError(c, http.StatusUnauthorized, "Unauthorized")
+			}
+			c.Abort()
 			return
 		}
 		if jwtEnabled() {
@@ -243,7 +304,11 @@ func adminAuthMiddleware() gin.HandlerFunc {
 				return
 			}
 		}
-		apiError(c, http.StatusUnauthorized, "Unauthorized")
+		if restStyleError(c) {
+			restError(c, http.StatusUnauthorized, "unauthorized", "invalid credentials")
+		} else {
+			apiError(c, http.StatusUnauthorized, "Unauthorized")
+		}
 		c.Abort()
 	}
 }

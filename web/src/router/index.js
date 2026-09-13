@@ -4,6 +4,8 @@ import { useAuthStore } from '../stores/auth.js'
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('../views/LoginView.vue'), meta: { public: true } },
+  // 公开状态页（B3）：免登录只读，分享链接 /s/<token>（数据来自收集中心公开 JSON）
+  { path: '/s/:token', name: 'status', component: () => import('../views/StatusView.vue'), meta: { public: true, title: '状态页' } },
   {
     path: '/',
     component: () => import('../components/ConsoleLayout.vue'),

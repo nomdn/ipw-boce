@@ -13,10 +13,10 @@
           <label class="ak-field">
             <span class="ak-label">用户名</span>
             <input class="ak-input" v-model.trim="username" name="username" autocomplete="username"
-              placeholder="admin" autofocus />
+              placeholder="登录用户名" autofocus />
           </label>
           <label class="ak-field">
-            <span class="ak-label">口令</span>
+            <span class="ak-label">密码</span>
             <input class="ak-input" type="password" v-model="password" name="password"
               autocomplete="current-password" placeholder="••••••••" />
           </label>
@@ -30,7 +30,7 @@
               placeholder="登录用户名" autofocus />
           </label>
           <label class="ak-field">
-            <span class="ak-label">口令</span>
+            <span class="ak-label">密码</span>
             <input class="ak-input" type="password" v-model="reg.password" name="new-password"
               autocomplete="new-password" placeholder="至少 6 位" />
           </label>
@@ -132,7 +132,7 @@ async function onSubmit() {
   okMsg.value = ''
   if (mode.value === 'login') {
     if (!username.value || !password.value) {
-      error.value = '请输入用户名与口令'
+      error.value = '请输入用户名与密码'
       return
     }
     busy.value = true
@@ -149,11 +149,11 @@ async function onSubmit() {
   // register
   const { username: un, password: pw, email, code } = reg.value
   if (!un || !pw || !email || !code) {
-    error.value = '请完整填写用户名、口令、邮箱与验证码'
+    error.value = '请完整填写用户名、密码、邮箱与验证码'
     return
   }
   if (pw.length < 6) {
-    error.value = '口令至少 6 位'
+    error.value = '密码至少 6 位'
     return
   }
   busy.value = true

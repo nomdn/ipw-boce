@@ -23,11 +23,12 @@ import (
 // 心跳批量刷新 last_seen_at；节点经本通道发 report 消息上报统计与拨测明细（见 report.go）。
 //
 // 消息信封（JSON 文本帧）：{ "type": "...", "nodeId": "...", "ts": <unix秒>, "data": {...} }
-//   - 节点 → middleware：register / probe_result / pong / command
-//   - middleware → 节点：register_ok / register_error / probe / ping / status
+//   - 节点 → middleware：register / probe_result / pong / report / config_result / ota_result
+//   - middleware → 节点：register_ok / register_error / probe / ping / status / config / ota
 //
 // probe 消息 data：{ "requestId": "...", "apiType": "tcping", "raw": "qq.com", "query": {"port":"443"} }
 // probe_result data：{ "requestId": "...", "status": 200, "body": <JSON 值> }（body 为 JSON 字符串时按原文透传）
+// ota 消息 data：{ "requestId": "...", "url"|"version"+"assetBase", "sha256" }，节点按阶段回 ota_result（见 ota.go）
 
 type wsMessage struct {
 	Type   string          `json:"type"`
@@ -73,6 +74,16 @@ type wsServer struct {
 	probeMu   sync.Mutex
 	probeWait map[string]chan wsProbeResult
 
+	// configMu/configWait：配置管理指令（get / patch / refresh）的应答通道，
+	// 与拨测分开维护——两者报文结构不同，复用 probeWait 会污染类型
+	configMu   sync.Mutex
+	configWait map[string]chan json.RawMessage
+
+	// otaMu/otaWait：OTA 下发的 ack 通道（等节点首个 ota_result）。
+	// 之后的进度回报不再走这里（已无等待方），由 ota_result 分支按 requestId 直接更新任务（见 ota.go）
+	otaMu   sync.Mutex
+	otaWait map[string]chan json.RawMessage
+
 	// 统计（内存快照，随 status 消息上报节点；持久化走 store）
 	statMu    sync.Mutex
 	totalReqs int64
@@ -84,9 +95,11 @@ func newWSServer() *wsServer {
 	// 进程重启后 WS 连接全部断开，把存量在线快照重置为离线，等节点重新注册
 	markAllNodesOffline()
 	return &wsServer{
-		peers:     make(map[string]*wsPeer),
-		probeWait: make(map[string]chan wsProbeResult),
-		startedAt: time.Now(),
+		peers:      make(map[string]*wsPeer),
+		probeWait:  make(map[string]chan wsProbeResult),
+		configWait: make(map[string]chan json.RawMessage),
+		otaWait:    make(map[string]chan json.RawMessage),
+		startedAt:  time.Now(),
 	}
 }
 
@@ -138,8 +151,12 @@ func (s *wsServer) Handler(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "register":
 			var reg struct {
-				NodeID string `json:"nodeId"`
-				Key    string `json:"key"` // 注册凭证：与 setting.json wsKeys 配置比对
+				NodeID  string `json:"nodeId"`
+				Key     string `json:"key"`     // 注册凭证：与 setting.json wsKeys 配置比对
+				Version string `json:"version"` // 节点版本号（老版本节点不发，留空）
+				// Capabilities 节点支持的管理能力（probe/report/config）。
+				// 老版本节点不发 → 留空，表示"未知"而非"不支持"
+				Capabilities []string `json:"capabilities"`
 			}
 			_ = json.Unmarshal(msg.Data, &reg)
 			if reg.NodeID == "" {
@@ -171,8 +188,10 @@ func (s *wsServer) Handler(w http.ResponseWriter, r *http.Request) {
 			s.peers[reg.NodeID] = peer
 			s.mu.Unlock()
 			log.Printf("[ws] node registered: %s", reg.NodeID)
-			// 持久化：在线快照 + online 事件
-			recordNodeOnline(reg.NodeID, r.RemoteAddr)
+			// 持久化：在线快照 + online 事件（含节点上报的版本号与能力清单，供节点状态页展示）
+			recordNodeOnline(reg.NodeID, r.RemoteAddr, reg.Version, reg.Capabilities)
+			// OTA 任务追踪钩子：节点重连上报的版本号命中在途任务判定 → 即时判 success（见 ota.go）
+			otaOnNodeRegistered(reg.NodeID, reg.Version)
 			s.sendJSON(c, wsMessage{Type: "register_ok", NodeID: reg.NodeID, TS: time.Now().Unix(), Data: mustRaw(struct {
 				Heartbeat int `json:"heartbeatSeconds"`
 			}{Heartbeat: 20})})
@@ -193,6 +212,48 @@ func (s *wsServer) Handler(w http.ResponseWriter, r *http.Request) {
 			if ok {
 				ch <- res
 			}
+
+		case "config_result":
+			// 配置管理指令的应答（get / patch / refresh），原样投递给等待方
+			if !registered {
+				continue
+			}
+			var head struct {
+				RequestID string `json:"requestId"`
+			}
+			if err := json.Unmarshal(msg.Data, &head); err != nil || head.RequestID == "" {
+				log.Printf("[ws] bad config_result from %s", peer.id)
+				continue
+			}
+			s.configMu.Lock()
+			ch, ok := s.configWait[head.RequestID]
+			delete(s.configWait, head.RequestID)
+			s.configMu.Unlock()
+			if ok {
+				// msg.Data 底层数组会随下一次 Read 复用，必须拷贝
+				ch <- append(json.RawMessage(nil), msg.Data...)
+			}
+
+		case "ota_result":
+			// OTA 下发的应答/进度：首帧（accepted）投递给下发等待方；所有帧同步更新任务状态（见 ota.go）
+			if !registered {
+				continue
+			}
+			var head struct {
+				RequestID string `json:"requestId"`
+			}
+			if err := json.Unmarshal(msg.Data, &head); err != nil || head.RequestID == "" {
+				log.Printf("[ws] bad ota_result from %s", peer.id)
+				continue
+			}
+			s.otaMu.Lock()
+			ch, ok := s.otaWait[head.RequestID]
+			delete(s.otaWait, head.RequestID)
+			s.otaMu.Unlock()
+			if ok {
+				ch <- append(json.RawMessage(nil), msg.Data...)
+			}
+			otaOnNodeResult(peer.id, msg.Data)
 
 		case "pong":
 			// 心跳应答，仅刷新 last
@@ -293,6 +354,118 @@ func (s *wsServer) RequestProbe(nodeID, apiType, raw string, query map[string]st
 	}
 }
 
+// RequestConfig 经 WS 通道向节点下发配置管理指令（get / patch / refresh）并等待 config_result。
+// 返回节点应答的原始 data（含 ok / applied / unknown / restartRequired / config 等字段）。
+// 与拨测不同：配置指令不产生拨测数据，故不带 scheduler 标记，也不计入请求统计。
+func (s *wsServer) RequestConfig(nodeID, action string, cfg map[string]any, persist bool, timeout time.Duration) (json.RawMessage, error) {
+	s.mu.Lock()
+	peer, ok := s.peers[nodeID]
+	s.mu.Unlock()
+	if !ok || peer.conn == nil {
+		return nil, fmt.Errorf("ws node %s not connected", nodeID)
+	}
+
+	reqID := "c" + genRequestID()
+	ch := make(chan json.RawMessage, 1)
+	s.configMu.Lock()
+	s.configWait[reqID] = ch
+	s.configMu.Unlock()
+	defer func() {
+		s.configMu.Lock()
+		delete(s.configWait, reqID)
+		s.configMu.Unlock()
+	}()
+
+	payload := map[string]any{"requestId": reqID, "action": action}
+	if len(cfg) > 0 {
+		payload["config"] = cfg
+	}
+	if persist {
+		payload["persist"] = true
+	}
+
+	if err := s.sendJSON(peer.conn, wsMessage{Type: "config", NodeID: nodeID, TS: time.Now().Unix(), Data: mustRaw(payload)}); err != nil {
+		return nil, fmt.Errorf("ws config send failed for node %s: %w", nodeID, err)
+	}
+
+	select {
+	case data := <-ch:
+		var head struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(data, &head)
+		if !head.OK {
+			if head.Error == "" {
+				head.Error = "节点返回失败但未给出原因"
+			}
+			return nil, fmt.Errorf("%s", head.Error)
+		}
+		return data, nil
+	case <-time.After(timeout):
+		// 型别化：调用方据此区分"节点不认指令 / 连接半死"与"节点明确拒绝"
+		return nil, &wsTimeoutError{NodeID: nodeID, Command: "config"}
+	}
+}
+
+// RequestOTA 经 WS 通道向节点下发 OTA 升级指令并等待首个 ota_result（节点 ack）。
+// 与 config 指令同构：老版本节点不认识该指令会静默忽略 → 超时（*wsTimeoutError），
+// 调用方用 ProbeAlive 分型给出"程序版本过旧"提示。之后的进度回报不经此通道
+// （等待方已消失），由 ota_result 分支直接更新任务状态（见 ota.go）。
+func (s *wsServer) RequestOTA(nodeID string, payload map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	s.mu.Lock()
+	peer, ok := s.peers[nodeID]
+	s.mu.Unlock()
+	if !ok || peer.conn == nil {
+		return nil, fmt.Errorf("ws node %s not connected", nodeID)
+	}
+
+	reqID, _ := payload["requestId"].(string)
+	if reqID == "" {
+		reqID = "o" + genRequestID()
+		payload["requestId"] = reqID
+	}
+	ch := make(chan json.RawMessage, 1)
+	s.otaMu.Lock()
+	s.otaWait[reqID] = ch
+	s.otaMu.Unlock()
+	defer func() {
+		s.otaMu.Lock()
+		delete(s.otaWait, reqID)
+		s.otaMu.Unlock()
+	}()
+
+	if err := s.sendJSON(peer.conn, wsMessage{Type: "ota", NodeID: nodeID, TS: time.Now().Unix(), Data: mustRaw(payload)}); err != nil {
+		return nil, fmt.Errorf("ws ota send failed for node %s: %w", nodeID, err)
+	}
+
+	select {
+	case data := <-ch:
+		var head struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(data, &head)
+		if !head.OK {
+			if head.Error == "" {
+				head.Error = "节点返回失败但未给出原因"
+			}
+			return nil, fmt.Errorf("%s", head.Error)
+		}
+		return data, nil
+	case <-time.After(timeout):
+		return nil, &wsTimeoutError{NodeID: nodeID, Command: "ota"}
+	}
+}
+
+// NodeConnected 判断节点当前是否有活跃的 WS 连接（决定配置指令走 WS 还是回退 HTTP）
+func (s *wsServer) NodeConnected(nodeID string) bool {
+	s.mu.Lock()
+	peer, ok := s.peers[nodeID]
+	s.mu.Unlock()
+	return ok && peer.conn != nil
+}
+
 // Start 启动 WS 服务端（阻塞）。
 func (s *wsServer) Start(addr string) {
 	mux := http.NewServeMux()
@@ -306,6 +479,57 @@ func (s *wsServer) Start(addr string) {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Printf("[ws] server stopped: %v", err)
 	}
+}
+
+// wsTimeoutError 节点在超时窗口内**什么都没回**（区别于"节点明确回了 ok:false + 原因"）。
+// 调用方据此区分"节点不认这条指令 / 连接半死"与"节点拒绝了指令"，给出不同的排障提示。
+type wsTimeoutError struct {
+	NodeID  string
+	Command string // probe | config
+}
+
+func (e *wsTimeoutError) Error() string {
+	return fmt.Sprintf("ws %s timeout for node %s", e.Command, e.NodeID)
+}
+
+// PeerLastActive 节点当前连接的最近收包时间（unix nano）；无该节点的活跃连接返回 0。
+// 供"超时后判断节点是否还活着"使用（见 ProbeAlive）。
+func (s *wsServer) PeerLastActive(nodeID string) int64 {
+	s.mu.Lock()
+	peer, ok := s.peers[nodeID]
+	s.mu.Unlock()
+	if !ok || peer.conn == nil {
+		return 0
+	}
+	return peer.lastAtomic.Load()
+}
+
+// ProbeAlive 主动探活节点当前 WS 连接：发一条 ping，等节点回包（pong，任意消息都会刷新收包时间）。
+//
+// 用途：管理指令超时后区分两种截然不同的情况——
+//   - true  连接活着，只是不认这条指令 → 几乎必然是节点程序版本过旧
+//   - false 连接已半死（对端进程没了但 TCP 未感知）→ 指令根本没到节点，等空闲剔除自行收敛
+//
+// 只有在已发生超时（15s 白等）之后才调用，代价可忽略。
+func (s *wsServer) ProbeAlive(nodeID string, wait time.Duration) bool {
+	s.mu.Lock()
+	peer, ok := s.peers[nodeID]
+	s.mu.Unlock()
+	if !ok || peer.conn == nil {
+		return false
+	}
+	before := peer.lastAtomic.Load()
+	if err := s.sendJSON(peer.conn, wsMessage{Type: "ping", NodeID: nodeID, TS: time.Now().Unix()}); err != nil {
+		return false
+	}
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if peer.lastAtomic.Load() > before {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 // maintenanceLoop 心跳 + 状态上报（middleware → 节点）+ 在线快照落库。

@@ -29,9 +29,10 @@ type ProbeTask struct {
 	// 掉线告警只发给所有者；无归属任务不发告警；删用户时级联删其任务（见 users.go DELETE）。
 	OwnerID   uint   `gorm:"index" json:"ownerId"`
 	Enabled   bool   `gorm:"index" json:"enabled"`                // 注意：勿加 gorm default:true，否则 false 会被默认值吞掉无法建 disabled 任务
-	APIType   string `gorm:"size:16;index" json:"apiType"`        // tcping | speed | ssl | detail
-	Target    string `gorm:"size:512" json:"target"`              // detail/ssl=域名；tcping=host[:port]；speed=v4/或v6/+URL
+	APIType   string `gorm:"size:16;index" json:"apiType"`        // tcping | speed | ssl | detail | dns
+	Target    string `gorm:"size:512" json:"target"`              // detail/ssl=域名；tcping=host[:port]；speed=v4/或v6/+URL；dns=域名（记录类型见 RecordType）
 	Stack     string `gorm:"size:8" json:"stack"`                 // ""(按类型) | v4 | v6：speed 想固定单栈时用，可覆盖前缀
+	RecordType string `gorm:"size:8" json:"recordType"`          // dns 专用：a/aaaa/cname/mx/ns/ptr/srv/txt/caa（缺省 a）
 	NodeScope string `gorm:"size:8;default:all" json:"nodeScope"` // all(全池) | custom(指定)
 	NodeIDs   string `gorm:"size:512" json:"nodeIds"`             // custom 时的逗号分隔节点 id；all 忽略
 	Interval  int    `json:"intervalSec"`                         // 调度间隔（秒），最小 10
@@ -41,8 +42,16 @@ type ProbeTask struct {
 	BothProtocols    bool      `json:"bothProtocols"`                           // detail：http 与 https 都要命中才算成功；false=任一命中
 	RequireAllStacks bool      `json:"requireAllStacks"`                        // 双栈(ipv4+ipv6)全通才算该节点可用；false=任一栈通即可
 	CertExpiredDown  bool      `json:"certExpiredDown"`                         // ssl：body 里 is_expired=true 视为不可用
-	CreatedAt        time.Time `json:"-"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	// ---- 通知增强（B2）：恢复通知与免打扰时段，见 alert.go ----
+	NotifyRecover bool   `json:"notifyRecover"`             // 从 down 恢复时也通知一次（邮件+站内信+webhook 三路同 down）
+	QuietHours    string `gorm:"size:16" json:"quietHours"` // 免打扰时段 "HH:MM-HH:MM"（服务器本地时区），空=不静默；静默内站内信照发，邮件/webhook 抑制
+	// ---- 公开状态页（B3）----
+	ShareToken string `gorm:"index;size:32" json:"-"` // 分享令牌（/s/<token>），多个任务可共用同一令牌（多选分享组）；经 /tasks/share 管理，json 隐藏
+	HideTarget bool   `json:"hideTarget"`              // 分享页隐藏拨测目标（target 不进公开 JSON，页面不显示）
+	// ---- 标签（C1）----
+	Tags       string    `json:"tags"` // 逗号分隔标签；任务列表支持 ?tag= 子串过滤
+	CreatedAt  time.Time `json:"-"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // 任务里 target 为域名/裸 host 时，detail/ssl 节点的实际下发 raw 仍走域名（节点自动双栈）。
@@ -50,7 +59,12 @@ type ProbeTask struct {
 
 // knownProbeTaskTypes 任务可选拨测类型（用户划入 SLA 拨测的选项）
 func knownProbeTaskTypes() []string {
-	return []string{"tcping", "speed", "ssl", "detail"}
+	return []string{"tcping", "speed", "ssl", "detail", "dns"}
+}
+
+// knownDNSRecordTypes dns 任务支持的记录类型（与节点 /v1/dns/:type 的 case 一致）
+func knownDNSRecordTypes() []string {
+	return []string{"a", "aaaa", "cname", "mx", "ns", "ptr", "srv", "txt", "caa"}
 }
 
 // toGinH 把任务结构转成通用 JSON map（便于附加 ownerUsername 等派生字段；json 往返保全部字段）
@@ -269,6 +283,7 @@ func (s *dataStore) runTaskSamples(t *ProbeTask) {
 //   - detail/ssl：域名/URL 原样（节点自动双栈）
 //   - tcping：host[:port] 原样
 //   - speed：若没带 v4//v6/ 前缀，按 task.Stack（缺省 v4）补上前缀，节点据此单栈测速
+//   - dns：拼 "<记录类型>/<域名>"（RecordType 缺省 a），节点按类型解析
 func normalizeTaskRaw(t *ProbeTask) string {
 	if t.APIType == "speed" && !strings.HasPrefix(t.Target, "v4/") && !strings.HasPrefix(t.Target, "v6/") {
 		stack := strings.TrimPrefix(t.Stack, "")
@@ -276,6 +291,13 @@ func normalizeTaskRaw(t *ProbeTask) string {
 			stack = "v4"
 		}
 		return stack + "/" + t.Target
+	}
+	if t.APIType == "dns" {
+		rt := strings.ToLower(strings.TrimSpace(t.RecordType))
+		if rt == "" {
+			rt = "a"
+		}
+		return rt + "/" + strings.TrimPrefix(strings.TrimSpace(t.Target), "/")
 	}
 	return t.Target
 }

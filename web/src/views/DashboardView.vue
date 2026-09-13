@@ -21,7 +21,7 @@
         <div class="kpi-card"><div class="kpi-label">请求总数</div><div class="kpi-value">{{ num(total) }}</div><div class="kpi-sub">{{ hours }}h 窗口</div></div>
         <div class="kpi-card kpi--danger"><div class="kpi-label">错误</div><div class="kpi-value">{{ num(errors) }}</div><div class="kpi-sub">错误率 {{ pct(errors, total) }}</div></div>
         <div class="kpi-card kpi--success"><div class="kpi-label">平均延迟</div><div class="kpi-value" style="font-size:1.5rem">{{ avgMs(latSum, total) }}</div><div class="kpi-sub">端到端</div></div>
-        <div class="kpi-card kpi--accent"><div class="kpi-label">接口类型</div><div class="kpi-value">{{ num(apiCount) }}</div><div class="kpi-sub">whois/dns/ssl…</div></div>
+        <div class="kpi-card kpi--accent"><div class="kpi-label">接口类型</div><div class="kpi-value">{{ num(apiCount) }}</div><div class="kpi-sub">whois / dns / ssl…</div></div>
         <div class="kpi-card kpi--action"><div class="kpi-label">上报节点</div><div class="kpi-value">{{ num(nodeCount) }}</div><div class="kpi-sub">有统计</div></div>
       </div>
 
@@ -45,7 +45,7 @@
           <h2 class="panel-title">接口汇总明细</h2>
           <div class="ak-table-wrap">
             <table class="ak-table">
-              <thead><tr><th>apiType</th><th>总量</th><th>错误</th><th>错误率</th><th>平均延迟</th></tr></thead>
+              <thead><tr><th>接口类型</th><th>总量</th><th>错误</th><th>错误率</th><th>平均延迟</th></tr></thead>
               <tbody>
                 <tr v-for="r in byApiType" :key="r.apiType">
                   <td class="mono nowrap"><span class="ak-tag ch">{{ r.apiType }}</span></td>
@@ -81,28 +81,28 @@
       <div v-if="loading" class="loading-center"><span class="ak-loading"></span></div>
 
       <div class="kpi-strip" style="margin-bottom:16px">
-        <div class="kpi-card kpi--accent"><div class="kpi-label">我的任务</div><div class="kpi-value">{{ myTasks.length }}</div><div class="kpi-sub">运行 {{ runningCnt }} / 停 {{ myTasks.length - runningCnt }}</div></div>
+        <div class="kpi-card kpi--accent"><div class="kpi-label">我的任务</div><div class="kpi-value">{{ myTasks.length }}</div><div class="kpi-sub">运行 {{ runningCnt }} / 已停 {{ myTasks.length - runningCnt }}</div></div>
         <div class="kpi-card"><div class="kpi-label">平均可用率</div><div class="kpi-value" :style="availTone">{{ avgAvail }}%</div><div class="kpi-sub">{{ hours }}h 加权</div></div>
         <div class="kpi-card kpi--danger"><div class="kpi-label">累计掉线</div><div class="kpi-value">{{ sumDown }}</div><div class="kpi-sub">最近窗口</div></div>
-        <div class="kpi-card kpi--success"><div class="kpi-label">样本总数</div><div class="kpi-value">{{ numMy(sumSamples) }}</div><div class="kpi-sub">source=sched</div></div>
+        <div class="kpi-card kpi--success"><div class="kpi-label">样本总数</div><div class="kpi-value">{{ numMy(sumSamples) }}</div><div class="kpi-sub">定时采集</div></div>
         <div class="kpi-card"><div class="kpi-label">平均延迟</div><div class="kpi-value">{{ avgMsAll ? avgMsAll + ' ms' : '—' }}</div><div class="kpi-sub">按样本加权</div></div>
       </div>
 
       <!-- 我的任务趋势曲线 -->
       <section class="panel" style="margin-bottom:16px">
-        <h2 class="panel-title">我的可用率趋势 <span class="hl">/ mine series</span></h2>
+        <h2 class="panel-title">我的可用率趋势</h2>
         <EChart :option="mineTrendOption" height="300px" />
         <div v-if="!loading && !mySeries.length && !error" class="dim" style="padding:4px 2px">
-          暂无定时样本 —— 任务首次拨测落库后这里会出现可用率曲线。
+          暂无定时样本 —— 任务首次拨测完成后，这里会出现可用率曲线。
         </div>
       </section>
 
       <div class="panel">
-        <h2 class="panel-title">我的统计任务 <span class="hl">/ my tasks report</span>
+        <h2 class="panel-title">我的统计任务
           <router-link class="ak-button ak-button--outline sm" style="float:right" :to="{ name: 'sla' }">进入 SLA 监控</router-link>
         </h2>
         <div v-if="!loading && !myTasks.length && !error" class="dim" style="padding:8px 2px">
-          你还没有定时拨测任务 —— 到「SLA 监控」新建一个，调度器会按时对节点拨测并累计这份报告。
+          你还没有定时拨测任务 —— 到「SLA 监控」新建一个，系统会按时对节点拨测并累计这份报告。
         </div>
         <div v-else class="ak-table-wrap">
           <table class="ak-table">
@@ -112,12 +112,12 @@
                 <td class="mono" :title="c.task.name">{{ c.task.name }}</td>
                 <td class="mono nowrap"><span class="ak-tag ch">{{ c.task.apiType }}</span></td>
                 <td class="mono dim" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ c.task.target }}</td>
-                <td><span class="dot" :class="c.task.enabled ? 'online' : 'offline'"></span>{{ c.task.enabled ? '运行' : '停' }}</td>
+                <td><span class="dot" :class="c.task.enabled ? 'online' : 'offline'"></span>{{ c.task.enabled ? '运行中' : '已停' }}</td>
                 <td class="mono" :style="c.agg ? availStyle(c.agg.availability) : ''">{{ c.agg ? fmtPct(c.agg.availability) : '—' }}</td>
                 <td class="mono">{{ c.agg ? c.agg.avgMs + ' ms' : '—' }}</td>
                 <td class="mono">{{ c.agg ? c.agg.samples : '—' }}</td>
                 <td class="mono" :class="c.agg && c.agg.errCnt ? 'err' : ''">{{ c.agg ? c.agg.errCnt : '—' }}</td>
-                <td class="dim" style="white-space:nowrap">{{ fmtAgo(c.sla?.window?.to) }}</td>
+                <td class="dim" style="white-space:nowrap">{{ timeAgo(c.sla?.window?.to) }}</td>
               </tr>
             </tbody>
           </table>
@@ -132,7 +132,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useAuthStore } from '../stores/auth.js'
 import EChart from '../components/EChart.vue'
 import { fetchStatsSummary, fetchStatsTimeseries, fetchTasks, fetchTaskSla, fetchMineSeries } from '../api/boce.js'
-import { num, avgMs, pct, fmtMinute } from '../utils/format.js'
+import { num, avgMs, pct, fmtMinute, timeAgo } from '../utils/format.js'
 
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.isAdmin)
@@ -160,7 +160,7 @@ async function loadAdmin() {
     summary.value = s
     series.value = ts || []
   } catch (e) {
-    error.value = e?.message || 'load failed'
+    error.value = e?.message || '加载失败'
   } finally {
     loading.value = false
   }
@@ -245,7 +245,7 @@ async function loadMine() {
     )
     mySla.value = Object.fromEntries(res)
   } catch (e) {
-    error.value = e?.message || 'load failed'
+    error.value = e?.message || '加载失败'
   } finally {
     loading.value = false
   }
@@ -331,15 +331,5 @@ function fmtBucket(iso, minute) {
   }
   if (minute != null) return fmtMinute(minute)
   return ''
-}
-function fmtAgo(iso) {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return iso
-  const s = Math.floor((Date.now() - d.getTime()) / 1000)
-  if (s < 60) return '刚刚'
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
-  return `${Math.floor(s / 86400)} 天前`
 }
 </script>

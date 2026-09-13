@@ -41,8 +41,11 @@
     "admin-user": "admin",         // 登录用户名（缺省 admin）
     "admin-password": "",          // 登录口令；空 = 不启用 JWT 登录
     "data-retention-days": 30,
+    "user-task-limit": 20,         // 普通用户可建任务数上限；0 = 不限
+    "user-min-interval": 0,        // 普通用户任务最小间隔秒；0 = 跟随全局最小值（10s）
 
     "report-token": "",
+    "ota-asset-base": "",          // 节点 OTA 按版本下发时的资产基址；空 = GitHub Releases
 
     // SMTP 掉线告警（见 alert.go）：收件人按任务 owner 动态解析（所有者有邮箱才走邮件）
     "smtp": {

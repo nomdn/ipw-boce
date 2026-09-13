@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,8 +34,10 @@ func registerTaskSlaRoutes(g *gin.RouterGroup) {
 
 	// 某任务在窗口内的时序曲线（SLA 卡片的延迟曲线 + 失败时间段红标）
 	// 归属同 SLA：user 仅可查自己创建的任务；admin/静态 token 不限。
+	// ?node=<nodeId>：只返回该节点的曲线（多节点对比视图前端逐节点拉取叠加，见 SlaView）。
 	g.GET("/tasks/:id/series", func(c *gin.Context) {
 		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
+		node := strings.TrimSpace(c.Query("node"))
 		taskID := idParam(c)
 		ctx, cancel := dbCtx()
 		defer cancel()
@@ -47,18 +52,136 @@ func registerTaskSlaRoutes(g *gin.RouterGroup) {
 		}
 		to := time.Now().UTC()
 		from := to.Add(-time.Duration(hours * float64(time.Hour)))
-		var rows []ProbeResult
-		if err := db.WithContext(ctx).
+		q := db.WithContext(ctx).
 			Where("task_id = ? AND source = ? AND created_at >= ? AND created_at <= ?",
-				taskID, sourceSched, from, to).
-			Order("created_at asc, id asc").Find(&rows).Error; err != nil {
+				taskID, sourceSched, from, to)
+		if node != "" {
+			q = q.Where("node_id = ?", node)
+		}
+		var rows []ProbeResult
+		if err := q.Order("created_at asc, id asc").Find(&rows).Error; err != nil {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
 		stepMin := stepForWindow(hours)
 		// 延迟曲线按采样轮次打点（每轮多节点取平均、不拆线不跨轮聚合），见 rowsToRoundSeries
 		series := rowsToRoundSeries(&t, rows)
-		c.JSON(http.StatusOK, gin.H{"taskId": taskID, "stepMinutes": stepMin, "mode": "round", "series": series})
+		resp := gin.H{"taskId": taskID, "stepMinutes": stepMin, "mode": "round", "series": series}
+		if node != "" {
+			resp["node"] = node
+		}
+		c.JSON(http.StatusOK, resp)
+	})
+
+	// ===== 公开状态页分享（B3，owner/admin；页面见 public_status.go / 前端 /s/:token）=====
+	// 令牌即"分享组"：批量把多选任务绑到同一令牌上（多选分享）；支持自定义令牌。POST 生成/重置，DELETE 关闭。
+
+	// 批量生成/重置分享：body {ids:[], token?}
+	//   - token 缺省随机 6 位 hex；自定义限 3~32 位小写字母/数字/连字符（同一令牌的任务同页展示，
+	//     把其他任务绑到同一令牌即并入该分享组）
+	g.POST("/tasks/share", func(c *gin.Context) {
+		var body struct {
+			IDs   []uint `json:"ids"`
+			Token string `json:"token"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			apiError(c, http.StatusBadRequest, "invalid body: "+err.Error())
+			return
+		}
+		uid, role, _ := currentUserFromCtx(c)
+		seen := map[uint]bool{}
+		ids := make([]uint, 0, len(body.IDs))
+		for _, id := range body.IDs {
+			if id > 0 && !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			apiError(c, http.StatusBadRequest, "ids 不能为空")
+			return
+		}
+		token := strings.ToLower(strings.TrimSpace(body.Token))
+		if token == "" {
+			// 6 位 hex（24-bit 熵）：短链接优先；枚举防护由公开 JSON 端点的 per-IP 限流承担
+			// （public_status.go，60 次/分/IP），重生成即换新令牌。
+			b := make([]byte, 3)
+			if _, err := rand.Read(b); err != nil {
+				apiError(c, http.StatusInternalServerError, err.Error())
+				return
+			}
+			token = hex.EncodeToString(b)
+		}
+		if len(token) < 3 || len(token) > 32 {
+			apiError(c, http.StatusBadRequest, "token 长度须为 3~32 位")
+			return
+		}
+		for _, ch := range token {
+			if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+				apiError(c, http.StatusBadRequest, "token 只能包含小写字母、数字、连字符")
+				return
+			}
+		}
+		ctx, cancel := dbCtx()
+		defer cancel()
+		// 可见性：user 只能分享自己的任务
+		tq := db.WithContext(ctx).Model(&ProbeTask{}).Where("id IN ?", ids)
+		if role == RoleUser {
+			tq = tq.Where("owner_id = ?", uid)
+		}
+		res := tq.Updates(map[string]any{"share_token": token})
+		if res.Error != nil {
+			apiError(c, http.StatusInternalServerError, res.Error.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"token": token, "url": "/s/" + token,
+			"shared": res.RowsAffected, "ids": ids,
+		})
+	})
+
+	// 批量关闭分享：body {ids:[]} —— 清空这些任务的令牌与域名绑定
+	g.DELETE("/tasks/share", func(c *gin.Context) {
+		var body struct {
+			IDs []uint `json:"ids"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || len(body.IDs) == 0 {
+			apiError(c, http.StatusBadRequest, "ids 不能为空")
+			return
+		}
+		uid, role, _ := currentUserFromCtx(c)
+		ctx, cancel := dbCtx()
+		defer cancel()
+		tq := db.WithContext(ctx).Model(&ProbeTask{}).Where("id IN ?", body.IDs)
+		if role == RoleUser {
+			tq = tq.Where("owner_id = ?", uid)
+		}
+		res := tq.Update("share_token", "")
+		if res.Error != nil {
+			apiError(c, http.StatusInternalServerError, res.Error.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"closed": res.RowsAffected})
+	})
+
+	// 查询某任务的分享状态（owner/admin）
+	g.GET("/tasks/:id/share", func(c *gin.Context) {
+		var t ProbeTask
+		ctx, cancel := dbCtx()
+		defer cancel()
+		if err := db.WithContext(ctx).First(&t, idParam(c)).Error; err != nil {
+			apiError(c, http.StatusNotFound, errTaskNotFound.Error())
+			return
+		}
+		if taskOwnedByUserButNot(c, &t) {
+			apiError(c, http.StatusForbidden, "not your task")
+			return
+		}
+		if t.ShareToken == "" {
+			c.JSON(http.StatusOK, gin.H{"enabled": false})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"enabled": true, "token": t.ShareToken, "url": "/s/" + t.ShareToken})
 	})
 }
 
@@ -77,7 +200,7 @@ type slaNodeAgg struct {
 	Up           int64   `json:"up"`
 	Down         int64   `json:"down"`
 	Invalid      int64   `json:"invalid"`      // body 无法解析/判定不明，不参与成功率
-	Availability float64 `json:"availability"` // up/samples，0~1（样本为 0 → 0）
+	Availability float64 `json:"availability"` // 可用率百分数 = up/samples*100（样本为 0 → 0）
 	// 延迟
 	AvgMs   int64   `json:"avgMs"`
 	MaxMs   int64   `json:"maxMs"`
@@ -266,6 +389,8 @@ func evalSample(t *ProbeTask, linkStatus int, body string, latMs int64) sampleEv
 		up, invalid := evalDualStack(t, body)
 		ev.up = up
 		ev.invalid = invalid
+	case "dns":
+		ev.up, ev.invalid = evalDNS(body, linkStatus)
 	default:
 		// tcping / speed：body 扁平（speed 顶层字段、tcping 由 ipv4 包裹）。
 		// 优先解析节点 body 的真实可达性（is_reachable / ipv4.success），
@@ -314,6 +439,27 @@ func evalFlatBody(t *ProbeTask, body string, linkStatus int) (up bool, invalid b
 		return false, true // 链路请求失败且无有效 body，无法判定 → invalid
 	}
 	return statusIsExpected(linkStatus, t.ExpectStatus), false
+}
+
+// evalDNS 判定 dns 类样本（节点 body：{domain, record[], ttl, duration}）。
+//   - record 数组存在 → up = 记录数>0（NXDOMAIN/无记录 → down，这正是被监控的对象）
+//   - body 带 "error"（节点侧解析失败：HTTP 500 错误体 / WS 错误结果）→ down
+//   - body 空/非 JSON：链路 0 → invalid（传输层失败无法判定）；否则按链路状态判
+//     （dns 不看 ExpectStatus——链路 200 仅代表节点应答了本次查询）
+func evalDNS(body string, linkStatus int) (up bool, invalid bool) {
+	var root map[string]any
+	if body != "" && json.Unmarshal([]byte(body), &root) == nil {
+		if records, ok := root["record"].([]any); ok {
+			return len(records) > 0, false
+		}
+		if _, ok := root["error"].(string); ok {
+			return false, false
+		}
+	}
+	if linkStatus == 0 {
+		return false, true
+	}
+	return statusIsExpected(linkStatus, "2xx"), false
 }
 
 // evalDualStack 解析 detail/ssl 双栈 body 判定 up。
@@ -402,12 +548,35 @@ func evalStackUp(t *ProbeTask, o map[string]any) bool {
 // extractSpecial 从最新样本提取看板展示的特殊字段（SSL 证书 / Detail 速度等）。
 // 返回 nil 表示无可展示字段。取 ipv4 栈（无则任一栈）的值。
 func extractSpecial(t *ProbeTask, body string) map[string]any {
-	if t.APIType != "ssl" && t.APIType != "detail" {
+	if t.APIType != "ssl" && t.APIType != "detail" && t.APIType != "dns" {
 		return nil
 	}
 	var root map[string]any
 	if json.Unmarshal([]byte(body), &root) != nil {
 		return nil
+	}
+	if t.APIType == "dns" {
+		// dns 特殊字段：查询域名 / 记录数 / 首条记录 / TTL / 查询耗时（看板"解析结果"列）
+		out := map[string]any{}
+		if v, ok := root["domain"].(string); ok {
+			out["domain"] = v
+		}
+		if records, ok := root["record"].([]any); ok {
+			out["record_count"] = len(records)
+			if len(records) > 0 {
+				out["first_record"] = records[0]
+			}
+		}
+		if v, ok := numOf(root, "ttl"); ok {
+			out["ttl"] = v
+		}
+		if v, ok := numOf(root, "duration"); ok {
+			out["duration"] = v
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
 	}
 	var o map[string]any
 	if v, ok := root["ipv4"].(map[string]any); ok {
@@ -486,6 +655,12 @@ func trueLatencyMs(t *ProbeTask, body string) (int64, bool) {
 	case "speed":
 		// speed body 顶层扁平，total_time 为节点真实耗时（不可达时=0/缺失）
 		if v, ok := numOf(root, "total_time"); ok && v > 0 {
+			return int64(v), true
+		}
+		return 0, false
+	case "dns":
+		// dns body 顶层 duration 为节点本次 DNS 查询耗时(ms，float)；解析失败时无意义 → 0
+		if v, ok := numOf(root, "duration"); ok && v > 0 {
 			return int64(v), true
 		}
 		return 0, false

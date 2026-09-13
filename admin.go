@@ -2,15 +2,84 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/spf13/viper"
 	"gorm.io/gorm"
 )
+
+// userTaskLimit 普通用户任务数上限（user-task-limit / 环境变量 USER_TASK_LIMIT，缺省 20；0 = 不限）。
+// 放权给普通用户的护栏：防止账号被用来刷任务打爆调度器和节点。
+func userTaskLimit() int {
+	v := strings.TrimSpace(os.Getenv("USER_TASK_LIMIT"))
+	if v == "" {
+		v = strings.TrimSpace(viper.GetString("user-task-limit"))
+	}
+	if v == "" {
+		return 20
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 20
+	}
+	return n
+}
+
+// userMinInterval 普通用户任务最小间隔秒（user-min-interval / USER_MIN_INTERVAL，缺省 0 = 不额外限制，
+// 仍受全局最小 10s 约束）。>0 时普通用户新建/修改任务的 interval 不得低于该值。
+func userMinInterval() int {
+	v := strings.TrimSpace(os.Getenv("USER_MIN_INTERVAL"))
+	if v == "" {
+		v = strings.TrimSpace(viper.GetString("user-min-interval"))
+	}
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// nodeBriefItems 节点池简表（enabled 节点 + 在线/版本，脱敏无上游地址）。
+// /admin/nodes/brief 与 /api/v1/nodes 共用（见 rest.go）。
+func nodeBriefItems() ([]gin.H, error) {
+	ctx, cancel := dbCtx()
+	defer cancel()
+	var defs []NodeDef
+	if err := db.WithContext(ctx).Where("enabled = ?", true).Order("sort_order asc, id asc").Find(&defs).Error; err != nil {
+		return nil, err
+	}
+	var snaps []Node
+	if err := db.WithContext(ctx).Find(&snaps).Error; err != nil {
+		return nil, err
+	}
+	online := make(map[string]*Node, len(snaps))
+	for i := range snaps {
+		online[snaps[i].NodeID] = &snaps[i]
+	}
+	out := make([]gin.H, 0, len(defs))
+	for _, d := range defs {
+		item := gin.H{
+			"nodeId": d.NodeID, "label": d.Label, "ws": d.WS,
+			"pools": d.Pool, "stack": d.Stack, "online": false, "version": "",
+		}
+		if s, ok := online[d.NodeID]; ok {
+			item["online"] = s.Online
+			item["version"] = s.Version
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
 
 // ==================== 节点远端配置托管 ====================
 //
@@ -105,6 +174,15 @@ func registerAdminRoutes(router *gin.Engine) {
 	// 其余登录接口（拨测工具 / 自己任务 / 站内信 / 个人资料）user 亦可用。
 	restricted := admin.Group("", adminOnly())
 
+	// 上游节点池 CRUD：数据库托管，取代 setting.json 的 api-base-url / ip-location-api（见 node_defs.go）
+	registerNodeDefRoutes(restricted)
+
+	// 节点运行时配置读写（控制台 → 节点进程，WS 优先、HTTP 回退）
+	registerNodeRuntimeConfigRoutes(restricted)
+
+	// 节点 OTA 升级（控制台建任务下发，节点下载/替换/重启；任务追踪见 ota.go）
+	registerOTARoutes(restricted)
+
 	// 服务状态：版本 / 运行时长 / WS 在线数 / 数据库驱动 / 队列堆积
 	admin.GET("/status", func(c *gin.Context) {
 		wsPeers := 0
@@ -150,11 +228,24 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, events)
 	})
 
+	// 节点简表（登录即可，含 user）：任务表单"指定节点"勾选数据源。
+	// 脱敏：只给池内节点的基本信息与在线/版本，不给远端地址/上游 URL（那是 admin 视角）。
+	// 构建逻辑与 /api/v1/nodes 共用（见 rest.go nodeBriefItems）。
+	admin.GET("/nodes/brief", func(c *gin.Context) {
+		items, err := nodeBriefItems()
+		if err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, items)
+	})
+
 	// 一键拨测：对节点池全部（或 body.nodes 子集）同步批量下发拨测并聚合返回（见 admin_probe.go）
 	admin.POST("/nodes/probe/:apiType/*raw", batchProbeHandler)
 
 	// 拨测记录（probe_results）；cat=类别过滤：sched=定时拨测(source=sched)，biz=业务拨测(source!=sched)
-	// user 只能看"自己创建任务"的定时拨测明细（source=sched 且 task_id 归自己）；biz/ws/http/他人 sched 一律不可见。
+	// user 只能看"自己任务"的定时拨测明细（source=sched 且 task_id 归自己）+ 自己发起的一键拨测
+	// （source=biz 且 owner_id=自己，见 persistManualProbes）；他人的 sched/biz 一律不可见。
 	admin.GET("/probes", func(c *gin.Context) {
 		limit := clampLimit(c.Query("limit"), 100)
 		ctx, cancel := dbCtx()
@@ -167,12 +258,11 @@ func registerAdminRoutes(router *gin.Engine) {
 				apiError(c, http.StatusInternalServerError, err.Error())
 				return
 			}
-			if len(ownIDs) == 0 {
-				// 该用户没有任何任务 → 无可见 sched 明细
-				c.JSON(http.StatusOK, []ProbeResult{})
-				return
+			if len(ownIDs) > 0 {
+				q = q.Where("(source = ? AND task_id IN ?) OR (source = ? AND owner_id = ?)", sourceSched, ownIDs, sourceBiz, uid)
+			} else {
+				q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
 			}
-			q = q.Where("source = ? AND task_id IN ?", sourceSched, ownIDs)
 		}
 		if v := c.Query("node"); v != "" {
 			q = q.Where("node_id = ?", v)
@@ -183,16 +273,13 @@ func registerAdminRoutes(router *gin.Engine) {
 		if v := c.Query("cat"); v != "" {
 			switch v {
 			case "sched":
-				if role != RoleUser {
-					q = q.Where("source = ?", sourceSched)
-				}
+				q = q.Where("source = ?", sourceSched)
 			case "biz":
 				if role != RoleUser {
 					q = q.Where("source <> ?", sourceSched)
 				} else {
-					// user 已强制只看自己 sched，biz 请求无可见行
-					c.JSON(http.StatusOK, []ProbeResult{})
-					return
+					// user：自己的 biz 拨测（基线已含自己 sched，需收紧回 biz）
+					q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
 				}
 			default:
 				apiError(c, http.StatusBadRequest, "invalid cat (sched|biz)")
@@ -333,6 +420,49 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, gin.H{"nodeId": c.Param("nodeId"), "deleted": res.RowsAffected > 0})
 	})
 
+	// 运行时配置改动合并进托管配置（持久化）—— admin only。
+	// 背景：运行时 patch 只改节点内存（persist 也只写节点本地 setting.json），
+	// 节点重启后 ENV > setting.json 会顶掉改动；托管远端配置优先级最高（远端 > ENV > 本地），
+	// 把改动键值合并进该节点的托管配置即可让重启后依旧生效（节点 remote-config-url 指向本中心时）。
+	// 恒写节点级配置（不允许 nodeId=global）：单节点的改动合并进全局会扩散到所有节点。
+	restricted.POST("/node-configs/:nodeId/merge", func(c *gin.Context) {
+		nodeID := c.Param("nodeId")
+		if nodeID == "" || nodeID == "global" {
+			apiError(c, http.StatusBadRequest, "global 不支持合并：这里持久化的是单节点覆盖值")
+			return
+		}
+		var body struct {
+			Config map[string]any `json:"config"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			apiError(c, http.StatusBadRequest, "请求体不是合法 JSON："+err.Error())
+			return
+		}
+		if len(body.Config) == 0 {
+			apiError(c, http.StatusBadRequest, "config 不能为空")
+			return
+		}
+		ctx, cancel := dbCtx()
+		defer cancel()
+		merged := map[string]any{}
+		var row NodeConfig
+		if err := db.WithContext(ctx).Where("node_id = ?", nodeID).First(&row).Error; err == nil {
+			_ = json.Unmarshal([]byte(row.Config), &merged) // 存量非法 JSON 时从空对象开始
+		}
+		for k, v := range body.Config {
+			merged[k] = v
+		}
+		normalized := mustJSON(merged)
+		if err := db.WithContext(ctx).Where("node_id = ?", nodeID).
+			Assign(map[string]any{"config": string(normalized), "updated_at": time.Now().UTC()}).
+			FirstOrCreate(&NodeConfig{NodeID: nodeID, Config: string(normalized)}).Error; err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Printf("[node-configs] merged %d key(s) into hosted config of %s", len(body.Config), nodeID)
+		c.JSON(http.StatusOK, gin.H{"nodeId": nodeID, "merged": len(body.Config), "sizeBytes": len(normalized)})
+	})
+
 	// ===== 定时拨测任务 CRUD（SLA 数据源；调度器见 probe_task.go） =====
 
 	// 任务可用拨测类型元信息（前端表单选项用）
@@ -347,6 +477,10 @@ func registerAdminRoutes(router *gin.Engine) {
 		q := db.WithContext(ctx).Model(&ProbeTask{})
 		if uid, role, _ := currentUserFromCtx(c); role == RoleUser {
 			q = q.Where("owner_id = ?", uid)
+		}
+		// 标签过滤（C1）：?tag= 子串匹配
+		if v := strings.TrimSpace(c.Query("tag")); v != "" {
+			q = q.Where("tags LIKE ?", "%"+v+"%")
 		}
 		var rows []ProbeTask
 		if err := q.Order("id asc").Find(&rows).Error; err != nil {
@@ -388,7 +522,28 @@ func registerAdminRoutes(router *gin.Engine) {
 			apiError(c, http.StatusBadRequest, msg)
 			return
 		}
-		uid, _, _ := currentUserFromCtx(c)
+		uid, role, _ := currentUserFromCtx(c)
+		// 普通用户配额护栏：任务数上限 + 最小间隔（user-task-limit / user-min-interval，0 = 不限）
+		if role == RoleUser {
+			if min := userMinInterval(); min > 0 && t.Interval < min {
+				apiError(c, http.StatusForbidden, fmt.Sprintf("普通用户任务间隔不能低于 %d 秒", min))
+				return
+			}
+			if limit := userTaskLimit(); limit > 0 {
+				ctx, cancel := dbCtx()
+				var n int64
+				if err := db.WithContext(ctx).Model(&ProbeTask{}).Where("owner_id = ?", uid).Count(&n).Error; err != nil {
+					cancel()
+					apiError(c, http.StatusInternalServerError, err.Error())
+					return
+				}
+				cancel()
+				if n >= int64(limit) {
+					apiError(c, http.StatusForbidden, fmt.Sprintf("任务数已达普通用户上限（%d 个），请清理不需要的任务或联系管理员", limit))
+					return
+				}
+			}
+		}
 		t.OwnerID = uid // 创建者即所有者
 		ctx, cancel := dbCtx()
 		defer cancel()
@@ -422,8 +577,18 @@ func registerAdminRoutes(router *gin.Engine) {
 			apiError(c, http.StatusBadRequest, msg)
 			return
 		}
+		// 普通用户改任务同样受最小间隔约束（数量配额只在新建时生效）
+		if _, role, _ := currentUserFromCtx(c); role == RoleUser {
+			if min := userMinInterval(); min > 0 && in.Interval < min {
+				apiError(c, http.StatusForbidden, fmt.Sprintf("普通用户任务间隔不能低于 %d 秒", min))
+				return
+			}
+		}
 		in.CreatedAt = t.CreatedAt
-		in.OwnerID = t.OwnerID // 编辑不改所有者（保持创建者）
+		in.OwnerID = t.OwnerID  // 编辑不改所有者（保持创建者）
+		in.Enabled = t.Enabled // 编辑不改运行状态：启停走专用 PATCH /tasks/:id/enabled。
+		// （否则前端编辑表单不带 enabled 字段时，全量 Save 会把任务静默停用）
+		in.ShareToken = t.ShareToken // 编辑不清空分享令牌（share 经 /tasks/:id/share 专门管理，否则全量 Save 会抹掉令牌）
 		if err := db.WithContext(ctx).Save(&in).Error; err != nil {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
@@ -609,6 +774,26 @@ func validateTask(t *ProbeTask) string {
 	if strings.TrimSpace(t.Target) == "" {
 		return "target is required"
 	}
+	// dns 任务：记录类型规整（缺省 a，非法值拒绝）；非 dns 任务清空避免残留
+	if t.APIType == "dns" {
+		rt := strings.ToLower(strings.TrimSpace(t.RecordType))
+		if rt == "" {
+			rt = "a"
+		}
+		validRT := false
+		for _, k := range knownDNSRecordTypes() {
+			if rt == k {
+				validRT = true
+				break
+			}
+		}
+		if !validRT {
+			return "recordType must be one of " + strings.Join(knownDNSRecordTypes(), ",")
+		}
+		t.RecordType = rt
+	} else {
+		t.RecordType = ""
+	}
 	if t.Interval <= 0 {
 		return "intervalSec is required"
 	}
@@ -624,7 +809,40 @@ func validateTask(t *ProbeTask) string {
 	if t.SlowMs < 0 {
 		t.SlowMs = 0
 	}
+	// 免打扰时段校验（B2）："HH:MM-HH:MM"，支持跨零点（如 23:00-07:00）；空 = 不静默
+	if t.QuietHours != "" {
+		qh := strings.TrimSpace(t.QuietHours)
+		if !validQuietHours(qh) {
+			return "quietHours 格式应为 HH:MM-HH:MM（如 23:00-07:00）"
+		}
+		t.QuietHours = qh
+	}
+	// 标签规整（C1）：去空白段、逗号分隔
+	tagParts := make([]string, 0, 4)
+	for _, s := range strings.Split(t.Tags, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			tagParts = append(tagParts, s)
+		}
+	}
+	t.Tags = strings.Join(tagParts, ",")
 	return ""
+}
+
+// validQuietHours 校验 "HH:MM-HH:MM" 格式（各段 00:00~23:59）
+func validQuietHours(s string) bool {
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	validHM := func(x string) bool {
+		if len(x) != 5 || x[2] != ':' {
+			return false
+		}
+		h, err1 := strconv.Atoi(x[:2])
+		m, err2 := strconv.Atoi(x[3:])
+		return err1 == nil && err2 == nil && h >= 0 && h <= 23 && m >= 0 && m <= 59
+	}
+	return validHM(parts[0]) && validHM(parts[1])
 }
 
 // clampLimit 解析 limit 参数（缺省 def，上限 1000）

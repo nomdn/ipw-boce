@@ -3,7 +3,7 @@
     <div class="panel-head">
       <div>
         <h2 class="panel-title">控制台用户</h2>
-        <p class="panel-sub">账号 / 角色 / 状态 / 告警邮箱。仅 admin 可在此管理；普通用户看不到本页。</p>
+        <p class="panel-sub">管理控制台账号、角色、状态与告警邮箱。</p>
       </div>
       <button class="ak-button ak-button--action" @click="openCreate">＋ 新增用户</button>
     </div>
@@ -13,7 +13,7 @@
         <table class="ak-table">
           <thead>
             <tr>
-              <th>用户名</th><th>角色</th><th>状态</th><th>告警邮箱</th><th>创建时间</th><th style="width:170px">操作</th>
+              <th>用户名</th><th>角色</th><th>状态</th><th>告警邮箱</th><th>创建时间</th><th style="width:230px">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -28,9 +28,9 @@
                 </span>
               </td>
               <td>
-                <button class="ak-toggle" :class="{ on: u.enabled }" @click="toggleEnabled(u)">
-                  {{ u.enabled ? '启用' : '禁用' }}
-                </button>
+                <span class="ak-tag ch state-tag" :class="u.enabled ? 'ak-tag--advanced' : 'ak-tag--neutral'">
+                  {{ u.enabled ? '已启用' : '已停用' }}
+                </span>
               </td>
               <td class="mono" :title="u.email">{{ u.email || '—' }}
                 <span v-if="u.email" class="vtag" :class="u.emailVerified ? 'vok' : 'vno'" :title="u.emailVerified ? '邮箱已验证' : '邮箱未验证（该用户登录后需验证，否则 SLA 受限）'">
@@ -39,13 +39,16 @@
               </td>
               <td class="mono nowrap dim">{{ fmtTime(u.createdAt) }}</td>
               <td class="ops">
+                <button class="link-btn" :disabled="isMe(u.id)" :title="isMe(u.id) ? '不能停用自己的账号' : ''" @click="toggleEnabled(u)">
+                  {{ u.enabled ? '停用' : '启用' }}
+                </button>
                 <button class="link-btn" @click="openEdit(u)">编辑</button>
                 <button class="link-btn danger" :disabled="isMe(u.id)" @click="openReset(u)">重置密码</button>
                 <button class="link-btn danger" :disabled="isMe(u.id)" @click="confirmDelete(u)">删除</button>
               </td>
             </tr>
             <tr v-if="!loading && !users.length">
-              <td colspan="6" class="dim">暂无用户。首个 admin 会在服务启动时由 admin-user/admin-password 自动创建。</td>
+              <td colspan="6" class="dim">暂无用户。首个管理员账号会在服务首次启动时自动创建。</td>
             </tr>
           </tbody>
         </table>
@@ -63,7 +66,7 @@
               placeholder="登录名（唯一）" />
           </label>
           <label class="ak-field" v-if="!dialog.isEdit">
-            <span class="ak-label">初始口令</span>
+            <span class="ak-label">初始密码</span>
             <input class="ak-input" type="password" v-model="dialog.form.password"
               placeholder="至少 6 位" autocomplete="new-password" />
           </label>
@@ -90,13 +93,13 @@
       </div>
     </div>
 
-    <!-- 重置口令对话框 -->
+    <!-- 重置密码对话框 -->
     <div v-if="pwDlg.show" class="mask" @click.self="pwDlg.show = false">
       <div class="dlg">
-        <div class="dlg-title">重置口令 · {{ pwDlg.user?.username }}</div>
+        <div class="dlg-title">重置密码 · {{ pwDlg.user?.username }}</div>
         <div class="ak-form-stack">
           <label class="ak-field">
-            <span class="ak-label">新口令</span>
+            <span class="ak-label">新密码</span>
             <input class="ak-input" type="password" v-model="pwDlg.password"
               placeholder="至少 6 位" autocomplete="new-password" @keyup.enter="saveReset" />
           </label>
@@ -162,7 +165,7 @@ function closeDialog() {
 async function saveDialog() {
   dialog.err = ''
   if (!dialog.isEdit && (!dialog.form.username || dialog.form.password.length < 6)) {
-    dialog.err = '用户名必填，口令至少 6 位'
+    dialog.err = '用户名必填，密码至少 6 位'
     return
   }
   dialog.busy = true
@@ -193,7 +196,14 @@ async function toggleEnabled(u) {
   try {
     await updateUser(u.id, { enabled: next })
     await load()
-  } catch (e) { /* 后端已给错误提示；此处静默 */ }
+  } catch (e) {
+    // 后端有硬约束（如"必须保留至少一个启用中的管理员"），静默会让管理员以为操作已生效
+    await uiDialog.open({
+      title: next ? '启用失败' : '停用失败',
+      kind: 'info', actions: true, showCancel: false, confirmText: '知道了',
+      message: e?.message || '操作失败',
+    })
+  }
 }
 
 function openReset(u) {
@@ -205,7 +215,7 @@ function openReset(u) {
 
 async function saveReset() {
   pwDlg.err = ''
-  if (pwDlg.password.length < 6) { pwDlg.err = '新口令至少 6 位'; return }
+  if (pwDlg.password.length < 6) { pwDlg.err = '新密码至少 6 位'; return }
   pwDlg.busy = true
   try {
     await resetUserPassword(pwDlg.user.id, pwDlg.password)
@@ -229,7 +239,13 @@ async function confirmDelete(u) {
   try {
     await deleteUser(u.id)
     await load()
-  } catch (e) { /* 后端已给错误提示 */ }
+  } catch (e) {
+    await uiDialog.open({
+      title: '删除失败',
+      kind: 'info', actions: true, showCancel: false, confirmText: '知道了',
+      message: e?.message || '删除失败',
+    })
+  }
 }
 </script>
 
@@ -254,6 +270,8 @@ async function confirmDelete(u) {
   vertical-align: 1px;
 }
 
+.state-tag { text-transform: none; }
+
 .ops { white-space: nowrap; }
 .link-btn {
   background: none;
@@ -276,17 +294,6 @@ async function confirmDelete(u) {
 }
 .vtag.vok { color: var(--ak-signal-success, #46c47c); border: 1px solid currentColor; }
 .vtag.vno { color: var(--ak-signal-warn, #ffab00); border: 1px solid currentColor; }
-
-.ak-toggle {
-  border: var(--ak-line-hairline) solid rgba(0, 0, 0, 0.15);
-  background: transparent;
-  color: var(--ak-text-secondary);
-  font-size: 0.72rem;
-  padding: 2px 10px;
-  border-radius: 10px;
-  cursor: pointer;
-}
-.ak-toggle.on { color: var(--ak-signal-success); border-color: currentColor; }
 
 .mask {
   position: fixed;

@@ -171,7 +171,6 @@ function fmtTime(s) {
 }
 function fmtNum(k, v) {
   if (!Number.isFinite(v)) return String(v)
-  const n = v < 0 && v !== -1 ? v : v // 保留负值(如 tcping rtt=-1 无数据)
   const msKeys = ['dns_lookup_time', 'tcp_connect_time', 'http_connect_time', 'first_byte_time',
     'total_time', 'duration', 'rtt', 'min_rtt', 'max_rtt', 'avg_rtt', 'connect_time', 'ttfb']
   const absKeys = ['min_rtt', 'max_rtt', 'avg_rtt', 'rtt', 'total_time']

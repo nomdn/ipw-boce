@@ -377,6 +377,17 @@ body {
   outline: 2px solid var(--ak-signal-info);
   outline-offset: 1px;
 }
+/* 原生 select 会为下拉箭头预留 ~20px 槽位，文本在槽位前就提前截断（视觉上"没到边就被切"）。
+   去掉原生外观并自绘箭头：文本可用宽度一直延伸到右侧 28px 内边距（容纳自绘箭头）为止。 */
+.ak-select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b949e'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
 /* ak-button 已含 color:white + 灰底，深色下 --outline 需透出深底 */
 .ak-button.ak-button--outline {
   background: transparent;
@@ -710,6 +721,128 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
 
 /* 标签 */
 .ak-tag.ch { text-transform: none; }
+
+/* ============ 窄屏适配（<768px）：侧边栏收起为抽屉 ============ */
+/* 宽屏不出现汉堡；窄屏由 .console-aside.open 控制抽屉进出 */
+.menu-btn { display: none; }
+.aside-close { display: none; }
+
+@media (max-width: 767px) {
+  /* 侧栏：脱离文档流改为抽屉，主区自动占满全宽 */
+  .console-aside {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 78vw;
+    max-width: 280px;
+    flex: none;
+    height: 100vh;
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform 0.22s var(--ak-ease-standard, ease);
+    box-shadow: 0 0 28px rgba(0, 0, 0, 0.55);
+  }
+  .console-aside.open { transform: none; }
+
+  /* 抽屉遮罩：低于侧栏(40)、高于顶栏(20) */
+  .aside-mask {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 35;
+  }
+
+  /* 侧栏头：品牌文字 + 关闭按钮同一行 */
+  .console-brand {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 16px 14px 12px;
+  }
+  .aside-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex: none;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+    color: var(--ak-text-secondary);
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+
+  /* 顶栏：汉堡 + 标题（超长省略），右侧操作区保持同行 */
+  .console-topbar { padding: 10px 12px; gap: 8px; }
+  .tb-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .console-topbar .crumb {
+    font-size: 1rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .menu-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    flex: none;
+    padding: 0;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+    color: var(--ak-text-primary);
+    cursor: pointer;
+  }
+  .menu-btn .menu-ico { display: inline-flex; }
+  .menu-btn .menu-ico svg { width: 18px; height: 18px; }
+  .console-topbar .top-actions { gap: 6px; flex: none; }
+  .verify-banner { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+  .verify-banner .ak-button { margin-left: 0; }
+
+  /* 内容区收紧留白 */
+  .console-body { padding: 14px 12px 32px; }
+  .panel { padding: 14px; }
+  .toolbar { gap: 10px; margin-bottom: 12px; }
+
+  /* 卡片墙 / 网格：单列优先（ConfigView 的 340px 侧栏是行内样式，需 !important 覆盖） */
+  .node-wall { grid-template-columns: 1fr; }
+  .grid-2, .grid-3 { grid-template-columns: 1fr !important; }
+  .kpi-strip { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .kpi-card { padding: 12px 13px; }
+  .kpi-card .kpi-value { font-size: 1.5rem; }
+  .chart-box { height: 260px; }
+
+  /* 表格：字号与内边距收紧，横向滚动兜住宽表 */
+  .ak-table { font-size: 0.8rem; }
+  .ak-table th { padding: 6px 8px; font-size: 0.7rem; }
+  .ak-table td { padding: 7px 8px; }
+  .fv-key { width: 96px; }
+
+  /* 站内信面板：贴住视口两侧 */
+  .notice-panel {
+    width: calc(100vw - 24px);
+    max-width: none;
+    right: -2px;
+  }
+
+  /* 拨测结果：限高收窄，避免窄屏下整块 JSON 顶满屏幕 */
+  .probe-card pre { font-size: 0.72rem; max-height: 260px; padding: 10px 12px; }
+
+  /* 表单：字段撑满，按钮不挤压 */
+  .form-row { gap: 10px; }
+  .form-field { width: 100%; }
+
+  /* 页面内 minmax(≥360px) 的多列布局在窄屏会撑出横向滚动，统一改单列 */
+  .profile-cols, .acc-grid { grid-template-columns: 1fr !important; }
+
+  /* 登录卡片：宽度已自适应，仅收紧内边距 */
+  .login-card { padding: 26px 18px 22px !important; }
+}
 
 /* 滚动条 */
 ::-webkit-scrollbar { width: 10px; height: 10px; }

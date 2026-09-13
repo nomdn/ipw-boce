@@ -17,6 +17,16 @@ export const submitVerifyCode = (code) => http.post('/admin/me/verify', { code }
 export const fetchNodes = () => http.get('/admin/nodes')
 export const fetchNodeEvents = (nodeId, limit = 100) =>
   http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/events?limit=${limit}`)
+// 节点简表（登录即可，脱敏：池内节点 + 在线/版本，无远端地址）——任务表单"指定节点"勾选用
+export const fetchNodesBrief = () => http.get('/admin/nodes/brief')
+
+// 我的用量（本人任务的 sched 样本 + 本人发起的 biz 拨测，按 apiType 聚合）
+export const fetchMyUsage = (hours = 24) => http.get(`/admin/me/usage?hours=${hours}`)
+// 测试本人 webhook（向自配地址推一条测试消息）
+export const testMyWebhook = () => http.post('/admin/me/webhook/test')
+// 个人 API Token：明文仅在生成响应里返回一次；重复生成使旧 token 立即失效
+export const createMyToken = () => http.post('/admin/me/token')
+export const revokeMyToken = () => http.del('/admin/me/token')
 
 // 统计
 export const fetchStatsSummary = (hours = 24) => http.get(`/admin/stats/summary?hours=${hours}`)
@@ -53,10 +63,27 @@ export const deleteNodeConfig = (nodeId) =>
   http.del(`/admin/node-configs/${encodeURIComponent(nodeId)}`)
 // 查看某节点合并后的远端配置（global 底 + 节点覆盖）
 export const fetchResolvedConfig = (nodeId) => http.get(`/remote-config/${encodeURIComponent(nodeId)}`)
+// 把运行时配置改动合并进节点托管配置（持久化：重启后远端配置 > ENV > setting.json）
+export const mergeNodeHostedConfig = (nodeId, config) =>
+  http.post(`/admin/node-configs/${encodeURIComponent(nodeId)}/merge`, { config })
+
+// 节点运行时配置（节点进程当前生效值，WS 优先 / HTTP 回退；区别于上面「托管配置」）
+export const fetchNodeRuntimeConfig = (nodeId) =>
+  http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/config`)
+// payload: { action: 'patch' | 'refresh', config: {...}, persist: bool }
+export const applyNodeRuntimeConfig = (nodeId, payload) =>
+  http.post(`/admin/nodes/${encodeURIComponent(nodeId)}/config`, payload)
+
+// ===== 节点 OTA 升级（控制台下发，节点执行）=====
+// payload: { version?, url?, sha256? }（version 与 url 二选一）
+export const dispatchNodeOta = (nodeId, payload) =>
+  http.post(`/admin/nodes/${encodeURIComponent(nodeId)}/ota`, payload)
+// 最近 OTA 任务列表（节点重连上报新版本号即判定成功，见任务 hint）
+export const fetchOtaTasks = (limit = 50) => http.get(`/admin/ota-tasks?limit=${limit}`)
 
 // ===== 定时拨测任务 + SLA（source=sched）=====
 export const fetchTaskMeta = () => http.get('/admin/tasks/meta')
-export const fetchTasks = () => http.get('/admin/tasks')
+export const fetchTasks = (tag) => http.get(`/admin/tasks${tag ? `?tag=${encodeURIComponent(tag)}` : ''}`)
 export const fetchTask = (id) => http.get(`/admin/tasks/${id}`)
 export const createTask = (t) => http.post('/admin/tasks', t)
 export const updateTask = (id, t) => http.put(`/admin/tasks/${id}`, t)
@@ -65,9 +92,27 @@ export const deleteTask = (id) => http.del(`/admin/tasks/${id}`)
 // SLA 聚合：某任务在窗口内的可用率/延迟/错误率 + 最新样本特殊字段
 export const fetchTaskSla = (id, hours = 24) => http.get(`/admin/tasks/${id}/sla?hours=${hours}`)
 // 某任务的时序曲线（SLA 卡片延迟图）：{taskId,stepMinutes,series:[{time,samples,up,down,availability,avgMs}]}
-export const fetchTaskSeries = (id, hours = 24) => http.get(`/admin/tasks/${id}/series?hours=${hours}`)
+// node 传节点 id 时只返回该节点的曲线（多节点对比视图逐节点拉取叠加）
+export const fetchTaskSeries = (id, hours = 24, node = '') =>
+  http.get(`/admin/tasks/${id}/series?hours=${hours}${node ? `&node=${encodeURIComponent(node)}` : ''}`)
+// 公开状态页分享（B3）：分享码即分享组——多选任务共用一个分享码；支持自定义分享码
+// shareTasks([ids], token?)：token 缺省随机 6 位 hex
+export const shareTasks = (ids, token) =>
+  http.post('/admin/tasks/share', { ids, token: token || undefined })
+export const unshareTasks = (ids) => http.del('/admin/tasks/share', { ids })
 // 我的定时任务时序（当前用户自己任务 source=sched 分桶）：{stepMinutes, series:[...]}
 export const fetchMineSeries = (hours = 24) => http.get(`/admin/tasks/mine/series?hours=${hours}`)
+
+// ===== 上游节点池（数据库托管，仅 admin）=====
+// 节点定义列表（含停用）
+export const fetchNodeDefs = () => http.get('/admin/node-defs')
+// 新增节点 {nodeId,label,url,ws,pool,stack,enabled,sortOrder}
+export const createNodeDef = (n) => http.post('/admin/node-defs', n)
+// 更新节点（按主键 id，未传字段保持原值）
+export const updateNodeDef = (id, patch) => http.put(`/admin/node-defs/${id}`, patch)
+export const deleteNodeDef = (id) => http.del(`/admin/node-defs/${id}`)
+// 已接入（WS 在线 / 在线快照）但库里没有节点定义的节点，供控制台补录下拉框
+export const fetchUnconfiguredNodes = () => http.get('/admin/node-defs/online')
 
 // ===== 用户管理（仅 admin）=====
 export const fetchUsers = () => http.get('/admin/users')
@@ -78,6 +123,8 @@ export const deleteUser = (id) => http.del(`/admin/users/${id}`)
 
 // ===== 个人资料（本人，登录即可）=====
 export const fetchMe = () => http.get('/admin/me')
+// PATCH /admin/me：{email?, webhookUrl?, webhookType?}，字段可选只更新传入项
+export const updateMeProfile = (patch) => http.patch('/admin/me', patch)
 export const updateMeEmail = (email) => http.patch('/admin/me', { email })
 export const changeMyPassword = (oldPassword, newPassword) =>
   http.patch('/admin/me/password', { oldPassword, newPassword })

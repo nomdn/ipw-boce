@@ -24,6 +24,38 @@ export class ApiError extends Error {
   }
 }
 
+// 后端 /admin 接口的部分 message 是英文（login/账号相关），直接展示对用户不友好。
+// 这里做已知条目的中文化：精确命中 → 中文；前缀命中 → 中文并丢弃技术性尾部
+// （如 "invalid body: json: ..."）；未命中一律保留原文，避免误译。
+const ERROR_TEXT = {
+  'invalid username or password': '用户名或密码错误',
+  'account disabled': '账号已停用',
+  Unauthorized: '登录状态已失效，请重新登录',
+  'admin role required': '需要管理员权限',
+  'JWT login is not enabled (set jwt-secret)': '服务端未开启账号登录（jwt-secret 未配置）',
+  'invalid login body': '登录请求格式有误',
+  'invalid body': '请求参数有误',
+  'username required': '用户名必填',
+  'password must be at least 6 chars': '密码至少 6 位',
+  'role must be admin|user': '角色只能是 admin 或 user',
+  'username already exists': '用户名已存在',
+  'user not found': '用户不存在',
+  'cannot demote your own admin role': '不能降级自己的管理员角色',
+  'cannot disable your own account': '不能停用自己的账号',
+  'cannot delete your own account': '不能删除自己的账号',
+  'must keep at least one enabled admin': '必须保留至少一个启用中的管理员',
+  'issue token': '登录凭证签发失败',
+}
+
+function localizeError(msg) {
+  if (!msg) return msg
+  if (ERROR_TEXT[msg]) return ERROR_TEXT[msg]
+  for (const [en, zh] of Object.entries(ERROR_TEXT)) {
+    if (msg.startsWith(en)) return zh
+  }
+  return msg
+}
+
 async function request(method, path, body) {
   const headers = {}
   const token = getToken()
@@ -54,10 +86,10 @@ async function request(method, path, body) {
     }
   }
   if (!resp.ok) {
-    const msg =
+    const raw =
       (data && (data.statusMessage || data.error || data.message)) ||
       `HTTP ${resp.status}`
-    throw new ApiError(resp.status, msg)
+    throw new ApiError(resp.status, localizeError(raw))
   }
   return data
 }
@@ -67,5 +99,5 @@ export const http = {
   post: (path, body) => request('POST', path, body === undefined ? {} : body),
   put: (path, body) => request('PUT', path, body),
   patch: (path, body) => request('PATCH', path, body === undefined ? {} : body),
-  del: (path) => request('DELETE', path),
+  del: (path, body) => request('DELETE', path, body),
 }

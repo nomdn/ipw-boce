@@ -28,7 +28,11 @@ type Node struct {
 	Label       string    `gorm:"size:256" json:"label"`
 	Online      bool      `gorm:"index" json:"online"`
 	RemoteAddr  string    `gorm:"size:128" json:"remoteAddr"`
-	FirstSeenAt time.Time `json:"firstSeenAt"`
+	Version     string    `gorm:"size:64" json:"version"` // 节点上报的版本号（WS register / HTTP 健康检查）
+	// Capabilities 节点上报的能力清单（逗号分隔，如 "probe,report,config"）。
+	// 空 = 老版本节点未上报（无法据此判定"不支持"，只能作为"程序可能过旧"的线索）。
+	Capabilities string    `gorm:"size:128" json:"capabilities"`
+	FirstSeenAt  time.Time `json:"firstSeenAt"`
 	LastSeenAt  time.Time `json:"lastSeenAt"`
 	CreatedAt   time.Time `json:"-"`
 	UpdatedAt   time.Time `json:"-"`
@@ -58,6 +62,9 @@ type ProbeResult struct {
 	LatencyMs int64     `json:"latencyMs"`                                              // 端到端耗时（中间件侧）
 	Error     string    `gorm:"size:512" json:"error,omitempty"`
 	Source    string    `gorm:"size:16" json:"source"`            // ws|http 节点上报 / sched 定时 / biz 手动一键
+	// OwnerID 手动一键拨测(biz)发起者的用户 id；sched 样本的归属走 task_id→任务 owner，不在此冗余。
+	// 0 = 无归属（静态 token 发起 / 节点上报）。用户"我的拨测历史"按它过滤。
+	OwnerID   uint      `gorm:"index;default:0" json:"ownerId,omitempty"`
 	Origin    string    `gorm:"size:128" json:"origin,omitempty"` // 数据来源实例（外部上报方标识；空 = 本机观测）
 	Body      string    `gorm:"type:text" json:"body,omitempty"`
 	CreatedAt time.Time `gorm:"index:idx_probe_created;index:idx_probe_node,priority:2" json:"createdAt"`
@@ -85,8 +92,63 @@ type NodeConfig struct {
 	CreatedAt time.Time `json:"-"`
 }
 
+// NodeDef 节点定义（管理员在控制台维护的上游节点池，见 node_defs.go）
+//
+// 取代 setting.json 的 api-base-url / ip-location-api 两处静态配置：
+// 库中有记录即由库接管对应池，空库才回退 setting.json（兼容老部署平滑迁移）。
+type NodeDef struct {
+	ID     uint   `gorm:"primaryKey" json:"id"`
+	NodeID string `gorm:"uniqueIndex;size:128" json:"nodeId"` // 节点标识，即转发路径里的 backendID
+	Label  string `gorm:"size:256" json:"label"`              // 显示名，如"中国 江苏 移动"
+	URL    string `gorm:"size:512" json:"url"`                // HTTP 上游地址；走 WS 通道的节点可留空
+	WS     bool   `json:"ws"`                                 // true = 拨测请求经 WS 通道下发
+	// Pool 归属池，逗号分隔可多选：api | location | api,location（默认 api）
+	// 双归属节点在转发时按 apiType 选池：location/asn 走 location，其余走 api
+	Pool string `gorm:"size:16;index" json:"pool"`
+	// Stack 仅对 api 池有意义，对应原三栈分组：DualStack / IPv4 / IPv6；location 池为纯数组，留空
+	Stack     string    `gorm:"size:16" json:"stack"`
+	Enabled   bool      `json:"enabled"`   // 停用后不进节点池（转发/拨测/探活都看不见）
+	SortOrder int       `json:"sortOrder"` // 控制台展示与池内排序
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// OTATask 控制台下发的节点 OTA 升级任务（见 ota.go）
+//
+// 状态机：dispatched（已下发）→ success / failed。
+// 节点重启期间 WS 必然断开，最终结果无法经原连接回传，成败以"观测到节点重连后的版本号"为准：
+//   - TargetVersion 非空（按版本下发）：重连版本 == 目标版本 → success
+//   - TargetVersion 为空（直发 url）：重连版本 != FromVersion → success
+//   - 节点主动回报 ok:false（下载/校验失败）→ 立即 failed
+//   - 超过超时窗口未观测到版本变化 → failed（超时）
+type OTATask struct {
+	ID     uint   `gorm:"primaryKey" json:"id"`
+	NodeID string `gorm:"index;size:128" json:"nodeId"`
+	// RequestID 下发时生成的指令 id（"o" 前缀），节点 ota_result 按 it 关联回报
+	RequestID string `gorm:"size:64" json:"requestId"`
+	// FromVersion 下发时节点的版本号（nodes 表快照，可能为空）
+	FromVersion string `gorm:"size:64" json:"fromVersion"`
+	// TargetVersion 目标版本（按版本下发时有值；直发 url 时为空）
+	TargetVersion string `gorm:"size:64" json:"targetVersion"`
+	// URL 直发下载地址；按版本下发时为空（资产名由节点按平台计算）
+	URL    string `gorm:"size:512" json:"url,omitempty"`
+	SHA256 string `gorm:"size:64" json:"sha256,omitempty"`
+	// Channel 实际使用的下发通道：ws | http
+	Channel string `gorm:"size:8" json:"channel"`
+	// Status 任务状态：dispatched | success | failed
+	Status string `gorm:"index;size:16" json:"status"`
+	// Stage 节点回报的最新阶段（accepted/downloading/verifying/installing/restarting）
+	Stage string `gorm:"size:32" json:"stage"`
+	Error string `gorm:"size:512" json:"error,omitempty"`
+	// DispatchedBy 操作人用户名（审计；静态 token 操作为空）
+	DispatchedBy string     `gorm:"size:64" json:"dispatchedBy,omitempty"`
+	DispatchedAt time.Time  `json:"dispatchedAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
+	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
+}
+
 // allModels AutoMigrate 的全部模型
-var allModels = []any{&Node{}, &NodeEvent{}, &ProbeResult{}, &RequestStat{}, &NodeConfig{}, &ProbeTask{}, &User{}, &AppNotice{}}
+var allModels = []any{&Node{}, &NodeEvent{}, &ProbeResult{}, &RequestStat{}, &NodeConfig{}, &NodeDef{}, &ProbeTask{}, &User{}, &AppNotice{}, &OTATask{}}
 
 // ==================== 数据库初始化 ====================
 

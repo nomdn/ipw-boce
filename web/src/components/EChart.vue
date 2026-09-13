@@ -6,7 +6,8 @@
 // 通用 ECharts 封装：传 option 即渲染，DOM 尺寸变化自动 resize
 import { ref, onMounted, onBeforeUnmount, watch, computed, shallowRef } from 'vue'
 import * as echarts from 'echarts/core'
-import { LineChart, BarChart, PieChart } from 'echarts/charts'
+// ScatterChart：失败轮次标记（SlaView 趋势图顶部条带）使用；按需注册漏了会被 ECharts 静默丢弃
+import { LineChart, BarChart, PieChart, ScatterChart } from 'echarts/charts'
 import {
   GridComponent, TooltipComponent, LegendComponent,
   DataZoomComponent, TitleComponent,
@@ -15,7 +16,7 @@ import {
 import { CanvasRenderer } from 'echarts/renderers'
 
 echarts.use([
-  LineChart, BarChart, PieChart,
+  LineChart, BarChart, PieChart, ScatterChart,
   GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, TitleComponent,
   MarkAreaComponent, MarkLineComponent, MarkPointComponent,
   CanvasRenderer,

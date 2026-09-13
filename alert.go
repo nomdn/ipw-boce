@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/smtp"
 	"strings"
 	"sync"
@@ -103,11 +107,18 @@ func noteRoundOutcome(t *ProbeTask, rows []ProbeResult) {
 	defer alertMu.Unlock()
 	id := t.ID
 	if !roundDown {
-		// 恢复：清计数与已触发，下次新故障可再告警
-		if alertStreak[id] != 0 || alertFired[id] {
+		// 恢复：清计数与已触发，下次新故障可再告警。
+		// 若本次故障实际触发过告警且任务开了"恢复通知"（NotifyRecover），补一封恢复通知（B2）。
+		fired := alertFired[id]
+		if alertStreak[id] != 0 || fired {
 			alertStreak[id] = 0
 			delete(alertFired, id)
-			log.Printf("[alert] task#%d %s recovered, reset down streak", id, t.Name)
+			if fired && t.NotifyRecover {
+				log.Printf("[alert] task#%d %s recovered -> notify owner#%d (recover notice)", id, t.Name, t.OwnerID)
+				go deliverRecoverAlert(t)
+			} else {
+				log.Printf("[alert] task#%d %s recovered, reset down streak", id, t.Name)
+			}
 		}
 		return
 	}
@@ -125,10 +136,9 @@ func noteRoundOutcome(t *ProbeTask, rows []ProbeResult) {
 	}
 }
 
-// deliverDownAlert 按任务所有者送达掉线告警（邮件 + 站内信**同时**发，互不回退）：
+// deliverDownAlert 按任务所有者送达掉线告警（邮件 + 站内信 + Webhook 三路，互不回退）：
 //   - 所有者不存在 → 丢弃（不应发生：删用户会级联删任务；防御兜底）
-//   - 所有者有邮箱且 SMTP 可用 → 发 SMTP 邮件（失败仅记日志）
-//   - 所有者启用（能登录看到站内信）→ 无论是否已发邮件，都落一条站内信
+//   - 任务处于免打扰时段（QuietHours）→ 站内信照发，邮件与 Webhook 抑制（见 deliverToOwner）
 func deliverDownAlert(t *ProbeTask, rows []ProbeResult, streak int) {
 	owner, err := userByID(t.OwnerID)
 	if err != nil || owner == nil {
@@ -137,29 +147,147 @@ func deliverDownAlert(t *ProbeTask, rows []ProbeResult, streak int) {
 	}
 	subject := fmt.Sprintf("[IPW-BOCE] SLA 掉线告警：%s 连续 %d 轮不可达", t.Name, streak)
 	body := buildAlertBody(t, rows, streak)
+	deliverToOwner(owner, subject, body, "task_down", t.ID, inQuietHours(t))
+}
 
+// deliverRecoverAlert 恢复通知（B2）：任务开了 NotifyRecover 且本次故障实际触发过告警，
+// 恢复那一轮补一封"已恢复"。三路同 down，同样受免打扰时段约束。
+func deliverRecoverAlert(t *ProbeTask) {
+	owner, err := userByID(t.OwnerID)
+	if err != nil || owner == nil {
+		return
+	}
+	subject := fmt.Sprintf("[IPW-BOCE] SLA 恢复通知：%s 已恢复", t.Name)
+	body := fmt.Sprintf("任务已恢复正常拨测。\n\n任务: %s (#%d)\n类型: %s\n目标: %s\n时间: %s\n\n—— ipw-boce 自动通知",
+		t.Name, t.ID, t.APIType, t.Target, time.Now().UTC().Format(time.RFC3339))
+	deliverToOwner(owner, subject, body, "task_recover", t.ID, inQuietHours(t))
+}
+
+// deliverToOwner 三路投递（互不回退）：
+//   - 邮件：有邮箱且 SMTP 可用才发；缺邮箱/不可用/失败仅记日志
+//   - 站内信：所有者启用即落
+//   - Webhook：配了接收端就推（generic/wecom/feishu）
+//
+// quiet=true（任务免打扰时段）：站内信照发（只记不丢），邮件与 Webhook 抑制。
+func deliverToOwner(owner *User, subject, body, event string, taskID uint, quiet bool) {
+	if quiet {
+		log.Printf("[alert] owner#%d in quiet hours, email/webhook suppressed (in-app only): %s", owner.ID, subject)
+	}
 	// 1) 邮件路径：所有者有邮箱且 SMTP 可用才发；失败/缺邮箱仅记日志，不短路站内信
-	if e := strings.TrimSpace(owner.Email); e != "" {
-		if !smtpReady() {
-			log.Printf("[alert] task#%d %s owner#%d email %s but smtp not ready, email skipped (in-app notice still sent)", t.ID, t.Name, owner.ID, e)
-		} else if err := mailSender([]string{e}, subject, body); err != nil {
-			log.Printf("[alert] ERROR send down alert task#%d to %s: %v", t.ID, e, err)
+	if !quiet {
+		if e := strings.TrimSpace(owner.Email); e != "" {
+			if !smtpReady() {
+				log.Printf("[alert] owner#%d email %s but smtp not ready, email skipped (in-app notice still sent)", owner.ID, e)
+			} else if err := mailSender([]string{e}, subject, body); err != nil {
+				log.Printf("[alert] ERROR send alert to %s: %v", e, err)
+			} else {
+				log.Printf("[alert] sent alert to owner#%d <%s> (%s)", owner.ID, e, event)
+			}
 		} else {
-			log.Printf("[alert] sent down alert task#%d to owner#%d <%s>", t.ID, owner.ID, e)
+			log.Printf("[alert] owner#%d has no email, email skipped (in-app notice still sent)", owner.ID)
 		}
-	} else {
-		log.Printf("[alert] task#%d %s owner#%d has no email, email skipped (in-app notice still sent)", t.ID, t.Name, owner.ID)
 	}
 	// 2) 站内信路径：所有者启用即落（与邮件并存）；停用账号收不到站内信
 	if !owner.Enabled {
-		log.Printf("[alert] task#%d %s owner#%d disabled, skip in-app notice (email above may still go out)", t.ID, t.Name, owner.ID)
+		log.Printf("[alert] owner#%d disabled, skip in-app notice (email above may still go out)", owner.ID)
 		return
 	}
-	if err := createNotice(owner.ID, noticeKindSLA, t.ID, subject, body); err != nil {
-		log.Printf("[alert] ERROR create in-app notice task#%d owner#%d: %v", t.ID, owner.ID, err)
+	if err := createNotice(owner.ID, noticeKindSLA, taskID, subject, body); err != nil {
+		log.Printf("[alert] ERROR create in-app notice owner#%d: %v", owner.ID, err)
 	} else {
-		log.Printf("[alert] in-app notice task#%d -> owner#%d (sent with email)", t.ID, owner.ID)
+		log.Printf("[alert] in-app notice -> owner#%d (%s)", owner.ID, event)
 	}
+	// 3) Webhook 路径：所有者在个人资料里配了接收端就推（第三条投递路径，失败仅记日志）
+	if !quiet {
+		pushUserWebhook(owner, subject, body, event, taskID)
+	}
+}
+
+// inQuietHours 任务是否处于免打扰时段（服务器本地时区）。QuietHours 形如 "HH:MM-HH:MM"，
+// 支持跨零点（23:00-07:00）；起止相同视为无窗口。格式非法时不静默（宁多勿漏）。
+func inQuietHours(t *ProbeTask) bool {
+	qh := strings.TrimSpace(t.QuietHours)
+	if qh == "" {
+		return false
+	}
+	parts := strings.SplitN(qh, "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	toMin := func(s string) int {
+		s = strings.TrimSpace(s)
+		if len(s) != 5 || s[2] != ':' {
+			return -1
+		}
+		h := int(s[0]-'0')*10 + int(s[1]-'0')
+		m := int(s[3]-'0')*10 + int(s[4]-'0')
+		if h < 0 || h > 23 || m < 0 || m > 59 || s[0] < '0' || s[0] > '9' || s[3] < '0' || s[3] > '9' {
+			return -1
+		}
+		return h*60 + m
+	}
+	a, b := toMin(parts[0]), toMin(parts[1])
+	if a < 0 || b < 0 || a == b {
+		return false
+	}
+	now := time.Now()
+	cur := now.Hour()*60 + now.Minute()
+	if a < b {
+		return cur >= a && cur < b
+	}
+	return cur >= a || cur < b // 跨零点窗口
+}
+
+// pushUserWebhook 向用户自配的 Webhook 推送通知（任务告警等），失败仅记日志，不影响邮件/站内信主路径。
+func pushUserWebhook(u *User, title, content, event string, taskID uint) {
+	if strings.TrimSpace(u.WebhookURL) == "" {
+		return
+	}
+	if err := webhookDeliver(u, title+"\n"+content, event, taskID); err != nil {
+		log.Printf("[alert] ERROR webhook push owner#%d (%s): %v", u.ID, event, err)
+	} else {
+		log.Printf("[alert] webhook push owner#%d (%s) ok", u.ID, event)
+	}
+}
+
+// webhookDeliver 实际投递 Webhook，报文格式按 WebhookType：
+//   - "" / generic：结构化 JSON {"event","taskId","title","content"}（自建接收端用）
+//   - wecom：企业微信/钉钉群机器人 text 格式 {"msgtype":"text","text":{"content":...}}
+//   - feishu：飞书自定义机器人 text 格式 {"msg_type":"text","content":{"text":...}}
+//
+// URL 为空 = 未配置（no-op 返回 nil）；HTTP 状态 ≥400 视为失败。
+func webhookDeliver(u *User, text, event string, taskID uint) error {
+	url := strings.TrimSpace(u.WebhookURL)
+	if url == "" {
+		return nil
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return fmt.Errorf("webhook url 不是 http(s) 地址")
+	}
+	var payload any
+	switch strings.ToLower(strings.TrimSpace(u.WebhookType)) {
+	case "wecom":
+		payload = map[string]any{"msgtype": "text", "text": map[string]string{"content": text}}
+	case "feishu":
+		payload = map[string]any{"msg_type": "text", "content": map[string]string{"text": text}}
+	default: // generic
+		payload = map[string]any{"event": event, "taskId": taskID, "title": text}
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("接收端返回 HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // buildAlertBody 组装告警正文（纯文本，中文可读）

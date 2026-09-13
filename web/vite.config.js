@@ -7,5 +7,9 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     port: 5173,
+    host: '127.0.0.1',
+    // 预览面板 / 沙箱环境不支持 WebSocket 升级时，用 VITE_NO_HMR=1 关掉 HMR。
+    // 否则客户端会反复重连失败，模块图错乱后报 "injection Symbol(router) not found" 这类假错。
+    hmr: process.env.VITE_NO_HMR ? false : undefined,
   },
 })

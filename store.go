@@ -65,7 +65,9 @@ func (s *dataStore) Stop() {
 // ---------- 节点在线状态 ----------
 
 // recordNodeOnline WS 注册成功：upsert 节点快照并追加 online 事件
-func recordNodeOnline(nodeID, remoteAddr string) {
+// recordNodeOnline WS 注册：置在线并追加 online 事件。
+// version / capabilities 为空时不覆盖库里的旧值（老版本节点不上报，避免把已知信息清空）。
+func recordNodeOnline(nodeID, remoteAddr, version string, capabilities []string) {
 	if db == nil {
 		return
 	}
@@ -74,14 +76,24 @@ func recordNodeOnline(nodeID, remoteAddr string) {
 	clearNodeDownFired(nodeID)
 	ctx, cancel := dbCtx()
 	defer cancel()
+	updates := map[string]any{
+		"online":       true,
+		"remote_addr":  remoteAddr,
+		"last_seen_at": now,
+	}
+	// 版本可能为空（老版本节点不上报）：只在有值时更新，避免把已知版本清空
+	if v := strings.TrimSpace(version); v != "" {
+		updates["version"] = v
+	}
+	// 能力清单同理：老版本节点不发则该列为空（= "未知"），新版本节点每次注册都会带上
+	caps := joinCapabilities(capabilities)
+	if caps != "" {
+		updates["capabilities"] = caps
+	}
 	err := db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "node_id"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"online":       true,
-			"remote_addr":  remoteAddr,
-			"last_seen_at": now,
-		}),
-	}).Create(&Node{NodeID: nodeID, Online: true, RemoteAddr: remoteAddr, FirstSeenAt: now, LastSeenAt: now}).Error
+		Columns:   []clause.Column{{Name: "node_id"}},
+		DoUpdates: clause.Assignments(updates),
+	}).Create(&Node{NodeID: nodeID, Online: true, RemoteAddr: remoteAddr, Version: strings.TrimSpace(version), Capabilities: caps, FirstSeenAt: now, LastSeenAt: now}).Error
 	if err != nil {
 		log.Printf("[store] ERROR upsert node online: %v", err)
 		return
@@ -114,6 +126,12 @@ func recordNodeOffline(nodeID, reason string) {
 	// 仅在"此前在线"的真掉线翻转时通知，且同一次掉线只通知一次（复联后由 recordNodeOnline 复位）。
 	// 启动后从未在线的节点不上报，避免冷启动误报。
 	if wasOnline && markNodeDownFired(nodeID) {
+		// OTA 在途豁免：计划内重启伴随的真实断连不 page（offline 事件已照记，可追溯）；
+		// 任务终结仍失败且节点未恢复时由 otaNotifyIfStillDown 补报（见 ota.go）
+		if otaTaskInFlight(nodeID) {
+			log.Printf("[store] node %s offline while OTA task in-flight, down alert suppressed", nodeID)
+			return
+		}
 		label := ""
 		var n Node
 		if err := db.WithContext(ctx).Where("node_id = ?", nodeID).Limit(1).Find(&n).Error; err == nil && n.ID != 0 {

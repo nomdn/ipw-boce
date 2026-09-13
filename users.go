@@ -41,9 +41,20 @@ type User struct {
 	Enabled      bool      `json:"enabled"`
 	// EmailVerified 邮箱是否已验证。自助注册走验证码，创建即 true；
 	// 管理员直建(带邮箱)默认为 false → 该用户登录受限(SLA 需先验证邮箱)。
-	EmailVerified bool      `gorm:"default:false" json:"emailVerified"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"-"`
+	EmailVerified bool `gorm:"default:false" json:"emailVerified"`
+	// Webhook 通知渠道（任务掉线告警除邮件/站内信外的第三条投递路径，见 alert.go pushUserWebhook）：
+	//   - WebhookURL 自定义接收端；WebhookType 决定报文格式：generic(缺省，结构化 JSON) /
+	//     wecom(企业微信·钉钉群机器人 text 格式) / feishu(飞书自定义机器人 text 格式)
+	WebhookURL  string `gorm:"size:512" json:"webhookUrl,omitempty"`
+	WebhookType string `gorm:"size:16" json:"webhookType,omitempty"`
+	// 个人 API Token（profile 生成，供脚本/自动化替代 24h JWT）：只存 bcrypt 哈希，
+	// 明文仅在生成时返回一次；Hint 存末 4 位供前端展示。哈希为空 = 未生成/已吊销。
+	// 鉴权见 auth.go userByAPIToken（ipt_ 前缀三轨之一），权限与账号角色一致。
+	APITokenHash      string    `gorm:"size:128" json:"-"`
+	APITokenHint      string    `gorm:"size:8" json:"apiTokenHint,omitempty"`
+	APITokenCreatedAt time.Time `json:"apiTokenCreatedAt,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"-"`
 }
 
 // userPublic 返回给前端的视图（绝不带口令哈希）
@@ -55,6 +66,11 @@ func (u *User) userPublic() gin.H {
 		"emailVerified": u.EmailVerified,
 		"role":          u.Role,
 		"enabled":       u.Enabled,
+		"webhookUrl":    u.WebhookURL,
+		"webhookType":   u.WebhookType,
+		"apiTokenHint":  u.APITokenHint,
+		"hasApiToken":   u.APITokenHash != "",
+		"apiTokenCreatedAt": u.APITokenCreatedAt,
 		"createdAt":     u.CreatedAt,
 	}
 }

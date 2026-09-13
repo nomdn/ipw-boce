@@ -46,9 +46,9 @@ type nodeResult struct {
 // nodePoolForType 按 apiType 返回对应节点池（与 middlewareHandler 的池路由规则一致）
 func nodePoolForType(apiType string) []apiInfo {
 	if apiType == "location" || apiType == "asn" {
-		return IP_LOCATION_APIS
+		return locationPoolSnapshot()
 	}
-	return flattenStack(API_BASE_URLS)
+	return apiPoolSnapshot()
 }
 
 // batchProbeHandler POST /admin/nodes/probe/:apiType/*raw
@@ -60,30 +60,67 @@ func batchProbeHandler(c *gin.Context) {
 		apiError(c, http.StatusBadRequest, "Invalid slug")
 		return
 	}
+	uid, _, _ := currentUserFromCtx(c) // 一键拨测归属（biz 明细"我的拨测历史"用）
 
-	// 池路由：与 middlewareHandler 一致（location/asn 走 ip-location-api，其余走 api-base-url）
-	pool := nodePoolForType(apiType)
-	if len(pool) == 0 {
-		apiError(c, http.StatusBadRequest, "No nodes configured for api type "+apiType)
-		return
-	}
-
-	// body 可选 nodes 子集：缺省 = 池中全部节点（HTTP + WS）
-	selected := make(map[string]bool)
-	wantAll := true
+	// body 可选 {"nodes": [...]}：限定只拨测这些节点；缺省 = 池中全部节点（HTTP + WS）
+	var wantNodes []string
 	if c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) > 0 {
 		var body struct {
 			Nodes []string `json:"nodes"`
 		}
 		if err := c.ShouldBindJSON(&body); err == nil && len(body.Nodes) > 0 {
-			wantAll = false
-			for _, n := range body.Nodes {
-				selected[n] = true
-			}
+			wantNodes = body.Nodes
 		}
 	}
 
-	// 过滤出目标节点；body 指定了但池里没有的记入 unknown 返回
+	results, unknown, err := batchProbeCore(apiType, raw, wantNodes, c.Request.URL.Query())
+	if err != nil {
+		apiError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 控制台手动一键拨测落库（source=biz，归明细页"业务拨测"）。
+	// 只落拨测类（isProbeType，对齐上报明细语义）；whois/dnssec/location/asn 等诊断类不进明细表。
+	// 记录发起者 uid：用户据此在明细页看到"我的拨测历史"（静态 token 为 0，无归属）。
+	persisted := persistManualProbes(apiType, raw, results, uid)
+
+	okCnt, failedCnt := 0, 0
+	for _, r := range results {
+		if r.Status >= 200 && r.Status < 300 {
+			okCnt++
+		} else {
+			failedCnt++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"apiType":   apiType,
+		"raw":       raw,
+		"targeted":  len(results),
+		"ok":        okCnt,
+		"failed":    failedCnt,
+		"unknown":   unknown,
+		"persisted": persisted,
+		"results":   results,
+	})
+}
+
+// batchProbeCore 一键拨测核心：对节点池（或指定节点子集）并发拨测一轮并同步聚合结果。
+// wantNodes 为空 = 全池；query 透传给目标（空值会被过滤）。
+// 返回逐节点结果与"指定了但池里没有"的节点 id 列表；err 仅表示请求本身无法执行
+// （该类型没有节点池 / 指定节点全部不在池中），单节点失败体现在 results[i].Error。
+// 内部路由（/admin/nodes/probe）与 REST 语法糖层（POST /api/v1/probes）共用。
+func batchProbeCore(apiType, raw string, wantNodes []string, query url.Values) ([]nodeResult, []string, error) {
+	// 池路由：与 middlewareHandler 一致（location/asn 走 ip-location-api，其余走 api-base-url）
+	pool := nodePoolForType(apiType)
+	if len(pool) == 0 {
+		return nil, nil, fmt.Errorf("No nodes configured for api type %s", apiType)
+	}
+
+	selected := make(map[string]bool, len(wantNodes))
+	wantAll := len(wantNodes) == 0
+	for _, n := range wantNodes {
+		selected[n] = true
+	}
 	targets := make([]apiInfo, 0, len(pool))
 	var unknown []string
 	for _, n := range pool {
@@ -99,16 +136,15 @@ func batchProbeHandler(c *gin.Context) {
 		}
 	}
 	if len(targets) == 0 {
-		apiError(c, http.StatusBadRequest, "No matching nodes (known nodes: "+strings.Join(knownNodeIDs(pool), ", ")+")")
-		return
+		return nil, unknown, fmt.Errorf("No matching nodes (known nodes: %s)", strings.Join(knownNodeIDs(pool), ", "))
 	}
 
-	// query 透传（过滤空值，对齐 middlewareHandler）
-	query := url.Values{}
+	// query 透传（过滤空值，对齐 middlewareHandler）：HTTP 用 Values、WS 用 map 双形态
+	queryString := url.Values{}
 	queryMap := make(map[string]string)
-	for k, vals := range c.Request.URL.Query() {
+	for k, vals := range query {
 		if len(vals) > 0 && vals[0] != "" {
-			query.Set(k, vals[0])
+			queryString.Set(k, vals[0])
 			queryMap[k] = vals[0]
 		}
 	}
@@ -125,10 +161,10 @@ func batchProbeHandler(c *gin.Context) {
 			start := time.Now()
 			if n.UseWS() {
 				// WS 节点：经 WS 通道拨测（wsSrv 未启用时直接判失败）
-				status, body, err := probeOneWS(n.ID, apiType, raw, queryMap, timeout)
+				status, body, perr := probeOneWS(n.ID, apiType, raw, queryMap, timeout)
 				r := nodeResult{NodeID: n.ID, Label: n.Label, Channel: "ws", Status: status, LatencyMs: time.Since(start).Milliseconds()}
-				if err != nil {
-					r.Error = err.Error()
+				if perr != nil {
+					r.Error = perr.Error()
 				} else {
 					r.Body = json.RawMessage(body)
 				}
@@ -136,10 +172,10 @@ func batchProbeHandler(c *gin.Context) {
 				return
 			}
 			// HTTP 节点：GET 上游 v1/{apiType}/{raw}
-			status, body, err := probeOneHTTP(n, apiType, raw, query, timeout)
+			status, body, perr := probeOneHTTP(n, apiType, raw, queryString, timeout)
 			r := nodeResult{NodeID: n.ID, Label: n.Label, Channel: "http", Status: status, LatencyMs: time.Since(start).Milliseconds()}
-			if err != nil {
-				r.Error = err.Error()
+			if perr != nil {
+				r.Error = perr.Error()
 			} else {
 				r.Body = json.RawMessage(body)
 			}
@@ -147,34 +183,12 @@ func batchProbeHandler(c *gin.Context) {
 		}(i, n)
 	}
 	wg.Wait()
-
-	// 控制台手动一键拨测落库（source=biz，归明细页"业务拨测"）。
-	// 只落拨测类（isProbeType，对齐上报明细语义）；whois/dnssec/location/asn 等诊断类不进明细表。
-	persisted := persistManualProbes(apiType, raw, results)
-
-	okCnt, failedCnt := 0, 0
-	for _, r := range results {
-		if r.Status >= 200 && r.Status < 300 {
-			okCnt++
-		} else {
-			failedCnt++
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"apiType":   apiType,
-		"raw":       raw,
-		"targeted":  len(targets),
-		"ok":        okCnt,
-		"failed":    failedCnt,
-		"unknown":   unknown,
-		"persisted": persisted,
-		"results":   results,
-	})
+	return results, unknown, nil
 }
 
-// persistManualProbes 手动一键拨测结果落库（source=biz）。仅拨测类 API 入库，
+// persistManualProbes 手动一键拨测结果落库（source=biz，归属发起者 uid）。仅拨测类 API 入库，
 // 单节点失败不中断；返回实际写入条数。数据库不可用（db==nil）时静默跳过。
-func persistManualProbes(apiType, raw string, results []nodeResult) int {
+func persistManualProbes(apiType, raw string, results []nodeResult, ownerID uint) int {
 	if !isProbeType(apiType) || db == nil {
 		return 0
 	}
@@ -187,6 +201,7 @@ func persistManualProbes(apiType, raw string, results []nodeResult) int {
 		row := ProbeResult{
 			NodeID: r.NodeID, APIType: apiType, Raw: truncateStr(raw, 512),
 			Status: r.Status, LatencyMs: r.LatencyMs, Source: sourceBiz, CreatedAt: now,
+			OwnerID: ownerID,
 		}
 		if r.Error != "" {
 			row.Error = truncateStr(r.Error, 512)

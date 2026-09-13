@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"gorm.io/gorm/clause"
@@ -14,21 +15,30 @@ import (
 // 这里在探活 up/down 翻转时同步写 nodes 表 + node_events，使 NodeView/节点事件与 WS 节点一致。
 
 // markNodeUp 某节点判 up：upsert 在线快照 + 追加 online 事件（HTTP 看门狗探活成功时）。
-func markNodeUp(n monitorNode, reason string) {
+// version / capabilities 取自节点健康检查返回；为空（老版本节点）时不覆盖库里已有值。
+func markNodeUp(n monitorNode, reason, version string, capabilities []string) {
 	if db == nil {
 		return
 	}
 	now := time.Now().UTC()
 	ctx, cancel := dbCtx()
 	defer cancel()
+	updates := map[string]any{
+		"label":        n.label,
+		"online":       true,
+		"last_seen_at": now,
+	}
+	if v := strings.TrimSpace(version); v != "" {
+		updates["version"] = v
+	}
+	caps := joinCapabilities(capabilities)
+	if caps != "" {
+		updates["capabilities"] = caps
+	}
 	if err := db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "node_id"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"label":        n.label,
-			"online":       true,
-			"last_seen_at": now,
-		}),
-	}).Create(&Node{NodeID: n.id, Label: n.label, Online: true, FirstSeenAt: now, LastSeenAt: now}).Error; err != nil {
+		Columns:   []clause.Column{{Name: "node_id"}},
+		DoUpdates: clause.Assignments(updates),
+	}).Create(&Node{NodeID: n.id, Label: n.label, Online: true, Version: strings.TrimSpace(version), Capabilities: caps, FirstSeenAt: now, LastSeenAt: now}).Error; err != nil {
 		log.Printf("[node] ERROR upsert node up(%s): %v", n.id, err)
 		return
 	}

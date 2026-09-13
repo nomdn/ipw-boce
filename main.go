@@ -378,11 +378,12 @@ func middlewareHandler(c *gin.Context) {
 	switch apiType {
 	case "whois", "dns", "location", "ssl", "asn", "dnssec", "detail":
 		// 节点池结构：location/asn 走 IPLocationAPI（纯数组，无栈），其余走 APIBaseURL（三栈平铺）
+		// 节点池来自数据库（管理员在控制台维护），见 node_defs.go
 		var pool []apiInfo
 		if apiType == "location" || apiType == "asn" {
-			pool = IP_LOCATION_APIS
+			pool = locationPoolSnapshot()
 		} else {
-			pool = flattenStack(API_BASE_URLS)
+			pool = apiPoolSnapshot()
 		}
 
 		node := findNode(pool, backendID)
@@ -405,7 +406,7 @@ func middlewareHandler(c *gin.Context) {
 
 	case "tcping", "speed":
 		// tcping/speed 统一走 APIBaseURL 节点池
-		pool := flattenStack(API_BASE_URLS)
+		pool := apiPoolSnapshot()
 
 		// 转发 query 参数（过滤空值，等价于 TS 中 URLSearchParams 过滤 undefined）
 		queryString := url.Values{}
@@ -647,7 +648,10 @@ func applyRemoteConfig(mw *middlewareConfig) error {
 		mw.IPLocationAPI = remote.IPLocationAPI
 	}
 	// api-keys / ws-keys 强制忽略：密钥凭据不随远端配置覆盖，只从本地 setting.json / env 读取
-	// database / admin-token 同理：持久化与鉴权属本地部署决策，不随远端覆盖
+	// database / admin-token / report-token 同理：持久化与鉴权属本地部署决策，不随远端覆盖。
+	// 本函数是**白名单**式应用（只认上面逐条列出的键），凭据类键根本不在名单里，
+	// 因此远端 JSON 里写 report-token 也不会生效；节点侧另有对称的保护名单，
+	// 见 admin_node_config.go 的 nodeConfigRemoteProtectedKeys。
 	log.Printf("[middleware] remote config applied from %s", u)
 	return nil
 }
@@ -967,6 +971,10 @@ func main() {
 	}
 	store = newDataStore(db)
 	store.Start()
+
+	// 用数据库节点定义重建节点池（控制台维护，见 node_defs.go）；须早于 startNodeWatcher，
+	// 使看门狗一开始监控的就是库里的节点
+	loadNodePoolsFromDB()
 	defer store.Stop()
 
 	// 首次启动 seed 初始 admin（users 表空时），见 users.go
@@ -988,6 +996,9 @@ func main() {
 	// 服务节点掉线看门狗（HTTP 版每 1h 探 url 根/health、WS 版看心跳），见 nodeHealth.go
 	startNodeWatcher()
 
+	// OTA 任务追踪兜底轮询（WS 注册即时钩子之外的版本命中判定与超时收敛），见 ota.go
+	go otaReconcilerLoop()
+
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -1006,19 +1017,13 @@ func main() {
 		_ = router.SetTrustedProxies(nil)
 	}
 
-	// 单 IP 限流：次数由配置 rate-limit / 环境变量 RATE_LIMIT 决定（默认 120 次/分钟），0 表示不限流。
-	// 必须放在所有路由注册之前。
-	if RATE_LIMIT > 0 {
-		router.Use(rateLimitMiddleware(newRateLimiter(RATE_LIMIT)))
-	}
-
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
 	// 转发路由：/{prefix}/{backendID}/{apiType}/{raw}，同时兼容 /v1/... 与 /middleware/... 两种前缀。
-	// 限流只挂在转发路由上：/report（节点上报）、/admin、/remote-config 不在限流组内，
-	// 否则节点上报会被转发限流误伤。
+	// 限流只挂在转发路由上（公开口，面向不可信流量）：/report（节点上报）、/admin、/remote-config、
+	// /console/sla、健康检查均不限流——节点上报与管理 API 是机器/受信流量，被 429 会丢数据或打断运维操作。
 	router.Use(corsMiddleware())
 	if RATE_LIMIT > 0 {
 		limited := router.Group("", rateLimitMiddleware(newRateLimiter(RATE_LIMIT)))
@@ -1037,6 +1042,12 @@ func main() {
 
 	// 管理 API：节点列表 / 统计 / 拨测记录 / 节点配置 CRUD（见 admin.go）
 	registerAdminRoutes(router)
+
+	// REST 语法糖层（/api/v1，个人 Token 等程序化访问的规范只读接口，见 rest.go）
+	registerRestRoutes(router)
+
+	// 公开状态页（B3：/api/public/status/<token> 免登录 JSON，见 public_status.go）
+	registerPublicStatusRoutes(router)
 
 	// 浏览器控制台实时推送 WS（/console/sla，与 HTTP 同端口升级；避开 /ws 前缀，与节点通道 8092 解耦）
 	registerConsoleSlaRoute(router)

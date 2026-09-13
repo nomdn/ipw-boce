@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -59,9 +61,10 @@ type nodeWatchState struct {
 
 // nodeWatcher 全局看门狗状态
 type nodeWatcher struct {
-	mu     sync.Mutex
-	nodes  map[string]*nodeWatchState
-	client *http.Client // 探活专用（带超时）
+	mu      sync.Mutex
+	nodes   map[string]*nodeWatchState
+	client  *http.Client // 探活专用（带超时）
+	started bool         // run 协程是否已启动（节点池热更新时据此补启动，避免重复）
 }
 
 var nodeWatch = &nodeWatcher{}
@@ -78,9 +81,46 @@ func startNodeWatcher() {
 		log.Printf("[node] no configured probe nodes, node watchdog idle")
 		return
 	}
+	nodeWatch.mu.Lock()
+	nodeWatch.started = true
+	nodeWatch.mu.Unlock()
 	log.Printf("[node] node watchdog watching %d nodes (ws=%d http=%d)",
 		len(nodeWatch.nodes), countWS(), countHTTP())
 	go nodeWatch.run()
+}
+
+// refreshWatchedNodes 节点池热更新后重新采集监控清单（见 node_defs.go 的 applyNodeDefs）。
+// 已监控节点保留连续失败计数与探活状态，仅刷新静态属性；新增的纳入，已删除的移出。
+func refreshWatchedNodes() {
+	fresh := collectMonitorNodes()
+
+	nodeWatch.mu.Lock()
+	defer nodeWatch.mu.Unlock()
+	if nodeWatch.nodes == nil {
+		nodeWatch.nodes = fresh
+	} else {
+		for id, state := range fresh {
+			if old, ok := nodeWatch.nodes[id]; ok {
+				old.node = state.node // 只刷新 label/url/ws
+				continue
+			}
+			nodeWatch.nodes[id] = state
+		}
+		for id := range nodeWatch.nodes {
+			if _, ok := fresh[id]; !ok {
+				delete(nodeWatch.nodes, id)
+			}
+		}
+	}
+	// 启动时无节点而协程未起来，后续补录了节点则在此补启动
+	if !nodeWatch.started && len(nodeWatch.nodes) > 0 {
+		nodeWatch.started = true
+		if nodeWatch.client == nil {
+			nodeWatch.client = &http.Client{Timeout: nodeHTTPTimeout}
+		}
+		log.Printf("[node] node watchdog started after pool refresh, watching %d nodes", len(nodeWatch.nodes))
+		go nodeWatch.run()
+	}
 }
 
 func countWS() int {
@@ -97,7 +137,10 @@ func countHTTP() int { return len(nodeWatch.nodes) - countWS() }
 
 // collectMonitorNodes 汇总配置池全部节点并去重（同 id 视为同一节点；任一 ws:true 即按 WS 版）。
 func collectMonitorNodes() map[string]*nodeWatchState {
-	entries := append(flattenStack(API_BASE_URLS), IP_LOCATION_APIS...)
+	// 走快照函数读取（与管理端热更新互斥）；另建切片承接，避免 append 复用前一个池的底层数组
+	entries := make([]apiInfo, 0, 16)
+	entries = append(entries, apiPoolSnapshot()...)
+	entries = append(entries, locationPoolSnapshot()...)
 	out := map[string]*nodeWatchState{}
 	for _, e := range entries {
 		id := strings.TrimSpace(e.ID)
@@ -151,20 +194,31 @@ func (w *nodeWatcher) tick(first bool) {
 	}
 }
 
-// httpUp 单次探活是否成功（health 接口 = 节点 url 根路径，GET url，2xx/3xx = up）
-func (w *nodeWatcher) httpUp(st *nodeWatchState) (bool, string) {
+// httpUp 单次探活是否成功（health 接口 = 节点 url 根路径，GET url，2xx/3xx = up）。
+// 顺带回读响应体里的 version 与 capabilities（节点 / 的 JSON：
+// {"status":"ok","version":"...","capabilities":["probe",...]}），
+// 供节点状态页显示 HTTP 版节点的版本，以及判定其是否支持 config 指令；
+// 老版本节点不返回这些字段时为空。
+func (w *nodeWatcher) httpUp(st *nodeWatchState) (bool, string, string, []string) {
 	if strings.TrimSpace(st.node.url) == "" {
-		return false, "empty url"
+		return false, "empty url", "", nil
 	}
 	resp, err := w.client.Get(st.node.url)
 	if err != nil {
-		return false, err.Error()
+		return false, err.Error(), "", nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		return true, ""
+		var probe struct {
+			Version      string   `json:"version"`
+			Capabilities []string `json:"capabilities"`
+		}
+		// 限制读取体积：探活只需要一个小 JSON，防止对端返回超大响应体把内存吃掉
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		_ = json.Unmarshal(body, &probe)
+		return true, "", probe.Version, probe.Capabilities
 	}
-	return false, fmt.Sprintf("http %d", resp.StatusCode)
+	return false, fmt.Sprintf("http %d", resp.StatusCode), "", nil
 }
 
 // checkHTTP 探活并更新状态。探活仅当到达周期（或 first 强制立即一次）。
@@ -172,7 +226,7 @@ func (w *nodeWatcher) checkHTTP(st *nodeWatchState, first bool) {
 	if !(first || time.Since(st.httpLast) >= nodeHTTPInterval) {
 		return
 	}
-	ok, reason := w.httpUp(st)
+	ok, reason, version, caps := w.httpUp(st)
 
 	w.mu.Lock()
 	st.httpLast = time.Now()
@@ -184,13 +238,13 @@ func (w *nodeWatcher) checkHTTP(st *nodeWatchState, first bool) {
 			// 从离线恢复：翻回在线并写库（markNodeUp 内部做事件去重）
 			st.down = false
 			log.Printf("[node] %s(%s) recovered (http)", st.node.id, st.node.label)
-			markNodeUp(st.node, "http probe ok")
+			markNodeUp(st.node, "http probe ok", version, caps)
 		} else if !st.upWritten {
 			// 首次探活成功且此前从未入库：把它写进 nodes 表，节点状态页才显示该 HTTP 节点。
 			// 事件去重交给 markNodeUp(nodeWasOffline)；之后持续在线不再重复写库。
 			st.upWritten = true
 			log.Printf("[node] %s(%s) http up, now tracked in node list", st.node.id, st.node.label)
-			markNodeUp(st.node, "http probe ok")
+			markNodeUp(st.node, "http probe ok", version, caps)
 		}
 		w.mu.Unlock()
 		return

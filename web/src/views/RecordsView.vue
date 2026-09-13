@@ -1,6 +1,6 @@
 <template>
   <div>
-    <!-- 类别页签：定时拨测(source=sched) / 业务拨测(节点上报 ws|http + 手动一键 biz) -->
+    <!-- 类别页签：定时拨测(source=sched) / 业务拨测(节点上报 ws|http + 一键拨测 biz) -->
     <div class="seg">
       <button
         v-for="c in cats" :key="c.value"
@@ -35,6 +35,7 @@
       <button class="ak-button ak-button--outline" @click="load">查询</button>
     </div>
     <div v-if="loading" class="loading-center"><span class="ak-loading"></span></div>
+    <div v-else-if="error" class="dim" style="color:var(--ak-signal-danger);margin:6px 0 10px">{{ error }}</div>
 
     <div class="panel">
       <div class="ak-table-wrap">
@@ -67,7 +68,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { fetchProbes, fetchNodes } from '../api/boce.js'
+import { fetchProbes, fetchNodesBrief } from '../api/boce.js'
 import { fmtTime } from '../utils/format.js'
 import { apiOptions, apiLabel, parseProbeRaw } from '../utils/probeMeta.js'
 
@@ -82,6 +83,7 @@ const f = reactive({ node: '', type: '', limit: 100 })
 const probes = ref([])
 const knownNodes = ref([])
 const loading = ref(false)
+const error = ref('')
 
 const curLabel = computed(() => cats.find((c) => c.value === cat.value)?.label || '')
 
@@ -98,10 +100,10 @@ function parseRow(p) {
   return r
 }
 
-// source → 可读来源标签
+// source → 可读来源标签（叫法与页签保持一致：定时拨测 / 一键拨测 / 节点上报）
 const srcLabelMap = {
   sched: '定时拨测',
-  biz: '手动一键',
+  biz: '一键拨测',
   ws: '节点上报',
   http: '节点上报',
 }
@@ -114,7 +116,8 @@ const srcClass = (s) => {
 
 onMounted(async () => {
   load()
-  try { knownNodes.value = (await fetchNodes()).map((n) => n.nodeId) } catch { /* 忽略 */ }
+  // 节点过滤下拉数据源：节点简表（admin/user 都可访问；完整节点快照是 admin-only）
+  try { knownNodes.value = (await fetchNodesBrief()).map((n) => n.nodeId) } catch { /* 忽略 */ }
 })
 
 function switchCat(v) {
@@ -127,10 +130,13 @@ function switchCat(v) {
 
 async function load() {
   loading.value = true
+  error.value = ''
   try {
     probes.value = await fetchProbes({ node: f.node, type: f.type, cat: cat.value, limit: f.limit })
   } catch (e) {
+    // 失败时不能只清空列表——否则与"该筛选条件下确实没有样本"无法区分
     probes.value = []
+    error.value = e?.message || '加载失败'
   } finally {
     loading.value = false
   }

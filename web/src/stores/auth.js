@@ -66,7 +66,7 @@ export const useAuthStore = defineStore('auth', {
       setToken('')
       clearMeta()
     },
-    // 本人口令/邮箱在"个人资料"页更新后，同步前端登录态与本地元信息
+    // 本人密码/邮箱在"个人资料"页更新后，同步前端登录态与本地元信息
     refreshMeta(meta) {
       if (meta.email !== undefined) this.email = meta.email
       if (meta.emailVerified !== undefined) this.emailVerified = !!meta.emailVerified

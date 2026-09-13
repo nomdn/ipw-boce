@@ -12,11 +12,11 @@
 // 顺序即前端 select 展示顺序。
 
 export const apiOptions = [
-  { value: 'detail', label: '综合详情 · 网站检查' },
-  { value: 'ssl', label: 'SSL · 证书检测' },
-  { value: 'tcping', label: 'TCPing · 端口连通' },
-  { value: 'speed', label: 'Speed · 下载速度' },
-  { value: 'dns', label: 'DNS · 域名解析' },
+  { value: 'detail', label: '网站检查', desc: '综合检查：状态码 / 延迟 / 双栈' },
+  { value: 'ssl', label: 'SSL 证书', desc: '证书检测：到期 / 颁发者' },
+  { value: 'tcping', label: 'TCPing', desc: 'TCP 端口连通' },
+  { value: 'speed', label: '下载测速', desc: '网页下载测速（可选 v4/v6）' },
+  { value: 'dns', label: 'DNS 解析', desc: '域名解析（可选记录类型）' },
 ]
 
 const labelMap = Object.fromEntries(apiOptions.map((o) => [o.value, o.label.replace(/\s·.*$/, '').trim()]))
@@ -59,3 +59,18 @@ function dnsKindLabel(t) {
   }
   return map[t.toLowerCase()] || `${t.toUpperCase()} 解析`
 }
+
+// dns 任务表单的记录类型选项（与后端 knownDNSRecordTypes / 节点 /v1/dns/:type 一致）
+export const dnsRecordTypes = [
+  { value: 'a', label: 'A' },
+  { value: 'aaaa', label: 'AAAA' },
+  { value: 'cname', label: 'CNAME' },
+  { value: 'mx', label: 'MX' },
+  { value: 'ns', label: 'NS' },
+  { value: 'txt', label: 'TXT' },
+  { value: 'srv', label: 'SRV' },
+  { value: 'caa', label: 'CAA' },
+  { value: 'ptr', label: 'PTR' },
+]
+
+export { dnsKindLabel }

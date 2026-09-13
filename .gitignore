@@ -4,6 +4,10 @@
 *.db-shm
 *.db-wal
 tmp-smoke/
+
+# 运行日志（mocknode.log 等，均为本地运行产物）
+*.log
+
 # 交叉编译产物（本机编译后按目标平台部署，不入库）
 ipw-boce-linux-arm64
 ipw-boce-*

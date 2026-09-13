@@ -2,7 +2,7 @@
   <div>
     <!-- 参数配置 -->
     <section class="panel" style="margin-bottom:18px">
-      <h2 class="panel-title">发起一键拨测 <span class="hl">/ POST nodes/probe</span></h2>
+      <h2 class="panel-title">发起一键拨测</h2>
 
       <div class="form-row">
         <div class="form-field">
@@ -28,7 +28,7 @@
         </template>
 
         <div class="form-field" v-else style="flex:1;min-width:260px">
-          <label>拨测目标 raw</label>
+          <label>拨测目标</label>
           <input class="ak-input" v-model.trim="form.raw" :placeholder="currentMeta.hint"
             @keyup.enter="run" />
         </div>
@@ -55,14 +55,14 @@
           <label>目标节点</label>
           <select class="ak-select" v-model="form.mode" @change="form.nodes=''">
             <option value="all">全部节点（HTTP + WS）</option>
-            <option value="custom">指定节点 id</option>
+            <option value="custom">指定节点</option>
           </select>
         </div>
       </div>
 
       <div v-if="form.mode === 'custom'" class="form-row" style="margin-top:12px">
         <div class="form-field" style="flex:1">
-          <label>节点 id（逗号分隔）</label>
+          <label>节点（逗号分隔）</label>
           <input class="ak-input" v-model.trim="form.nodes" placeholder="test-node-1, test-http" />
         </div>
       </div>
@@ -72,8 +72,8 @@
           {{ busy ? '拨测中…' : '执行拨测' }}
         </button>
         <span v-if="lastMeta" class="dim" style="font-size:.82rem">
-          上次：{{ lastMeta.apiType }} / {{ lastMeta.raw }} → targeted={{ lastMeta.targeted }} ok={{ lastMeta.ok }} failed={{ lastMeta.failed }}
-          <span v-if="lastMeta.unknown?.length" class="err"> unknown={{ lastMeta.unknown.join(',') }}</span>
+          上次：{{ apiLabel(lastMeta.apiType) }} / {{ lastMeta.raw }} → 目标节点 {{ lastNameCount }} 个 · 成功 {{ lastMeta.ok }} · 失败 {{ lastMeta.failed }}
+          <span v-if="lastMeta.unknown?.length" class="err"> · 未响应 {{ lastMeta.unknown.join('、') }}</span>
         </span>
       </div>
     </section>
@@ -117,10 +117,12 @@
           <pre v-else class="raw-json">{{ pretty(r.error ? { error: r.error } : r.body) }}</pre>
         </div>
       </div>
-      <div v-if="!results.length && !busy" class="panel" style="grid-column:1/-1">
-        <h2 class="panel-title">尚未执行</h2>
-        <p class="dim" style="margin:0">配置上方参数后点击「执行拨测」，将同步聚合各节点结果在此展示。</p>
-      </div>
+    </div>
+
+    <!-- 空态：未执行且无错误时给出引导（此前误挂在结果容器内，永远不会渲染） -->
+    <div v-else-if="!busy && !error" class="panel">
+      <h2 class="panel-title">尚未执行</h2>
+      <p class="dim" style="margin:0">配置上方参数后点击「执行拨测」，将同步聚合各节点结果在此展示。</p>
     </div>
   </div>
 </template>
@@ -129,20 +131,20 @@
 import { ref, reactive, computed } from 'vue'
 import { runBatchProbe } from '../api/boce.js'
 import ResultFieldView from '../components/ResultFieldView.vue'
-import { apiOptions } from '../utils/probeMeta.js'
+import { apiLabel } from '../utils/probeMeta.js'
 
-// typeMeta：UI 元数据 (label/hint/def) 沿用 apiOptions 顺序与命名，
+// typeMeta：UI 元数据 (label/hint/def) 与 apiOptions 同序同短名（原生下拉弹出层按最长项撑宽，长文案会留大片空白），
 // 仅补前端表单字段（hint/def/defDomain/defType）保持向后兼容。
 const typeMeta = [
-  { value: 'tcping',   label: 'TCPing · 端口连通',   hint: 'host，如 1.1.1.1', def: '1.1.1.1' },
-  { value: 'speed',    label: 'Speed · 下载速度',    hint: '测速文件 URL，如 https://host/file', def: 'https://speed.cloudflare.com/__down?bytes=1000000' },
-  { value: 'detail',   label: '综合详情 · 网站检查', hint: '完整 URL，如 https://www.qq.com', def: 'https://www.qq.com' },
-  { value: 'ssl',      label: 'SSL · 证书检测',      hint: '完整 URL 或域名', def: 'https://www.qq.com' },
-  { value: 'dns',      label: 'DNS · 域名解析',      hint: '', def: '', defDomain: 'example.com', defType: 'a' },
-  { value: 'whois',    label: 'Whois · 域名注册',    hint: '域名，如 example.com', def: 'example.com' },
-  { value: 'dnssec',   label: 'DNSSEC · 签名校验',   hint: '域名', def: 'cloudflare.com' },
-  { value: 'location', label: 'Location · IP 归属地', hint: 'IP', def: '8.8.8.8' },
-  { value: 'asn',      label: 'ASN · 自治域',        hint: 'IP', def: '8.8.8.8' },
+  { value: 'tcping',   label: 'TCPing',   hint: 'host，如 1.1.1.1', def: '1.1.1.1' },
+  { value: 'speed',    label: '下载测速',    hint: '测速文件 URL，如 https://host/file', def: 'https://speed.cloudflare.com/__down?bytes=1000000' },
+  { value: 'detail',   label: '网站检查', hint: '完整 URL，如 https://www.qq.com', def: 'https://www.qq.com' },
+  { value: 'ssl',      label: 'SSL 证书',      hint: '完整 URL 或域名', def: 'https://www.qq.com' },
+  { value: 'dns',      label: 'DNS 解析',      hint: '', def: '', defDomain: 'example.com', defType: 'a' },
+  { value: 'whois',    label: 'Whois',    hint: '域名，如 example.com', def: 'example.com' },
+  { value: 'dnssec',   label: 'DNSSEC',   hint: '域名', def: 'cloudflare.com' },
+  { value: 'location', label: 'IP 归属地', hint: 'IP', def: '8.8.8.8' },
+  { value: 'asn',      label: 'ASN',        hint: 'IP', def: '8.8.8.8' },
 ]
 
 // dns 域名解析可选的记录类型（value 为节点侧 /dns/:type 的 slug）
@@ -176,6 +178,8 @@ const busy = ref(false)
 const error = ref('')
 const results = ref([])
 const lastMeta = ref(null)
+// 上次实际参与的节点数（全部模式时为 targeted 的实际值）
+const lastNameCount = computed(() => lastMeta.value?.targeted ?? 0)
 
 function onTypeChange() {
   const m = currentMeta.value
@@ -232,7 +236,7 @@ async function run() {
   results.value = []
   // speed 测速：raw 为纯 URL，需拼上协议前缀（v4/ 或 v6/）；若用户已手动带前缀则不重复拼
   if (form.apiType === 'speed' && !/^(v4|v6)\//.test(raw)) raw = `${form.proto}/${raw}`
-  // 指定节点模式 → 转数组；全部模式 → 空（后端默认全池）
+  // 指定节点模式 → 转数组；全部模式 → 空（后端默认全部节点）
   const nodes = form.mode === 'custom'
     ? form.nodes.split(',').map((s) => s.trim()).filter(Boolean)
     : null

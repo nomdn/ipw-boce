@@ -1,5 +1,176 @@
 <template>
   <div>
+    <!-- ===== 上游节点池（数据库托管，取代 setting.json 静态配置） ===== -->
+    <div class="panel-head">
+      <div>
+        <h2 class="panel-title">上游节点池 <span class="hl">/ node-defs</span></h2>
+        <p class="panel-sub">拨测转发与一键拨测的节点来源。存于数据库，保存即生效，无需改配置重启。一个节点可同时用于拨测与 IP 定位。</p>
+      </div>
+      <button class="ak-button ak-button--action" @click="openCreate">＋ 新增节点</button>
+    </div>
+
+    <!-- 已接入但库里没有对应配置 → 下拉框补录 -->
+    <div v-if="online.length" class="adopt-bar">
+      <span class="adopt-tip">检测到 <b>{{ online.length }}</b> 个已接入但尚未配置的节点：</span>
+      <select class="ak-select" v-model="adoptId">
+        <option value="">— 请选择节点 —</option>
+        <option v-for="n in online" :key="n.nodeId" :value="n.nodeId">
+          {{ n.nodeId }}{{ n.label ? ' · ' + n.label : '' }}{{ n.viaWs ? ' · WS' : '' }}
+        </option>
+      </select>
+      <button class="ak-button" :disabled="!adoptId" @click="adopt">补录为节点</button>
+      <span class="dim" style="font-size:.75rem">补录后该节点即可参与转发与拨测</span>
+    </div>
+
+    <div class="panel" style="margin-bottom:24px">
+      <div class="ak-table-wrap">
+        <table class="ak-table">
+          <thead>
+            <tr>
+              <th>节点 ID</th><th>名称</th><th>归属池</th><th>协议栈</th><th>通道</th><th>上游地址</th><th>状态</th>
+              <th style="width:230px">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="n in defs" :key="n.id">
+              <td class="mono">{{ n.nodeId }}</td>
+              <td>{{ n.label || '—' }}</td>
+              <td>
+                <span class="pool-tags">
+                  <span v-for="p in poolsOf(n.pool)" :key="p" class="ak-tag ch"
+                    :class="p === 'location' ? 'ak-tag--neutral' : 'ak-tag--advanced'">{{ p }}</span>
+                </span>
+              </td>
+              <td class="mono dim">{{ poolsOf(n.pool).includes('api') ? (n.stack || 'DualStack') : '—' }}</td>
+              <td>{{ n.ws ? 'WS' : 'HTTP' }}</td>
+              <td class="mono" :title="n.url">{{ n.url || '—' }}</td>
+              <td>
+                <span class="ak-tag ch state-tag" :class="n.enabled ? 'ak-tag--advanced' : 'ak-tag--neutral'">
+                  {{ n.enabled ? '已启用' : '已停用' }}
+                </span>
+              </td>
+              <td class="ops">
+                <button class="link-btn" @click="toggleEnabled(n)">{{ n.enabled ? '停用' : '启用' }}</button>
+                <button class="link-btn" @click="openEdit(n)">编辑</button>
+                <button class="link-btn danger" @click="confirmDelete(n)">删除</button>
+              </td>
+            </tr>
+            <tr v-if="!defs.length">
+              <td colspan="8" class="dim">暂无节点。未配置任何节点时，转发会回退到配置文件里的默认上游。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ===== 节点运行时配置（直连节点进程） ===== -->
+    <section class="panel" style="margin-bottom:24px">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">节点运行时配置 <span class="hl">/ 直连节点</span></h2>
+          <p class="panel-sub">
+            读取并修改节点进程<b>当前生效</b>的配置（与下方「托管配置」不同：那是节点启动时拉的远端配置）。
+            优先走 WS 通道，WS 离线时回退 HTTP。凭据类字段节点只回显 ***，提交时自动剔除。
+          </p>
+        </div>
+      </div>
+
+      <div class="rt-bar">
+        <select class="ak-select" v-model="rt.nodeId" @change="rtReset">
+          <option value="">— 选择节点 —</option>
+          <option v-for="n in rtNodes" :key="n.id" :value="n.id">
+            {{ n.id }}{{ n.label ? ' · ' + n.label : '' }}
+          </option>
+        </select>
+        <button class="ak-button" :disabled="!rt.nodeId || rt.busy" @click="rtPull">
+          {{ rt.busy ? '处理中…' : '拉取配置' }}
+        </button>
+        <button class="ak-button" :disabled="!rt.nodeId || rt.busy" @click="rtRefresh">刷新远端配置</button>
+        <label class="rt-persist">
+          <input type="checkbox" v-model="rt.persist" /> 写回节点 setting.json
+        </label>
+        <span v-if="rt.channel" class="rt-channel" :class="rt.channel">
+          {{ rt.channel === 'ws' ? 'WS 通道' : 'HTTP 通道' }}
+        </span>
+      </div>
+
+      <p v-if="rt.err" class="rt-err">{{ rt.err }}</p>
+
+      <div v-if="rt.rows.length" class="ak-table-wrap">
+        <table class="ak-table">
+          <thead>
+            <tr><th style="width:34%">配置项</th><th>值</th><th style="width:110px">状态</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in rt.rows" :key="r.key">
+              <td class="mono">
+                {{ r.key }}
+                <span v-if="rt.restartKeys.includes(r.key)" class="rt-lock warn" title="改动后需重启节点才生效">需重启</span>
+                <span v-if="rt.protectedKeys.includes(r.key)" class="rt-lock"
+                  title="托管配置（remote-config-url）里的同名键不会覆盖它，只能在节点本地用 ENV / setting.json 设置">远端不可覆盖</span>
+              </td>
+              <td>
+                <span v-if="r.secret" class="dim mono">*** <span class="rt-lock">凭据 · 不下发</span></span>
+                <select v-else-if="typeof r.origin === 'boolean'" class="ak-select" v-model="r.value">
+                  <option :value="true">true</option>
+                  <option :value="false">false</option>
+                </select>
+                <input v-else class="ak-input" v-model="r.value" :placeholder="String(r.origin ?? '')" />
+              </td>
+              <td>
+                <span v-if="r.secret" class="dim">—</span>
+                <span v-else-if="isChanged(r)" class="rt-changed">已改动</span>
+                <span v-else class="dim">未改动</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="ak-button ak-button--action" :disabled="rt.busy || !rtChangedCount" @click="rtSave">
+            保存改动{{ rtChangedCount ? `（${rtChangedCount}）` : '' }}
+          </button>
+          <span class="dim" style="font-size:.75rem">只提交改动项</span>
+        </div>
+      </div>
+
+      <!-- 下发结果回执 -->
+      <div v-if="rt.result" class="rt-result">
+        <div class="rt-line">
+          <span class="dim">应用成功：</span>
+          <span v-if="rt.result.applied?.length">{{ rt.result.applied.join('、') }}</span>
+          <span v-else class="dim">无</span>
+        </div>
+        <div v-if="rt.result.unknown?.length" class="rt-line">
+          <span class="dim">节点不识别：</span><span>{{ rt.result.unknown.join('、') }}</span>
+        </div>
+        <div v-if="rt.result.ignoredKeys?.length" class="rt-line">
+          <span class="dim">已剔除：</span><span>{{ rt.result.ignoredKeys.join('、') }}（凭据类不下发）</span>
+        </div>
+        <div v-if="rt.result.protectedIgnored?.length" class="rt-line">
+          <span class="dim">已跳过：</span>
+          <span>{{ rt.result.protectedIgnored.join('、') }}（凭据由节点本地管理，远端配置不会覆盖）</span>
+        </div>
+        <div v-if="rt.result.restartRequired?.length" class="rt-warn">
+          以下配置需<b>重启节点</b>才生效：{{ rt.result.restartRequired.join('、') }}
+        </div>
+        <div v-if="rt.result.unpersistedKeys?.length" class="rt-warn rt-persist-warn">
+          <div>
+            <b>持久化提醒</b>：{{ rt.result.unpersistedKeys.join('、') }}
+            未写入托管配置——节点重启后 ENV 与本地 setting.json 会覆盖内存改动
+            （"写回 setting.json" 的优先级也低于 ENV），这些改动会丢失。
+          </div>
+          <div style="margin-top:6px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button class="ak-button ak-button--action" :disabled="rt.syncing" @click="rtSyncHosted">
+              {{ rt.syncing ? '同步中…' : '同步到托管配置（推荐）' }}
+            </button>
+            <span v-if="rt.syncMsg" :class="rt.syncOk ? 'ok-text' : 'err'">{{ rt.syncMsg }}</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== 节点远端配置托管 ===== -->
     <div class="grid-2" style="grid-template-columns: 340px 1fr">
       <!-- 左侧：配置项列表 -->
       <section class="panel">
@@ -45,7 +216,9 @@
             <textarea class="ak-textarea" v-model="text" rows="18" spellcheck="false"
               style="font-family:var(--ak-font-mono);font-size:.82rem;line-height:1.5"></textarea>
           </div>
-          <span class="field-hint">以 setting.json 同构的 JSON 对象保存；键用连接线（如 http-timeout-seconds）。非法 JSON 无法保存。</span>
+          <span class="field-hint">以 setting.json 同构的 JSON 对象保存；键用连接线（如 http-timeout-seconds）。非法 JSON 无法保存。
+            注意 <span class="mono">access-token</span> / <span class="mono">report-token</span>
+            属节点本地凭据，远端下发不会覆盖（写在这里也不生效），请在节点本地用 ENV 或 setting.json 设置。</span>
 
           <div v-if="resolved" style="margin-top:14px">
             <div class="ak-divider" style="margin:10px 0"></div>
@@ -55,17 +228,82 @@
         </template>
       </section>
     </div>
+
+    <!-- 节点新增 / 编辑对话框 -->
+    <div v-if="dlg.show" class="mask" @click.self="closeDialog">
+      <div class="dlg">
+        <div class="dlg-title">{{ dlg.isEdit ? '编辑节点' : '新增节点' }}</div>
+        <div class="ak-form-stack">
+          <label class="ak-field">
+            <span class="ak-label">节点 ID</span>
+            <input class="ak-input" v-model.trim="dlg.form.nodeId" :disabled="dlg.isEdit"
+              placeholder="如 cn-jiangsu（转发路径里的 backendID，唯一）" />
+          </label>
+          <label class="ak-field">
+            <span class="ak-label">名称</span>
+            <input class="ak-input" v-model.trim="dlg.form.label" placeholder="如 中国 江苏 移动" />
+          </label>
+          <div class="switch-row">
+            <span class="ak-label">归属池</span>
+            <button class="ak-toggle" :class="{ on: hasPool('api') }" @click.prevent="togglePool('api')">拨测 api</button>
+            <button class="ak-toggle" :class="{ on: hasPool('location') }" @click.prevent="togglePool('location')">定位 location</button>
+            <span class="dim sw-hint">可多选；双归属节点 location/asn 请求走定位池，其余走拨测池</span>
+          </div>
+          <label class="ak-field" v-if="hasPool('api')">
+            <span class="ak-label">栈分组</span>
+            <select class="ak-select" v-model="dlg.form.stack">
+              <option value="DualStack">DualStack</option>
+              <option value="IPv4">IPv4</option>
+              <option value="IPv6">IPv6</option>
+            </select>
+          </label>
+          <label class="ak-field">
+            <span class="ak-label">上游地址</span>
+            <input class="ak-input" v-model.trim="dlg.form.url" placeholder="https://node.example.com/（WS 节点可留空）" />
+          </label>
+          <div class="switch-row">
+            <span class="ak-label">通道</span>
+            <button class="ak-toggle" :class="{ on: dlg.form.ws }" @click.prevent="dlg.form.ws = !dlg.form.ws">
+              {{ dlg.form.ws ? 'WS 通道' : 'HTTP 转发' }}
+            </button>
+            <span class="dim sw-hint">WS 节点须已注册到中间件并保持长连接</span>
+          </div>
+          <div class="switch-row">
+            <span class="ak-label">状态</span>
+            <button class="ak-toggle" :class="{ on: dlg.form.enabled }" @click.prevent="dlg.form.enabled = !dlg.form.enabled">
+              {{ dlg.form.enabled ? '启用' : '停用' }}
+            </button>
+          </div>
+          <label class="ak-field">
+            <span class="ak-label">排序</span>
+            <input class="ak-input" type="number" v-model.number="dlg.form.sortOrder" placeholder="0" />
+          </label>
+        </div>
+        <div class="dlg-err" v-if="dlg.err">{{ dlg.err }}</div>
+        <div class="dlg-foot">
+          <button class="ak-button ak-button--outline" @click="closeDialog">取消</button>
+          <button class="ak-button ak-button--action" :disabled="dlg.busy" @click="saveDialog">
+            {{ dlg.busy ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import {
   fetchNodeConfigs, fetchNodeConfig, putNodeConfig, deleteNodeConfig, fetchResolvedConfig,
+  mergeNodeHostedConfig,
+  fetchNodeDefs, createNodeDef, updateNodeDef, deleteNodeDef, fetchUnconfiguredNodes,
+  fetchNodeRuntimeConfig, applyNodeRuntimeConfig,
 } from '../api/boce.js'
 import { fmtTime } from '../utils/format.js'
 import { API_BASE } from '../config.js'
+import { useDialog } from '../composables/useDialog.js'
 
+// ===== 托管配置（原有） =====
 const list = ref([])
 const current = ref(null)
 const text = ref('')
@@ -77,12 +315,131 @@ const resolving = ref(false)
 const resolved = ref('')
 const copiedId = ref(null) // 最近复制成功的 nodeId，按钮短暂显示 ✓ 已复制
 
-onMounted(load)
+// ===== 上游节点池 =====
+const defs = ref([])            // 节点定义列表（含停用）
+const online = ref([])          // 已接入但未配置的节点（补录下拉框数据源）
+const adoptId = ref('')         // 下拉框当前选中
+const uiDialog = useDialog()
+
+const emptyForm = { nodeId: '', label: '', pools: ['api'], stack: 'DualStack', url: '', ws: false, enabled: true, sortOrder: 0 }
+
+// poolsOf 解析存储的 pool 字段（"api,location" → ['api','location']）；空值按 api 处理
+function poolsOf(raw) {
+  const arr = String(raw || '').split(',').map((s) => s.trim()).filter(Boolean)
+  return arr.length ? arr : ['api']
+}
+const dlg = reactive({ show: false, isEdit: false, id: 0, form: { ...emptyForm }, err: '', busy: false })
+
+onMounted(() => { load(); loadDefs() })
 async function load() {
   try {
     list.value = await fetchNodeConfigs()
     if (list.value.length && !current.value) select(list.value[0])
   } catch (e) { err.value = e?.message }
+}
+
+// 节点定义 + 未配置候选一起拉（补录成功后候选自动减少）
+async function loadDefs() {
+  try { defs.value = await fetchNodeDefs() } catch { defs.value = [] }
+  try { online.value = await fetchUnconfiguredNodes() } catch { online.value = [] }
+}
+
+function openCreate() {
+  dlg.show = true
+  dlg.isEdit = false
+  dlg.id = 0
+  dlg.form = { ...emptyForm, pools: [...emptyForm.pools] } // 数组需拷贝，避免共享引用
+  dlg.err = ''
+}
+
+// hasPool / togglePool 归属池多选开关（至少一个）
+function hasPool(p) {
+  return dlg.form.pools.includes(p)
+}
+function togglePool(p) {
+  const set = new Set(dlg.form.pools)
+  if (set.has(p)) {
+    if (set.size === 1) { dlg.err = '至少归属一个池'; return }
+    set.delete(p)
+  } else {
+    set.add(p)
+  }
+  dlg.form.pools = ['api', 'location'].filter((x) => set.has(x)) // 固定顺序，与后端存储一致
+  dlg.err = ''
+}
+
+function openEdit(n) {
+  dlg.show = true
+  dlg.isEdit = true
+  dlg.id = n.id
+  dlg.form = {
+    nodeId: n.nodeId, label: n.label || '', pools: poolsOf(n.pool),
+    stack: n.stack || 'DualStack', url: n.url || '', ws: !!n.ws,
+    enabled: !!n.enabled, sortOrder: n.sortOrder || 0,
+  }
+  dlg.err = ''
+}
+
+function closeDialog() {
+  if (dlg.busy) return
+  dlg.show = false
+}
+
+// adopt 把下拉框选中的在线节点预填进新增表单（WS 节点自动切到 WS 通道）
+function adopt() {
+  const pick = online.value.find((n) => n.nodeId === adoptId.value)
+  if (!pick) return
+  openCreate()
+  dlg.form.nodeId = pick.nodeId
+  dlg.form.label = pick.label || pick.nodeId
+  dlg.form.ws = !!pick.viaWs
+  dlg.err = ''
+}
+
+async function saveDialog() {
+  dlg.err = ''
+  const form = dlg.form
+  if (!form.nodeId) { dlg.err = '节点 ID 必填'; return }
+  if (!form.ws && !form.url) { dlg.err = 'HTTP 节点必须填写上游地址'; return }
+  if (!form.pools.length) { dlg.err = '至少选择一个归属池'; return }
+  dlg.busy = true
+  try {
+    const payload = {
+      nodeId: form.nodeId, label: form.label, url: form.url, ws: form.ws,
+      pool: form.pools.join(','),
+      stack: form.pools.includes('api') ? form.stack : '',
+      enabled: form.enabled, sortOrder: form.sortOrder || 0,
+    }
+    if (dlg.isEdit) await updateNodeDef(dlg.id, payload)
+    else await createNodeDef(payload)
+    dlg.show = false
+    adoptId.value = ''
+    await loadDefs()
+  } catch (e) {
+    dlg.err = e?.message || '保存失败'
+  } finally { dlg.busy = false }
+}
+
+async function toggleEnabled(n) {
+  try {
+    await updateNodeDef(n.id, { enabled: !n.enabled })
+    await loadDefs()
+  } catch (e) { dlg.err = e?.message || '操作失败' }
+}
+
+async function confirmDelete(n) {
+  const ok = await uiDialog.confirm({
+    title: `删除节点 ${n.nodeId}？`,
+    message: '删除后该节点立即从转发与拨测节点池中移除（历史拨测数据不受影响）。',
+    kind: 'danger',
+    confirmText: '删除',
+    cancelText: '取消',
+  })
+  if (!ok) return
+  try {
+    await deleteNodeDef(n.id)
+    await loadDefs()
+  } catch (e) { /* 后端已给错误提示 */ }
 }
 
 async function select(c) {
@@ -138,6 +495,133 @@ async function remove(c) {
   } catch (e) { err.value = e?.message }
 }
 
+// ===== 节点运行时配置（直连节点进程） =====
+const rt = reactive({
+  nodeId: '', rows: [], busy: false, err: '',
+  channel: '', secretKeys: [], restartKeys: [], persist: false, result: null,
+  protectedKeys: [],  // 远端下发不会覆盖的凭据键（节点回报，见 configRemoteProtectedKeys）
+  lastCfg: null,   // 最近一次成功下发的改动键值（同步托管配置用）
+  syncing: false,  // 同步托管配置进行中
+  syncMsg: '',     // 同步结果提示
+  syncOk: false,   // 同步是否成功（着色）
+})
+
+// 候选节点：已配置的节点池 + 已接入但未补录的在线节点（后者 WS 在线，可直接管理）
+const rtNodes = computed(() => {
+  const seen = new Set()
+  const out = []
+  defs.value.forEach(n => {
+    if (!seen.has(n.nodeId)) { seen.add(n.nodeId); out.push({ id: n.nodeId, label: n.label }) }
+  })
+  online.value.forEach(n => {
+    if (!seen.has(n.nodeId)) { seen.add(n.nodeId); out.push({ id: n.nodeId, label: n.label || '未配置' }) }
+  })
+  return out
+})
+
+// 行是否改动过（布尔走 select、数字走 input，统一按字符串比较避免类型误判）
+function isChanged(r) {
+  return !r.secret && String(r.value) !== String(r.origin)
+}
+
+const rtChangedCount = computed(() => rt.rows.filter(isChanged).length)
+
+// 把节点返回的配置快照铺成可编辑行（凭据行只读）
+function rtRowsFrom(cfg) {
+  return Object.keys(cfg || {}).sort().map(k => ({
+    key: k, origin: cfg[k], value: cfg[k],
+    secret: rt.secretKeys.includes(k),
+  }))
+}
+
+function rtReset() {
+  rt.rows = []; rt.result = null; rt.err = ''; rt.channel = ''
+  rt.lastCfg = null; rt.syncMsg = ''; rt.syncOk = false
+}
+
+async function rtPull() {
+  if (!rt.nodeId) return
+  rt.busy = true; rt.err = ''; rt.result = null
+  try {
+    const d = await fetchNodeRuntimeConfig(rt.nodeId)
+    rt.channel = d.channel
+    rt.secretKeys = d.secretKeys || []
+    rt.restartKeys = d.restartKeys || []
+    rt.protectedKeys = d.remoteProtectedKeys || []
+    rt.rows = rtRowsFrom(d.config)
+  } catch (e) {
+    rt.err = e?.message || '拉取失败'
+    rt.rows = []
+  } finally {
+    rt.busy = false
+  }
+}
+
+async function rtRefresh() {
+  if (!rt.nodeId) return
+  rt.busy = true; rt.err = ''; rt.result = null
+  try {
+    const d = await applyNodeRuntimeConfig(rt.nodeId, { action: 'refresh' })
+    rt.channel = d.channel
+    rt.secretKeys = d.secretKeys || rt.secretKeys
+    rt.protectedKeys = d.remoteProtectedKeys || rt.protectedKeys
+    rt.rows = rtRowsFrom(d.config)
+    rt.result = d
+  } catch (e) {
+    rt.err = e?.message || '刷新失败'
+  } finally {
+    rt.busy = false
+  }
+}
+
+async function rtSave() {
+  const cfg = {}
+  rt.rows.forEach(r => {
+    if (!isChanged(r)) return
+    // 保持原值类型：布尔走 select、数字转 Number，其余按字符串序列化
+    cfg[r.key] = typeof r.origin === 'number' && r.value !== '' ? Number(r.value) : r.value
+  })
+  if (!Object.keys(cfg).length) return
+  rt.busy = true; rt.err = ''; rt.result = null; rt.syncMsg = ''; rt.syncOk = false
+  try {
+    const d = await applyNodeRuntimeConfig(rt.nodeId, { action: 'patch', config: cfg, persist: rt.persist })
+    rt.channel = d.channel
+    rt.rows = rtRowsFrom(d.config)
+    rt.result = d
+    rt.lastCfg = cfg // 留档本次改动值，供"同步到托管配置"一键持久化
+  } catch (e) {
+    rt.err = e?.message || '保存失败'
+  } finally {
+    rt.busy = false
+  }
+}
+
+// rtSyncHosted 把本次下发的改动键值合并进该节点的托管配置（持久化）。
+// 远端配置优先级最高（远端 > ENV > setting.json），重启后自动生效；
+// 未配 remote-config-url 的节点此同步不生效，需另行处理（提示语见后端 persistHint）。
+async function rtSyncHosted() {
+  if (!rt.nodeId || !rt.lastCfg || !rt.result?.unpersistedKeys?.length) return
+  const pick = {}
+  rt.result.unpersistedKeys.forEach((k) => {
+    if (rt.lastCfg[k] !== undefined) pick[k] = rt.lastCfg[k]
+  })
+  if (!Object.keys(pick).length) return
+  rt.syncing = true
+  rt.syncMsg = ''
+  try {
+    await mergeNodeHostedConfig(rt.nodeId, pick)
+    rt.result.unpersistedKeys = []
+    rt.syncOk = true
+    rt.syncMsg = '已同步到托管配置：重启后以远端配置生效'
+    await load() // 左侧托管配置列表刷新（新增了该节点的配置项）
+  } catch (e) {
+    rt.syncOk = false
+    rt.syncMsg = e?.message || '同步失败'
+  } finally {
+    rt.syncing = false
+  }
+}
+
 // remoteConfigUrl 拼出该配置项供节点拉取的公开 URL（global → /remote-config，其余 → /remote-config/:nodeId）
 function remoteConfigUrl(nodeId) {
   const seg = nodeId === 'global' ? 'remote-config' : `remote-config/${encodeURIComponent(nodeId)}`
@@ -185,6 +669,119 @@ async function reloadCurrent() {
 </script>
 
 <style scoped>
+/* ===== 节点池区块 ===== */
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.panel-title { margin: 0; font-size: 1.05rem; font-family: var(--ak-font-command); }
+.panel-sub { margin: 4px 0 0; color: var(--ak-text-secondary); font-size: 0.82rem; }
+
+/* 未配置节点提醒条（下拉框补录） */
+.adopt-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: color-mix(in srgb, var(--ak-signal-warn, #ffab00) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ak-signal-warn, #ffab00) 34%, transparent);
+  font-size: 0.82rem;
+}
+.adopt-bar .ak-select { max-width: 300px; flex: 1 1 220px; }
+.adopt-tip b { color: var(--ak-signal-warn, #ffab00); }
+
+.ops { white-space: nowrap; }
+.state-tag { text-transform: none; }
+
+/* ===== 节点运行时配置 ===== */
+.rt-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.rt-bar .ak-select { max-width: 260px; }
+.rt-persist { display: inline-flex; align-items: center; gap: 6px; font-size: .82rem; }
+.rt-channel {
+  font-size: .75rem; padding: 2px 8px; border-radius: 3px; letter-spacing: .05em;
+}
+.rt-channel.ws { background: rgba(0, 176, 80, .14); color: #00b050; }
+.rt-channel.http { background: rgba(255, 171, 0, .14); color: #ffab00; }
+.rt-err {
+  margin: 0 0 12px; padding: 8px 12px; font-size: .82rem;
+  background: rgba(255, 59, 48, .1); color: #ff3b30; border-radius: 4px;
+}
+.rt-lock {
+  font-size: .68rem; padding: 1px 6px; margin-left: 6px; border-radius: 3px;
+  background: rgba(132, 131, 131, .2);
+}
+.rt-lock.warn { background: rgba(255, 171, 0, .16); color: #ffab00; }
+.rt-changed { color: #00b050; font-size: .78rem; }
+.rt-result {
+  margin-top: 14px; padding: 10px 12px; border-radius: 4px; font-size: .82rem;
+  background: rgba(132, 131, 131, .1);
+}
+.rt-line { margin-bottom: 4px; word-break: break-all; }
+.rt-warn {
+  margin-top: 8px; padding: 6px 10px; border-radius: 3px;
+  background: rgba(255, 171, 0, .12); color: #ffab00;
+}
+.rt-persist-warn { line-height: 1.5; }
+.ok-text { color: #00b050; }
+.pool-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--ak-signal-info);
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 2px 6px;
+}
+.link-btn.danger { color: var(--ak-signal-danger); }
+
+.ak-toggle {
+  border: var(--ak-line-hairline) solid rgba(0, 0, 0, 0.15);
+  background: transparent;
+  color: var(--ak-text-secondary);
+  font-size: 0.72rem;
+  padding: 2px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.ak-toggle.on { color: var(--ak-signal-success); border-color: currentColor; }
+
+/* 对话框 */
+.mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 10vh;
+  z-index: 50;
+}
+.dlg {
+  width: min(440px, calc(100vw - 40px));
+  max-height: 84vh;
+  overflow: auto;
+  background: var(--ak-surface-raised);
+  border: var(--ak-line-hairline) solid rgba(0, 0, 0, 0.12);
+  border-top: 3px solid var(--ak-signal-info);
+  padding: 20px 22px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+.dlg-title { font-family: var(--ak-font-command); font-weight: 600; margin-bottom: 14px; }
+.dlg-err { margin-top: 10px; color: var(--ak-signal-danger); font-size: 0.8rem; }
+.dlg-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.switch-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.switch-row .ak-label { min-width: 56px; }
+.switch-row .sw-hint { font-size: 0.72rem; }
+
+/* ===== 托管配置区块（原有） ===== */
 .cfg-list { display: flex; flex-direction: column; gap: 6px; max-height: 60vh; overflow: auto; }
 .cfg-row {
   display: flex; flex-direction: column; gap: 5px; padding: 9px 10px;

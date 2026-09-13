@@ -1,10 +1,16 @@
 <template>
   <div class="console">
-    <!-- 侧边导航 -->
-    <aside class="console-aside">
+    <!-- 移动端抽屉遮罩：点击关闭侧边栏 -->
+    <div v-if="drawerOpen" class="aside-mask" @click="drawerOpen = false"></div>
+
+    <!-- 侧边导航（<768px 收起为抽屉，由顶栏汉堡唤出） -->
+    <aside class="console-aside" :class="{ open: drawerOpen }">
       <div class="console-brand">
-        <h1 class="brand-title">ipw-boce</h1>
-        <p class="brand-sub">拨测收集中心 · 控制台</p>
+        <div class="brand-text">
+          <h1 class="brand-title">ipw-boce</h1>
+          <p class="brand-sub">拨测收集中心 · 控制台</p>
+        </div>
+        <button v-if="isMobile" class="aside-close" aria-label="收起菜单" @click="drawerOpen = false">✕</button>
       </div>
 
       <nav class="console-nav">
@@ -25,7 +31,13 @@
     <!-- 主区 -->
     <div class="console-main">
       <header class="console-topbar">
-        <div class="crumb">{{ route.meta.title || '' }}</div>
+        <div class="tb-left">
+          <!-- 汉堡：仅窄屏出现，唤出侧边栏抽屉 -->
+          <button v-if="isMobile" class="menu-btn" aria-label="打开菜单" @click="drawerOpen = true">
+            <span class="menu-ico" v-html="menuSvg"></span>
+          </button>
+          <div class="crumb">{{ route.meta.title || '' }}</div>
+        </div>
         <div class="top-actions">
           <!-- 站内信铃铛（仅 JWT 登录用户可见；静态 token 无可视用户则不显示） -->
           <div v-if="auth.userId" class="notice-wrap" ref="noticeWrap">
@@ -45,12 +57,12 @@
               <div class="notice-body">
                 <div v-if="!loading && !list.length" class="empty">暂无通知</div>
                 <div v-for="n in list" :key="n.id" class="notice-item" :class="{ unread: !n.read }" @click="viewNotice(n)">
-                  <div class="ni-title"><span class="kind-tag">{{ kindText(n.kind) }}</span>{{ n.title }}<span class="ni-time">{{ fmtAgo(n.createdAt) }}</span></div>
+                  <div class="ni-title"><span class="kind-tag">{{ kindText(n.kind) }}</span>{{ n.title }}<span class="ni-time">{{ timeAgo(n.createdAt) }}</span></div>
                   <div v-if="n.body" class="ni-body">{{ shortBody(n.body) }}</div>
                 </div>
               </div>
               <div class="notice-foot">
-                <span class="dim">掉线告警（所有者未配置邮箱时在此显示）</span>
+                <span class="dim">节点掉线、任务异常等告警会出现在这里</span>
               </div>
             </div>
           </div>
@@ -61,7 +73,7 @@
 
       <!-- 邮箱待验证横幅：仅普通账号(填了邮箱未验证)显示；admin 无此约束 -->
       <div v-if="auth.emailPending" class="verify-banner">
-        <span>⚠ 你的邮箱尚未验证，SLA 监控与建/启停定时拨测任务暂不可用。</span>
+        <span>⚠ 你的邮箱尚未验证，验证后才能使用 SLA 监控与定时拨测任务（创建 / 启停）。</span>
         <button class="ak-button ak-button--outline sm" @click="goVerify">去验证邮箱</button>
       </div>
 
@@ -73,12 +85,13 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth.js'
 import { http } from '../api/http.js'
 import { fetchNotices, fetchUnreadCount, markNoticesRead, clearNotices } from '../api/boce.js'
 import { useDialog } from '../composables/useDialog.js'
+import { timeAgo } from '../utils/format.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -90,11 +103,23 @@ const usersSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 
 const userSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-5 0-9 2.5-9 6v1h18v-1c0-3.5-4-6-9-6z" fill="currentColor"/></svg>'
 const bellSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2zm6-6v-5a6 6 0 0 0-4.5-5.8V4.5a1.5 1.5 0 1 0-3 0v.7A6 6 0 0 0 6 11v5l-2 2v1h16v-1l-2-2z" fill="currentColor"/></svg>'
 
+// ===== 窄屏适配：<768px 侧边栏收起为抽屉 =====
+const mobileQuery = '(max-width: 767px)'
+const isMobile = ref(false)
+const drawerOpen = ref(false)
+const menuSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>'
+
+// syncViewport 视口跨过断点时同步状态；回到宽屏时强制收起，避免残留遮罩挡住页面
+function syncViewport() {
+  isMobile.value = window.matchMedia(mobileQuery).matches
+  if (!isMobile.value) drawerOpen.value = false
+}
+
 const allNavs = [
   { to: '/', label: '统计大盘', ico: '◫', tip: '汇总 / 按类型 / 按节点趋势', admin: false },
   { to: '/nodes', label: '节点状态', ico: '❖', tip: '在线节点 / 事件历史', admin: true },
   { to: '/probe', label: '一键拨测', svg: boltSvg, tip: '对全部或指定节点批量拨测', admin: false },
-  { to: '/records', label: '拨测明细', ico: '≣', tip: '最近 probe_results', admin: false },
+  { to: '/records', label: '拨测明细', ico: '≣', tip: '最近拨测记录', admin: false },
   { to: '/sla', label: 'SLA 监控', ico: '◔', tip: '定时拨测可用率 / 延迟 / 达标', admin: false },
   { to: '/config', label: '配置分发', ico: '⚙', tip: '节点远端配置托管', admin: true },
   { to: '/users', label: '用户管理', svg: usersSvg, tip: '管理控制台账号 / 角色 / 告警邮箱', admin: true },
@@ -104,11 +129,11 @@ const allNavs = [
 // admin-only 页面（节点/配置/用户）仅 admin 可见；其余登录可见
 const navs = computed(() => allNavs.filter((it) => !it.admin || auth.isAdmin))
 
-// 顶栏：健康心跳（轮询 /admin/status，仅显示在线节点数，不阻塞）
+// 顶栏：健康心跳（轮询 /admin/status，仅显示已连接的节点数，不阻塞）
 const wsPeers = ref(0)
 let timer = null
 const onlineCtl = computed(() => ({
-  text: `WS 在线 ${wsPeers.value}`,
+  text: `已连接节点 ${wsPeers.value}`,
   tagClass: wsPeers.value > 0 ? 'ak-tag--advanced' : 'ak-tag--neutral',
 }))
 
@@ -159,18 +184,22 @@ async function toggleNotices() {
   open.value = !open.value
   if (open.value) loadNotices()
 }
-// 全部已读
+// 全部已读（失败保持原状；下一次 30s 轮询会重新对齐未读数）
 async function readAll() {
-  const r = await markNoticesRead()
-  if (r) unread.value = r.unread ?? 0
-  list.value = list.value.map((n) => ({ ...n, read: true }))
+  try {
+    const r = await markNoticesRead()
+    if (r) unread.value = r.unread ?? 0
+    list.value = list.value.map((n) => ({ ...n, read: true }))
+  } catch { /* 静默：下拉列表本身不承载错误态 */ }
 }
 // 点一条 → 标已读
 async function readOne(n) {
   if (n.read) return
-  const r = await markNoticesRead([n.id])
-  if (r) unread.value = r.unread ?? 0
-  n.read = true
+  try {
+    const r = await markNoticesRead([n.id])
+    if (r) unread.value = r.unread ?? 0
+    n.read = true
+  } catch { /* 静默 */ }
 }
 // 点一条 → 弹窗显示完整内容 + 标已读
 async function viewNotice(n) {
@@ -204,19 +233,11 @@ async function clearAll() {
     cancelText: '取消',
   })
   if (!ok) return
-  await clearNotices()
-  list.value = []
-  unread.value = 0
-}
-// 时间/正文显示
-function fmtAgo(iso) {
-  if (!iso) return ''
-  const d = new Date(iso)
-  const s = Math.floor((Date.now() - d.getTime()) / 1000)
-  if (s < 60) return '刚刚'
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
-  return `${Math.floor(s / 86400)} 天前`
+  try {
+    await clearNotices()
+    list.value = []
+    unread.value = 0
+  } catch { /* 静默：失败时列表保持原样，用户可重试 */ }
 }
 function shortBody(b) {
   return b.length > 180 ? b.slice(0, 180) + '…' : b
@@ -227,7 +248,18 @@ function onDocClick(e) {
 }
 
 const noticeWrap = ref(null)
+
+// 窄屏下点导航跳转后自动收起抽屉（否则遮罩会盖住新页面）
+watch(() => route?.fullPath, () => { drawerOpen.value = false })
+
+// 抽屉展开时锁掉背景滚动，避免移动端"滑动穿透"
+watch(drawerOpen, (opened) => { document.body.style.overflow = opened ? 'hidden' : '' })
+
+let mq = null
 onMounted(() => {
+  syncViewport()
+  mq = window.matchMedia(mobileQuery)
+  mq.addEventListener('change', syncViewport)
   pollStatus()
   timer = setInterval(pollStatus, 20000)
   if (auth.userId) {
@@ -237,6 +269,8 @@ onMounted(() => {
   document.addEventListener('click', onDocClick)
 })
 onBeforeUnmount(() => {
+  if (mq) mq.removeEventListener('change', syncViewport)
+  document.body.style.overflow = '' // 极端情况：抽屉开着就卸载，需还回滚动
   clearInterval(timer)
   if (noticeTimer) clearInterval(noticeTimer)
   document.removeEventListener('click', onDocClick)

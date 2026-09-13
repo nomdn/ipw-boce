@@ -28,17 +28,16 @@ export function fmtMinute(m) {
 }
 function pad(n) { return String(n).padStart(2, '0') }
 
-// 距现在多久
+// 距现在多久（全站统一中文口径，勿再另写英文缩写版）
 export function timeAgo(iso) {
   if (!iso) return '—'
   const t = new Date(iso).getTime()
   if (isNaN(t)) return iso
   const s = Math.floor((Date.now() - t) / 1000)
-  if (s < 5) return '刚刚'
-  if (s < 60) return `${s}s 前`
-  if (s < 3600) return `${Math.floor(s / 60)}m 前`
-  if (s < 86400) return `${Math.floor(s / 3600)}h 前`
-  return `${Math.floor(s / 86400)}d 前`
+  if (s < 60) return '刚刚'
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
+  return `${Math.floor(s / 86400)} 天前`
 }
 
 // 展示时间戳（ISO 或秒）

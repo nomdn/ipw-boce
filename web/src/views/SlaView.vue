@@ -13,18 +13,25 @@
         </select>
       </div>
       <button class="ak-button ak-button--outline" @click="load">刷新</button>
+      <input class="ak-input" v-model.trim="tagFilter" @keyup.enter="load(true)" placeholder="按标签过滤" style="width:140px" />
+      <button class="ak-button ak-button--outline" :disabled="!tasks.length" @click="toggleSelectAll">
+        {{ allSelected ? '取消全选' : '全选' }}
+      </button>
+      <button class="ak-button ak-button--outline" :disabled="!selCount" @click="openBatchShare">
+        分享所选{{ selCount ? `（${selCount}）` : '' }}
+      </button>
       <button class="ak-button ak-button--action" @click="openCreate">＋ 新建定时拨测</button>
       <span v-if="error" class="err">加载失败：{{ error }}</span>
       <span v-if="!loading && !tasks.length && !error" class="dim" style="font-size:.85rem">
-        暂无定时拨测任务 —— 点击「新建定时拨测」配置一组，调度器会按时对节点拨测并累计 SLA
+        暂无定时拨测任务 —— 点击「新建定时拨测」配置一组，系统会按时对节点拨测并累计 SLA
       </span>
     </div>
-    <div v-if="loading" class="loading-center"><span class="ak-loading"></span></div>
+    <div v-if="loading && !tasks.length" class="loading-center"><span class="ak-loading"></span></div>
 
     <!-- 新建任务表单（编辑任务的表单插入到对应任务卡下方，详见 sla-stack 内） -->
     <TaskFormPanel
       v-if="editingId === 0"
-      :form="form" :target-hint="targetHint"
+      :form="form" :target-hint="targetHint" :nodes="briefNodes"
       :saving="saving" :msg="formMsg" :err="formErr"
       @submit="save" @cancel="cancelEdit"
     />
@@ -35,13 +42,21 @@
       <section class="panel sla-card">
         <div class="sla-head">
           <div class="sla-title">
+            <input type="checkbox" class="sel-box" :checked="!!selMap[tk.task.id]" @change="toggleSel(tk.task.id)"
+              :title="selMap[tk.task.id] ? '取消选择' : '选择（用于批量分享）'" />
             <span class="ak-tag ch type-tag">{{ apiLabel(tk.task.apiType) }}</span>
             <span class="mono name">{{ tk.task.name }}</span>
             <span class="dim tgt">{{ tk.task.target }}</span>
-            <span class="dim gap">{{ every(tk.task) }} · 慢&gt;{{ tk.task.slowMs || 0 }}ms</span>
+            <span class="dim gap">{{ every(tk.task) }} · 慢 &gt; {{ tk.task.slowMs || 0 }} ms</span>
           </div>
           <div class="sla-ops">
-            <button class="ak-button ak-button--outline sm" :class="{ off: !tk.task.enabled }" @click="toggle(tk.task)">{{ tk.task.enabled ? '运行中' : '已停' }}</button>
+            <button class="ak-button ak-button--outline sm" :class="{ off: !tk.task.enabled }"
+              :title="tk.task.enabled ? '当前运行中，点击停用' : '当前已停，点击启用'"
+              @click="toggle(tk.task)">{{ tk.task.enabled ? '运行中' : '已停' }}</button>
+            <button class="ak-button ak-button--outline sm" :class="{ off: trendCollapsed[tk.task.id] }" @click="toggleTrend(tk.task.id)">{{ trendCollapsed[tk.task.id] ? '展开曲线' : '延迟曲线' }}</button>
+            <button class="ak-button ak-button--outline sm" @click="toggleCompare(tk.task)">{{ compareMap[tk.task.id] ? '关闭对比' : '节点对比' }}</button>
+            <button class="ak-button ak-button--outline sm" @click="shareSingle(tk.task)">{{ shareMap[tk.task.id] ? '重生成链接' : '分享' }}</button>
+            <button v-if="shareMap[tk.task.id]" class="ak-button ak-button--outline sm danger" @click="closeBatchShare(tk.task)">关闭分享</button>
             <button class="ak-button ak-button--outline sm" @click="openEdit(tk.task)">编辑</button>
             <button class="ak-button ak-button--outline sm danger" @click="remove(tk.task)">✕</button>
           </div>
@@ -49,10 +64,15 @@
 
         <!-- 判定摘要 + 全局 -->
         <div class="sla-sub dim">
-          <span>判定: {{ judgeText(tk.task) }}</span>
+          <span>判定：{{ judgeText(tk.task) }}</span>
           <span>节点 {{ nodeScopeText(tk.task) }}</span>
+          <span v-if="tk.task.notifyRecover">恢复通知 ✓<span v-if="tk.task.quietHours">（免打扰 {{ tk.task.quietHours }}）</span></span>
+          <span v-if="tk.task.tags"><span class="ak-tag ch" v-for="tg in tk.task.tags.split(',')" :key="tg">{{ tg }}</span></span>
           <span>最近更新 {{ fmtTime(tk.task.updatedAt) }}</span>
           <span v-if="tk.task.ownerUsername" class="owner" :title="tk.task.ownerId ? '告警将发往该所有者' : ''">创建者 @{{ tk.task.ownerUsername }}</span>
+        </div>
+        <div v-if="shareMap[tk.task.id]" class="sla-sub share-line">
+          <span class="ok-200 mono" style="word-break:break-all">公开链接：{{ shareOrigin }}{{ shareMap[tk.task.id] }} <button class="link-btn" @click="copyShare(tk.task)">复制</button></span>
         </div>
 
         <div class="sla-kpis">
@@ -66,62 +86,117 @@
         <!-- 延迟曲线：一条折线，每样本点=单轮多节点平均延迟；有 down 的轮次标红带 -->
         <div class="sla-trend">
           <div class="sla-trend-cap">
-            <span>延迟趋势 <span class="dim">/ 每个点 = 一轮多节点平均 · 红带 = 有节点失败的轮次 · 滚轮/底部条缩放</span></span>
+            <span>延迟趋势 <span class="dim">/ 每个点 = 一轮多节点平均延迟 · 标红 = 该轮有节点失败 · 滚轮或底部滑块缩放</span></span>
             <span class="dim" v-if="hasFailure(seriesMap[tk.task.id])">存在失败轮次</span>
           </div>
-          <EChart v-if="hasTrend(seriesMap[tk.task.id])" :option="tk.chart" height="150px" />
+          <EChart v-if="hasTrend(seriesMap[tk.task.id]) && !trendCollapsed[tk.task.id]" :option="tk.chart" height="150px" />
+          <div v-else-if="trendCollapsed[tk.task.id]" class="dim empty">曲线已收起</div>
           <div v-else class="dim empty">该窗口暂无定时样本</div>
+        </div>
+
+        <!-- 节点对比（C2）：每条线 = 一个节点的每轮实测延迟，叠加同图 -->
+        <div v-if="compareMap[tk.task.id]" class="sla-trend">
+          <div class="sla-trend-cap">
+            <span>节点对比 <span class="dim">/ 每条线 = 一个节点的每轮延迟</span></span>
+            <span class="dim" v-if="compareMap[tk.task.id].loading">加载中…</span>
+          </div>
+          <EChart v-if="!compareMap[tk.task.id].loading && compareMap[tk.task.id].nodes.length"
+            :option="nodeCompareOption(tk.task.id)" height="220px" />
+          <div v-else-if="!compareMap[tk.task.id].loading" class="dim empty">无节点曲线数据</div>
         </div>
 
         <!-- 每节点 -->
         <div v-if="tk.sla && tk.sla.byNode && tk.sla.byNode.length" class="ak-table-wrap">
           <table class="ak-table sla-node">
             <thead><tr>
-              <th>节点</th><th>在线</th><th>可用</th><th>up/down</th><th>avg</th><th>max/p95</th><th>慢</th><th>最新</th><th>特殊字段</th>
+              <th>节点</th><th>在线</th><th>可用率</th><th>成功/失败</th><th>平均延迟</th><th>最大/P95</th><th>慢请求</th><th>最新延迟</th>
+              <th v-if="hasSpecialCol(tk.task.apiType)">{{ specialColName(tk.task.apiType) }}</th>
             </tr></thead>
             <tbody>
               <tr v-for="n in tk.sla.byNode" :key="n.nodeId">
                 <td class="mono nowrap">{{ n.nodeId }}</td>
                 <td><span class="dot" :class="n.nodeOnline === false ? 'offline' : 'online'"></span></td>
                 <td class="mono" :class="upTone(n.availability)">{{ fmtPct(n.availability) }}</td>
-                <td class="mono"><span class="ok-200">{{ n.up }}</span>/<span class="err">{{ n.down }}</span><span v-if="n.invalid" class="dim">·{{ n.invalid }}?</span></td>
+                <td class="mono"><span class="ok-200">{{ n.up }}</span>/<span class="err">{{ n.down }}</span><span v-if="n.invalid" class="dim" :title="'无法判定的样本数'"> · {{ n.invalid }} 不明</span></td>
                 <td class="mono">{{ n.avgMs }}ms</td>
                 <td class="mono dim">{{ n.maxMs }}/{{ n.p95Ms }}</td>
                 <td class="mono" :class="n.slow ? 'err' : 'ok-200'">{{ n.slow }}</td>
                 <td class="mono">
                   <span class="dot" :class="n.latestUp ? 'online' : 'offline'"></span>{{ n.latestMs }}ms
                 </td>
-                <td class="special">{{ specialText(tk.task.apiType, n.special) }}</td>
+                <!-- 取自最新一条样本（时间见后缀），悬浮看完整快照；与左侧窗口聚合口径不同 -->
+                <td v-if="hasSpecialCol(tk.task.apiType)" class="special" :class="specialTone(tk.task.apiType, n.special)"
+                  :title="specialFull(tk.task.apiType, n.special)">
+                  <template v-if="n.special">
+                    {{ specialText(tk.task.apiType, n.special) }}
+                    <span class="dim">· {{ timeAgo(n.latestAt) }}</span>
+                  </template>
+                  <template v-else>—</template>
+                </td>
               </tr>
             </tbody>
           </table>
         </div>
-        <div v-else class="dim empty">该窗口暂无定时样本：{{ tk.sla?.samples || 0 }} 条（确认任务已启用、间隔合理且节点可达）</div>
+        <div v-else class="dim empty">该窗口暂无定时样本（已采集 {{ tk.sla?.samples || 0 }} 条）。请确认任务已启用、采集间隔合理且节点可达。</div>
       </section>
       <!-- 编辑当前任务时把表单插入到该任务卡下方，而不是跳到列表顶部 -->
       <TaskFormPanel
         v-if="editingId === tk.task.id"
-        :form="form" :target-hint="targetHint"
+        :form="form" :target-hint="targetHint" :nodes="briefNodes"
         :saving="saving" :msg="formMsg" :err="formErr"
         @submit="save" @cancel="cancelEdit"
       />
     </template>
     </div>
+
+    <!-- 批量分享对话框（多选任务共用一个分享码；支持自定义分享码） -->
+    <div v-if="batchShare.show" class="mask" @click.self="batchShare.show = false">
+      <div class="dlg">
+        <div class="dlg-title">分享所选任务（{{ selCount }} 个，共用一条链接）</div>
+        <div class="ak-form-stack">
+          <label class="ak-field">
+            <span class="ak-label">自定义分享码</span>
+            <input class="ak-input" v-model.trim="batchShare.token"
+              placeholder="留空随机生成；3~32 位小写字母/数字/连字符" />
+          </label>
+          <p class="dim" style="margin:4px 0 0;font-size:.74rem">
+            链接：&lt;站点地址&gt;/s/&lt;分享码&gt;；同一分享码的任务在公开状态页同页展示；
+            重生成会使旧链接立即失效。
+          </p>
+        </div>
+        <div v-if="batchShare.msg" :class="batchShare.err ? 'err' : 'ok-200'" style="margin-top:10px;font-size:.8rem;word-break:break-all">
+          {{ batchShare.msg }}
+          <template v-if="batchShare.link">
+            <br />{{ batchShare.link }}
+            <button class="ak-button ak-button--outline" style="padding:2px 8px;font-size:.72rem;margin-left:6px"
+              @click="copyText(batchShare.link)">复制</button>
+          </template>
+        </div>
+        <div class="dlg-foot">
+          <button class="ak-button ak-button--outline" @click="batchShare.show = false">关闭</button>
+          <button v-if="batchShare.link" class="ak-button ak-button--outline danger" @click="closeBatchShare()">关闭分享</button>
+          <button class="ak-button ak-button--action" :disabled="batchShare.busy" @click="confirmBatchShare">
+            {{ batchShare.busy ? '生成中…' : (batchShare.link ? '重新生成' : '生成分享链接') }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import {
   fetchTasks, fetchTaskSla, createTask, updateTask, setTaskEnabled, deleteTask, fetchTaskMeta, fetchTaskSeries,
+  fetchNodesBrief, shareTasks, unshareTasks,
 } from '../api/boce.js'
 import { getToken } from '../api/http.js'
 import { WS_BASE } from '../config.js'
-import { fmtTime } from '../utils/format.js'
+import { fmtTime, timeAgo } from '../utils/format.js'
 import { useDialog } from '../composables/useDialog.js'
 import EChart from '../components/EChart.vue'
 import TaskFormPanel from '../components/TaskFormPanel.vue'
-import { apiOptions, apiLabel } from '../utils/probeMeta.js'
+import { apiOptions, apiLabel, dnsKindLabel } from '../utils/probeMeta.js'
 
 const dialog = useDialog()
 const hours = ref(24)
@@ -130,6 +205,30 @@ const types = ref(apiOptions.map((o) => o.value))
 const tasks = ref([])
 const slaMap = ref({}) // taskId -> sla resp
 const seriesMap = ref({}) // taskId -> 分桶时序（延迟曲线）
+const tagFilter = ref('') // 标签过滤（?tag=，服务端子串匹配）
+// B3 公开状态页分享：分享码即分享组（多选任务可共用同一分享码）——taskId -> 分享路径（/s/<token>）。
+// 页面由前端 Vue 路由渲染（/s/:token），链接拼在访问者所在的**前端** origin 下。
+const shareMap = ref({})
+const shareOrigin = window.location.origin
+// 多选分享：taskId -> bool + 批量分享对话框状态
+const selMap = ref({})
+const selCount = computed(() => Object.values(selMap.value).filter(Boolean).length)
+const batchShare = reactive({ show: false, token: '', busy: false, msg: '', err: false, link: '' })
+// 一键全选（针对当前列表的全部任务）
+const allSelected = computed(() => tasks.value.length > 0 && tasks.value.every((t) => selMap.value[t.id]))
+function toggleSelectAll() {
+  const target = !allSelected.value
+  const m = { ...selMap.value }
+  tasks.value.forEach((t) => { m[t.id] = target })
+  selMap.value = m
+}
+// 曲线收起/展开（按任务）
+const trendCollapsed = ref({})
+function toggleTrend(id) {
+  trendCollapsed.value = { ...trendCollapsed.value, [id]: !trendCollapsed.value[id] }
+}
+// C2 节点对比：taskId -> { loading, nodes:[{nodeId, series}] }
+const compareMap = ref({})
 const loading = ref(false)
 const error = ref('')
 
@@ -143,14 +242,15 @@ const editingId = ref(0)
 
 function blankForm() {
   return {
-    id: null, name: '', apiType: 'detail', target: '', stack: '', nodeScope: 'all', nodeIds: '',
+    id: null, name: '', apiType: 'detail', target: '', stack: '', recordType: 'a', nodeScope: 'all', nodeIds: '',
     intervalSec: 60, slowMs: 0, expectStatus: '2xx',
     bothProtocols: true, requireAllStacks: true, certExpiredDown: true,
+    notifyRecover: false, quietHours: '', tags: '', hideTarget: false,
   }
 }
 
 // ---- SLA 实时推送（WS /console/sla）----
-// 后端在每轮定时拨测落库后，把该任务整窗聚合 SLA 推过来，此处覆盖对应卡片即实时刷新。
+// 后端在每轮定时拨测写入样本后，把该任务整窗聚合 SLA 推过来，此处覆盖对应卡片即实时刷新。
 // 断线指数退避自动重连；重连成功(非首次)补拉一次全量，补齐断线窗口错过的推送。
 let ws = null
 let wsTimer = null
@@ -159,7 +259,7 @@ let wsUserClosed = false
 let wsRetry = 0
 
 function onWindowChange() {
-  load()
+  load(true)
   connectSla() // 窗口变了，重建 WS 用新 hours 订阅，避免收到的快照窗口错位
 }
 
@@ -219,17 +319,30 @@ function matchWindow(win) {
 
 onMounted(() => {
   load()
+  loadBrief()
   connectSla()
 })
 onBeforeUnmount(closeSla)
 
-async function load() {
-  loading.value = true
+// briefNodes 节点简表（脱敏）：任务表单"指定节点"勾选数据源（admin/user 都可用）
+const briefNodes = ref([])
+async function loadBrief() {
+  try {
+    briefNodes.value = await fetchNodesBrief()
+  } catch {
+    briefNodes.value = []
+  }
+}
+
+// silent=true：后台刷新（保存/启停/切窗口后），不显示全屏加载态——已有卡片原地更新，
+// 避免"每操作一次就整页重载"的体验
+async function load(silent) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
     const meta = await fetchTaskMeta().catch(() => null)
     if (meta?.types) types.value = meta.types
-    const list = await fetchTasks()
+    const list = await fetchTasks(tagFilter.value || undefined)
     tasks.value = list || []
     // 并发拉取每个任务的 SLA 与时序曲线
     const res = await Promise.all(
@@ -250,7 +363,7 @@ async function load() {
     slaMap.value = sm
     seriesMap.value = sem
   } catch (e) {
-    error.value = e?.message || 'load failed'
+    error.value = e?.message || '加载失败'
   } finally {
     loading.value = false
   }
@@ -290,7 +403,9 @@ function aggregate(task, sla) {
     samples,
     availability: denom ? Math.round((up / denom) * 10000) / 100 : 0,
     errRate: denom ? Math.round((down / denom) * 10000) / 100 : 0,
-    metRate: samples ? Math.round((met / samples) * 10000) / 100 : 0,
+    // slow 与 up 是独立判定（down 的样本也可能超过慢阈值），故 up-slow 可能为负 → 兜底夹到 0，
+    // 否则慢样本多于成功样本时会显示出负的达标率。
+    metRate: samples ? Math.max(0, Math.round((met / samples) * 10000) / 100) : 0,
     avgMs: nLat ? Math.round(sumMs / nLat) : 0,
     invalid,
   }
@@ -301,40 +416,93 @@ const targetHint = computed(() => {
     case 'ssl': return '域名，如 www.example.com'
     case 'detail': return '域名，如 www.example.com'
     case 'tcping': return 'host[:port]，如 1.1.1.1:443'
-    case 'speed': return '测速文件 URL，如 https://host/file（栈选 v4/v6）'
+    case 'speed': return '测速文件 URL，如 https://host/file（协议栈选 v4/v6）'
+    case 'dns': return '域名，如 example.com（记录类型另选）'
     default: return ''
   }
 })
 
 function every(t) {
-  return `每 ${t.intervalSec}s`
+  return `每 ${t.intervalSec} 秒`
 }
 function judgeText(t) {
+  // dns 的"判定口径"就是记录类型（解析出记录即成功，无状态码/双栈概念）
+  if (t.apiType === 'dns') return dnsKindLabel(t.recordType || 'a')
   const p = [t.expectStatus || '2xx']
-  if (t.apiType === 'detail') p.push(t.bothProtocols ? 'http+https都中' : '任一协议中')
-  if (t.apiType === 'ssl' || t.apiType === 'detail') p.push(t.requireAllStacks ? '双栈全通' : '任一栈通')
-  if (t.apiType === 'ssl') p.push(t.certExpiredDown ? '过期即fail' : '过期仅提示')
+  if (t.apiType === 'detail') p.push(t.bothProtocols ? 'HTTP 与 HTTPS 均需命中' : '任一协议命中')
+  if (t.apiType === 'ssl' || t.apiType === 'detail') p.push(t.requireAllStacks ? 'IPv4 与 IPv6 均可用' : '任一协议可用')
+  if (t.apiType === 'ssl') p.push(t.certExpiredDown ? '证书过期判为失败' : '证书过期仅提示')
   return p.join(' · ')
 }
 function nodeScopeText(t) {
-  return t.nodeScope === 'custom' ? `仅 ${t.nodeIds}` : '全池'
+  return t.nodeScope === 'custom' ? `仅 ${t.nodeIds}` : '全部节点'
 }
+// ===== 特殊字段列（取自最新一条样本，非窗口聚合）=====
+// ssl → "证书"（剩余天数着色：>30 正常 / ≤30 临期 / ≤0 过期）；detail → "速度/体积"；其余类型无此列
+const hasSpecialCol = (t) => t === 'ssl' || t === 'detail' || t === 'dns'
+const specialColName = (t) => (t === 'ssl' ? '证书' : t === 'dns' ? '解析结果' : '速度/体积')
+
+function specialTone(apiType, sp) {
+  if (apiType === 'ssl' && sp?.cert_validity_days != null) {
+    const d = Number(sp.cert_validity_days)
+    if (d <= 0) return 'bad'
+    if (d <= 30) return 'warn'
+  }
+  return ''
+}
+
 function specialText(apiType, sp) {
   if (!sp) return '—'
+  const parts = []
   if (apiType === 'ssl') {
-    const parts = []
     if (sp.domain) parts.push(sp.domain)
-    if (sp.cert_validity_days != null) parts.push(`证书 ${sp.cert_validity_days} 天`)
-    if (sp.cert_end_time) parts.push(`至 ${fmtTime(sp.cert_end_time).slice(0, 10)}`)
-    return parts.join(' · ') || '—'
-  }
-  if (apiType === 'detail') {
-    const parts = []
+    if (sp.cert_validity_days != null) {
+      const d = Number(sp.cert_validity_days)
+      parts.push(d <= 0 ? '证书已过期' : `证书剩 ${d} 天`)
+    }
+    if (sp.cert_end_time) parts.push(`至 ${String(sp.cert_end_time).slice(0, 10)}`)
+  } else if (apiType === 'detail') {
     if (sp.download_speed != null) parts.push(`↓ ${Number(sp.download_speed).toFixed(2)} MB/s`)
     if (sp.page_size != null) parts.push(`${fmtNum(sp.page_size)}B`)
-    return parts.join(' · ') || '—'
+  } else if (apiType === 'dns') {
+    if (sp.record_count != null) parts.push(`${sp.record_count} 条记录`)
+    if (sp.first_record) parts.push(String(sp.first_record))
+    if (sp.duration != null) parts.push(`${sp.duration}ms`)
   }
-  return '—'
+  return parts.filter(Boolean).join(' · ') || '—'
+}
+
+// specialFull 悬浮完整快照（后端 extractSpecial 已回传全部字段，这里仅格式化）
+function specialFull(apiType, sp) {
+  if (!sp) return ''
+  const parts = []
+  if (apiType === 'ssl') {
+    if (sp.subject_common_name) parts.push(`CN ${sp.subject_common_name}`)
+    if (sp.issuer_common_name) parts.push(`颁发者 ${sp.issuer_common_name}`)
+    if (sp.issuer_organization) parts.push(`机构 ${sp.issuer_organization}`)
+    if (sp.http_version) parts.push(`HTTP ${sp.http_version}`)
+    if (sp.cert_start_time) parts.push(`生效 ${String(sp.cert_start_time).slice(0, 10)}`)
+    if (sp.cert_end_time) parts.push(`到期 ${String(sp.cert_end_time).slice(0, 10)}`)
+    if (sp.cert_validity_days != null) parts.push(`剩余 ${sp.cert_validity_days} 天`)
+  } else if (apiType === 'dns') {
+    if (sp.domain) parts.push(`域名 ${sp.domain}`)
+    if (sp.record_count != null) parts.push(`记录 ${sp.record_count} 条`)
+    if (sp.first_record) parts.push(`首条 ${sp.first_record}`)
+    if (sp.ttl != null) parts.push(`TTL ${sp.ttl}`)
+    if (sp.duration != null) parts.push(`耗时 ${sp.duration}ms`)
+  } else {
+    if (sp.host_record) parts.push(`解析 ${sp.host_record}`)
+    if (sp.dns_lookup_time != null) parts.push(`DNS ${sp.dns_lookup_time}ms`)
+    if (sp.tcp_connect_time != null) parts.push(`TCP ${sp.tcp_connect_time}ms`)
+    if (sp.http_connect_time != null) parts.push(`HTTP 连接 ${sp.http_connect_time}ms`)
+    if (sp.first_byte_time != null) parts.push(`首字节 ${sp.first_byte_time}ms`)
+    if (sp.total_time != null) parts.push(`总计 ${sp.total_time}ms`)
+    if (sp.page_size != null) parts.push(`大小 ${fmtNum(sp.page_size)}B`)
+    if (sp.download_speed != null) parts.push(`速度 ${Number(sp.download_speed).toFixed(2)} MB/s`)
+    if (sp.http_status_code != null) parts.push(`HTTP ${sp.http_status_code}`)
+    if (sp.https_status_code != null) parts.push(`HTTPS ${sp.https_status_code}`)
+  }
+  return parts.filter(Boolean).join(' · ')
 }
 
 function fmtNum(n) {
@@ -401,6 +569,111 @@ function hasFailure(series) {
   return Array.isArray(series?.series) && series.series.some((s) => s.down > 0)
 }
 
+// ---- B3 公开状态页分享（分享码即分享组：多选批量 / 单个） ----
+function toggleSel(id) {
+  selMap.value = { ...selMap.value, [id]: !selMap.value[id] }
+}
+// 单卡分享：只选该任务并打开批量分享对话框（一个任务=一个分享码的最小情形）
+function shareSingle(t) {
+  selMap.value = { [t.id]: true }
+  openBatchShare()
+}
+function openBatchShare() {
+  if (!selCount.value) return
+  batchShare.show = true
+  batchShare.token = ''
+  batchShare.msg = ''
+  batchShare.err = false
+  batchShare.link = ''
+}
+function selectedIds() {
+  return Object.keys(selMap.value).filter((k) => selMap.value[k]).map(Number)
+}
+async function confirmBatchShare() {
+  const ids = selectedIds()
+  if (!ids.length) return
+  batchShare.busy = true
+  batchShare.msg = ''
+  batchShare.err = false
+  try {
+    const r = await shareTasks(ids, batchShare.token)
+    for (const id of ids) shareMap.value = { ...shareMap.value, [id]: r.url }
+    batchShare.link = shareOrigin + r.url
+    batchShare.msg = '已生成分享链接'
+  } catch (e) {
+    batchShare.err = true
+    batchShare.msg = e?.message || '生成失败'
+  } finally {
+    batchShare.busy = false
+  }
+}
+async function closeBatchShare(t) {
+  const ids = t ? [t.id] : selectedIds()
+  if (!ids.length) return
+  batchShare.busy = true
+  try {
+    await unshareTasks(ids)
+    const m = { ...shareMap.value }
+    for (const id of ids) delete m[id]
+    shareMap.value = m
+    batchShare.show = false
+  } catch { /* 后端已给错误提示 */ } finally { batchShare.busy = false }
+}
+// 复制该任务的公开链接（原模板绑定了 handler 但脚本里未定义，点击会抛错）
+function copyShare(t) {
+  const path = shareMap.value[t.id]
+  if (!path) return
+  copyText(shareOrigin + path)
+}
+async function copyText(txt) {
+  try { await navigator.clipboard.writeText(txt) } catch { /* 剪贴板不可用时用户可手动选中 */ }
+}
+
+// ---- C2 节点对比 ----
+async function toggleCompare(t) {
+  if (compareMap.value[t.id]) {
+    const m = { ...compareMap.value }
+    delete m[t.id]
+    compareMap.value = m
+    return
+  }
+  compareMap.value = { ...compareMap.value, [t.id]: { loading: true, nodes: [] } }
+  const card = taskCards.value.find((c) => c.task.id === t.id)
+  const nodeList = (card?.sla?.byNode || []).slice(0, 8).map((n) => n.nodeId)
+  const nodes = (await Promise.all(
+    nodeList.map((n) => fetchTaskSeries(t.id, hours.value, n).catch(() => null)),
+  ))
+    .map((s, i) => (s ? { nodeId: nodeList[i], series: s.series || [] } : null))
+    .filter(Boolean)
+  compareMap.value = { ...compareMap.value, [t.id]: { loading: false, nodes } }
+}
+// 节点对比图 option：每节点一条 avgMs 折线（同窗口同分桶，线上断点=该节点当轮无有效延迟）
+function nodeCompareOption(taskId) {
+  const nodes = compareMap.value[taskId]?.nodes || []
+  const colors = [CH.cyan, CH.yellow, CH.green, '#c678dd', '#ff9f43', '#4ec9b0', '#e06c75', '#569cd6']
+  return {
+    color: colors,
+    legend: { top: 0, textStyle: { color: CH.label }, itemWidth: 14 },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'line' }, ...chartTooltip,
+      valueFormatter: (v) => (typeof v === 'number' ? v + ' ms' : '无') },
+    grid: { left: 56, right: 16, top: 30, bottom: 40 },
+    // x 轴必须用 time（同主趋势图）：value 轴会把毫秒时间戳当普通数字做整数好刻度，
+    // 刻度从 0 开始散布在 1970~1973，格式化后就是"01-05/07-10 交错"的怪日期
+    xAxis: { type: 'time', ...chartAxis, axisLabel: { ...chartAxis.axisLabel, formatter: (v) => bucketLabel(v), hideOverlap: true } },
+    yAxis: { type: 'value', ...chartAxis, axisLabel: { ...chartAxis.axisLabel, formatter: '{value} ms' } },
+    series: nodes.map((n) => ({
+      name: n.nodeId, type: 'line', showSymbol: false,
+      data: (n.series || [])
+        .map((s) => {
+          const t = bucketMs(s.time)
+          const v = typeof s.avgMs === 'number' && s.avgMs > 0 ? s.avgMs : null
+          return t == null || v == null ? null : [t, v]
+        })
+        .filter(Boolean),
+    })),
+  }
+}
+
 // 延迟曲线 option：青色 avgMs 折线 + 失败(down>0)时间段红色 markArea 带。
 // x 用 value/time（毫秒），避免 category 跨日标签重复导致 markArea 锚定歧义。
 function slaTrendOption(series) {
@@ -412,9 +685,20 @@ function slaTrendOption(series) {
     const v = typeof s.avgMs === 'number' && s.avgMs > 0 ? s.avgMs : null
     return t == null || v == null ? null : [t, v]
   })
-  // 失败段：把连续 down>0 的桶聚成区间。区间左边界 = 段内首桶起点；
-  // 右边界 = 段内末桶的下一个桶起点（若无下一个桶则用末桶起点），确保整段连续失败被完整覆盖。
-  // （旧实现只在段首设 endI 不随段内更新，连续失败段被压成单桶宽，红线几乎不可见。）
+  // 失败段：把连续 down>0 的桶聚成区间。孤立的单轮失败在 24h 视图里只有 ~0.1 像素宽
+  // （一个采样间隔 / 整个时间轴），因此：① 每段向外扩半个典型采样间隔；② 另加一组
+  // 固定顶部条带的红色菱形标记（下方 failDots），任何缩放级别都肉眼可见。
+  let step = 0
+  const diffs = []
+  for (let i = 1; i < xv.length; i++) {
+    const d = xv[i] - xv[i - 1]
+    if (d > 0) diffs.push(d)
+  }
+  if (diffs.length) {
+    diffs.sort((a, b) => a - b)
+    step = diffs[Math.floor(diffs.length / 2)]
+  }
+  const half = Math.max(step / 2, 500) // 典型采样间隔的一半（至少 0.5s）
   const areas = []
   let segStart = null // 当前失败段首桶起点（ms）
   let lastFailT = null // 当前失败段末桶起点（ms）
@@ -425,15 +709,19 @@ function slaTrendOption(series) {
       lastFailT = xv[i]
     } else if (segStart !== null) {
       // 段结束：右边界取到失败段紧邻的下一个桶起点，覆盖完整
-      areas.push([{ name: '失败', xAxis: segStart }, { xAxis: xv[i] }])
+      areas.push([{ name: '失败', xAxis: segStart - half }, { xAxis: xv[i] + half }])
       segStart = null
       lastFailT = null
     }
   }
   if (segStart !== null) {
-    // 段延伸到末尾：无下一桶，右边界取末桶起点（仍有宽度 > 0）
-    areas.push([{ name: '失败', xAxis: segStart }, { xAxis: lastFailT }])
+    // 段延伸到末尾：右边界取末桶起点（+half 仍有宽度 > 0）
+    areas.push([{ name: '失败', xAxis: segStart - half }, { xAxis: lastFailT + half }])
   }
+  // 失败轮次标记点：画在隐藏副轴的固定高度（90%），与延迟值无关，任何缩放都可见
+  const failDots = rows
+    .map((r, i) => (r.down > 0 && xv[i] != null ? [xv[i], 0.9] : null))
+    .filter(Boolean)
   return {
     color: [CH.cyan],
     tooltip: {
@@ -442,16 +730,20 @@ function slaTrendOption(series) {
       ...chartTooltip,
       formatter(params) {
         const arr = Array.isArray(params) ? params : [params]
-        const x = arr[0]?.value
+        const lineP = arr.find((p) => p.seriesName === '平均延迟') || arr[0]
+        const failP = arr.find((p) => p.seriesName === '失败轮次')
+        const x = lineP?.value
         const ms = Array.isArray(x) ? x[0] : x
-        if (!ms) return ''
+        if (!ms) return failP ? `<div style="color:${CH.red}">失败轮次</div>` : ''
         let di = -1
         for (let i = 0; i < xv.length; i++) if (xv[i] === ms) { di = i; break }
         const r = di >= 0 ? rows[di] : null
         const head = `<div style="font-weight:600;margin-bottom:4px">${bucketLabel(ms)}</div>`
         const val = Array.isArray(x) && typeof x[1] === 'number' ? `${x[1]} ms` : '无'
-        const line = `<div>${arr[0]?.marker || ''}平均延迟：${val}</div>`
-        const fail = r && r.down > 0 ? `<div style="color:${CH.red};margin-top:2px">失败 ${r.down}/${r.samples} · 可用率 ${r.availability}%</div>` : ''
+        const line = `<div>${lineP?.marker || ''}平均延迟：${val}</div>`
+        let fail = ''
+        if (r && r.down > 0) fail += `<div style="color:${CH.red};margin-top:2px">失败 ${r.down}/${r.samples} · 可用率 ${r.availability}%</div>`
+        else if (failP) fail += `<div style="color:${CH.red};margin-top:2px">该轮存在失败</div>`
         return head + line + fail
       },
     },
@@ -469,7 +761,11 @@ function slaTrendOption(series) {
       },
     ],
     xAxis: { type: 'time', ...chartAxis, axisLabel: { ...chartAxis.axisLabel, formatter: (ms) => bucketLabel(ms), hideOverlap: true } },
-    yAxis: { type: 'value', name: 'ms', ...chartAxis },
+    yAxis: [
+      { type: 'value', name: 'ms', ...chartAxis },
+      // 隐藏副轴：失败轮次标记固定画在 90% 高度条带上，与延迟值解耦，任何缩放都可见
+      { type: 'value', min: 0, max: 1, show: false },
+    ],
     series: [
       {
         name: '平均延迟', type: 'line', smooth: true, showSymbol: false, connectNulls: false,
@@ -478,9 +774,15 @@ function slaTrendOption(series) {
         data: avg,
         markArea: {
           silent: true,
-          itemStyle: { color: 'rgba(227,59,59,0.15)' },
+          itemStyle: { color: 'rgba(227,59,59,0.22)' },
           data: areas,
         },
+      },
+      {
+        // 失败轮次标记（B2/C 修复）：红菱形固定在图表上部条带，缩放/全览均可见
+        name: '失败轮次', type: 'scatter', yAxisIndex: 1, symbol: 'diamond', symbolSize: 7,
+        itemStyle: { color: CH.red }, z: 5,
+        data: failDots,
       },
     ],
   }
@@ -496,9 +798,10 @@ function openCreate() {
 function openEdit(t) {
   form.value = {
     id: t.id, name: t.name, apiType: t.apiType, target: t.target, stack: t.stack || '',
-    nodeScope: t.nodeScope || 'all', nodeIds: t.nodeIds || '', intervalSec: t.intervalSec,
-    slowMs: t.slowMs || 0, expectStatus: t.expectStatus || '2xx',
+    recordType: t.recordType || 'a', nodeScope: t.nodeScope || 'all', nodeIds: t.nodeIds || '',
+    intervalSec: t.intervalSec, slowMs: t.slowMs || 0, expectStatus: t.expectStatus || '2xx',
     bothProtocols: t.bothProtocols, requireAllStacks: t.requireAllStacks, certExpiredDown: t.certExpiredDown,
+    notifyRecover: !!t.notifyRecover, quietHours: t.quietHours || '', tags: t.tags || '', hideTarget: !!t.hideTarget,
   }
   editing.value = true
   editingId.value = t.id // 编辑：该任务卡下方插入表单
@@ -513,17 +816,20 @@ async function save() {
   try {
     const payload = {
       name: form.value.name, apiType: form.value.apiType, target: form.value.target,
-      stack: form.value.stack, nodeScope: form.value.nodeScope, nodeIds: form.value.nodeIds,
+      stack: form.value.stack, recordType: form.value.apiType === 'dns' ? (form.value.recordType || 'a') : '',
+      nodeScope: form.value.nodeScope, nodeIds: form.value.nodeIds,
       intervalSec: form.value.intervalSec, slowMs: form.value.slowMs || 0,
       expectStatus: form.value.expectStatus || '2xx',
       bothProtocols: form.value.bothProtocols, requireAllStacks: form.value.requireAllStacks,
       certExpiredDown: form.value.certExpiredDown,
+      notifyRecover: form.value.notifyRecover, quietHours: form.value.quietHours || '',
+      tags: form.value.tags || '', hideTarget: form.value.hideTarget,
     }
     if (form.value.id) await updateTask(form.value.id, payload)
     else await createTask(payload)
     formMsg.value = '已保存'
     cancelEdit()
-    await load()
+    await load(true) // 静默刷新：不闪全屏加载，卡片原地更新
   } catch (e) {
     formErr.value = true
     formMsg.value = e?.message || '保存失败'
@@ -535,13 +841,13 @@ async function save() {
 async function toggle(t) {
   try {
     await setTaskEnabled(t.id, !t.enabled)
-    await load()
+    await load(true)
   } catch (e) { error.value = e?.message || '操作失败' }
 }
 async function remove(t) {
   const ok = await dialog.confirm({
     title: `删除任务「${t.name}」？`,
-    message: '任务定义及其全部历史拨测数据将被清退，操作不可撤销。',
+    message: '任务及其全部历史拨测数据将被删除，操作不可撤销。',
     kind: 'danger',
     confirmText: '删除',
     cancelText: '取消',
@@ -549,7 +855,7 @@ async function remove(t) {
   if (!ok) return
   try {
     await deleteTask(t.id)
-    await load()
+    await load(true)
   } catch (e) { error.value = e?.message || '删除失败' }
 }
 </script>
@@ -575,6 +881,29 @@ async function remove(t) {
 .sla-ops .ak-button.danger { color: var(--ak-signal-danger); border-color: var(--ak-signal-danger); }
 .sla-sub { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: .72rem; }
 .sla-sub .owner { color: var(--ak-signal-accent); font-family: var(--ak-font-mono); }
+/* 分享链接行（模板里的 .link-btn 若无样式会渲染成浏览器原生按钮） */
+.sla-sub.share-line { margin-top: 6px; }
+.link-btn {
+  background: none; border: none; color: var(--ak-signal-info);
+  cursor: pointer; font-size: 0.78rem; padding: 2px 6px;
+}
+/* 多选勾选框与批量分享对话框 */
+.sel-box { margin-right: 2px; cursor: pointer; }
+.mask {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 10vh; z-index: 50;
+}
+.dlg {
+  width: min(460px, calc(100vw - 40px)); max-height: 84vh; overflow: auto;
+  background: var(--ak-surface-raised);
+  border: var(--ak-line-hairline) solid rgba(0, 0, 0, 0.12);
+  border-top: 3px solid var(--ak-signal-info);
+  padding: 20px 22px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+.dlg-title { font-family: var(--ak-font-command); font-weight: 600; margin-bottom: 14px; }
+.dlg-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.dlg-foot .danger { color: var(--ak-signal-danger); border-color: var(--ak-signal-danger); }
 .sla-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 14px 0; }
 .sla-kpis .kpi { background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06); padding: 10px 12px; }
 .sla-kpis .kpi .l { font-size: .7rem; color: var(--ak-text-secondary); }
@@ -583,6 +912,9 @@ async function remove(t) {
 .sla-kpis .kpi.warn .v { color: var(--ak-signal-action); }
 .sla-kpis .kpi.bad .v { color: var(--ak-signal-danger); }
 .sla-node .special { color: var(--ak-text-secondary); font-size: .76rem; }
+/* 证书临期/过期着色（specialTone 输出 warn/bad，复用全局状态色） */
+.sla-node .special.warn { color: var(--ak-signal-action); }
+.sla-node .special.bad { color: var(--ak-signal-danger); }
 .empty { padding: 10px 2px; font-size: .82rem; }
 .chk { display: inline-flex; align-items: center; gap: 6px; font-size: .74rem; color: var(--ak-text-secondary); }
 .chk input { accent-color: var(--ak-signal-info); }
