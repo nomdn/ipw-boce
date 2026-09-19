@@ -11,8 +11,8 @@
           <div class="st-badge">LEMON / IPW</div>
           <h1 class="st-title">服务可用性状态</h1>
         </div>
-        <RangeTabs :model-value="hours" :options="PUBLIC_STATUS_WINDOWS" :disabled="winBusy"
-          aria-label="统计窗口" @change="setHours" />
+        <TimeRangePicker :model-value="range" :max-days="30" :disabled="winBusy"
+          aria-label="统计窗口" @update:model-value="onRange" />
       </header>
 
       <p v-if="!tasks.length" class="dim">该分享链接下暂无任务数据。</p>
@@ -43,7 +43,7 @@
             <thead><tr><th>节点</th><th>可用率</th><th>成功 / 失败</th><th>平均延迟</th><th>P95</th><th>最新延迟</th></tr></thead>
             <tbody>
               <tr v-for="n in t.byNode" :key="n.nodeId">
-                <td class="mono">{{ n.nodeId }}</td>
+                <td class="mono" :title="n.nodeId">{{ n.label || n.nodeId }}</td>
                 <td class="mono" :class="upTone(n.availability)">{{ fmtPct(n.availability) }}</td>
                 <td class="mono"><span class="ok-200">{{ n.up }}</span> / <span class="err">{{ n.down }}</span></td>
                 <td class="mono">{{ n.avgMs }}ms</td>
@@ -71,9 +71,9 @@ import { API_BASE } from '../config.js'
 import { fmtTime } from '../utils/format.js'
 import { apiLabel } from '../utils/probeMeta.js'
 import EChart from '../components/EChart.vue'
-import RangeTabs from '../components/RangeTabs.vue'
+import TimeRangePicker from '../components/TimeRangePicker.vue'
 import { useTheme, readChartTheme } from '../composables/useTheme.js'
-import { PUBLIC_STATUS_WINDOWS } from '../utils/timeWindow.js'
+import { resolveRange } from '../utils/timeRange.js'
 
 const route = useRoute()
 // 必须响应式：vue-router 会复用同一组件实例，从 /s/aaa 切到 /s/bbb 时
@@ -81,7 +81,13 @@ const route = useRoute()
 const token = computed(() => String(route.params.token || ''))
 const notFound = ref(false)
 const loadErr = ref('')
-const hours = ref(24)
+const range = ref({ key: '24h' })
+// 公开状态页后端只认 ?hours=N（相对窗口，见 public_status.go），任意选择
+// （含自然周期/自定义/平移）都折算成"最近 N 小时"交给后端按"现在"重算，规避本地时钟偏差。
+const hours = computed(() => {
+  const r = resolveRange(range.value)
+  return Math.min(24 * 90, Math.max(1, Math.round(r.hours)))
+})
 const st = ref({})
 let timer = null
 
@@ -98,15 +104,13 @@ function upTone(v) {
   return v >= 99 ? 'ok' : v >= 95 ? 'warn' : 'bad'
 }
 
-// 延迟曲线（按任务）：多节点叠加（每节点一条、图例=节点 id）；单节点/无按节点数据时退化为平均线。
-// 红菱形 = 失败轮次（顶部固定条带，缩放全览可见）
+// 延迟曲线（按任务）：只画"一轮多节点平均延迟"一条线；失败轮次以红菱形标在同图顶部。
+// 多节点各画一条线会让图例溢出分享页窄栏，故分享页刻意不叠加按节点细线（节点明细见下方表格）。
 // 网格/轴/label/提示框属中立色，随主题走（echarts 吃不到 CSS 变量，切主题时重读一次）
 const { theme } = useTheme()
 const CH = reactive({ ...readChartTheme() })
 watch(theme, () => Object.assign(CH, readChartTheme()))
-// 多节点叠加的配色：前三位跟 --chart-cyan/yellow/green 同值（数组是模块级常量，没法响应主题，只能写死），
-// 后五位沿用最初的原版装饰色（#c678dd/#ff9f43/#4ec9b0/#e06c75/#569cd6），不再做浅色处理
-const NODE_COLORS = ['#3aaeff', '#ffc61a', '#25d07c', '#c678dd', '#ff9f43', '#4ec9b0', '#e06c75', '#569cd6']
+
 const toPts = (series) => (series || [])
   .map((s) => {
     const t = new Date(s.time).getTime()
@@ -115,40 +119,25 @@ const toPts = (series) => (series || [])
   })
   .filter(Boolean)
 function curveOption(t) {
-  const nodeSeries = t.nodeSeries || []
-  const useNodes = nodeSeries.length > 1
-  const series = []
-  if (useNodes) {
-    nodeSeries.forEach((n, i) => {
-      series.push({
-        name: n.nodeId, type: 'line', showSymbol: false, connectNulls: false,
-        color: NODE_COLORS[i % NODE_COLORS.length],
-        lineStyle: { width: 1.5 },
-        data: toPts(n.series),
-      })
-    })
-  }
-  // 平均线恒显示（加粗、置于最上层作参考线），与按节点细线同图
-  series.push({
+  // 分享页只画"平均延迟"一条线（避免多节点图例溢出）；失败轮次以红菱形标在同图顶部。
+  const series = [{
     name: '平均延迟', type: 'line', showSymbol: false, connectNulls: false,
     color: CH.cyan, lineStyle: { width: 2.5 }, areaStyle: { opacity: 0.08 },
     data: toPts(t.series),
-  })
+  }]
   const dots = (t.series || [])
     .map((s) => {
-      const t = new Date(s.time).getTime()
-      return Number.isNaN(t) || !(s.down > 0) ? null : [t, 0.9]
+      const tm = new Date(s.time).getTime()
+      return Number.isNaN(tm) || !(s.down > 0) ? null : [tm, 0.9]
     })
     .filter(Boolean)
   return {
-    color: useNodes ? [CH.cyan, ...NODE_COLORS] : [CH.cyan],
-    legend: useNodes ? { top: 0, textStyle: { color: CH.label, fontSize: 10 }, itemWidth: 14 } : undefined,
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'line' },
       backgroundColor: CH.tipBg, borderColor: CH.tipBorder, textStyle: { color: CH.tipText },
       valueFormatter: (v) => (typeof v === 'number' ? v + ' ms' : '无'),
     },
-    grid: { left: 56, right: 16, top: useNodes ? 30 : 18, bottom: 28 },
+    grid: { left: 56, right: 16, top: 18, bottom: 28 },
     xAxis: { type: 'time', axisLine: { lineStyle: { color: CH.axis } }, axisLabel: { color: CH.label, hideOverlap: true }, splitLine: { lineStyle: { color: CH.grid } } },
     yAxis: [
       { type: 'value', name: 'ms', axisLine: { lineStyle: { color: CH.axis } }, axisLabel: { color: CH.label }, splitLine: { lineStyle: { color: CH.grid } } },
@@ -183,11 +172,11 @@ onMounted(() => {
 })
 onBeforeUnmount(() => timer && clearInterval(timer))
 
-// 快捷换统计窗口：winBusy 期间禁用按钮，避免连点堆一串请求（30s 自动刷新不受影响）
+// 快捷换统计窗口：winBusy 期间禁用选择器，避免连点堆一串请求（30s 自动刷新不受影响）
 const winBusy = ref(false)
-async function setHours(v) {
-  if (winBusy.value || v === hours.value) return
-  hours.value = v
+async function onRange(v) {
+  if (winBusy.value || v.key === range.value.key) return
+  range.value = v
   winBusy.value = true
   try {
     await load()

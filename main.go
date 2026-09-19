@@ -26,7 +26,8 @@ type apiInfo struct {
 	Label string `json:"label"`
 	ID    string `json:"id"`
 	URL   string `json:"url"`
-	WS    wsFlag `json:"ws"` // 是否经 WS 通道通信（缺省 false = HTTP）；支持 "ws": true 或 "ws": "true"
+	WS    wsFlag `json:"ws"`    // 是否经 WS 通道通信（缺省 false = HTTP）；支持 "ws": true 或 "ws": "true"
+	Stack string `json:"stack"` // 节点栈分组 DualStack/IPv4/IPv6（节点池定义载入，任务派发按栈过滤用）
 }
 
 // wsFlag 兼容 JSON 布尔与字符串两种写法

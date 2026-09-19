@@ -345,6 +345,7 @@ func registerAdminRoutes(router *gin.Engine) {
 		}
 		type nodeAgg struct {
 			NodeID       string `json:"nodeId"`
+			Label        string `json:"label"`
 			Total        int64  `json:"total"`
 			Errors       int64  `json:"errors"`
 			LatencySumMs int64  `json:"latencySumMs"`
@@ -382,6 +383,14 @@ func registerAdminRoutes(router *gin.Engine) {
 			return
 		}
 
+		// 补节点名：池 label 优先（UUID 无语义，前端直接展示 label）
+		lm := poolLabelMap()
+		for i := range byNode {
+			byNode[i].Label = lm[byNode[i].NodeID]
+		}
+		for i := range allNodes {
+			allNodes[i].Label = lm[allNodes[i].NodeID]
+		}
 		selected := nodes
 		if selected == nil {
 			selected = []string{}

@@ -80,7 +80,8 @@ func batchProbeHandler(c *gin.Context) {
 	}
 
 	// 控制台手动一键拨测落库（source=biz，归明细页"业务拨测"）。
-	// 只落拨测类（isProbeType，对齐上报明细语义）；whois/dnssec/location/asn 等诊断类不进明细表。
+	// 只落拨测类（isProbeType，对齐上报明细语义）；whois/dnssec 等诊断类不进明细表，
+	// 但 location/asn 已纳入 isProbeType 白名单、会进明细表（以 store.go 白名单为准）。
 	// 记录发起者 uid：用户据此在明细页看到"我的拨测历史"（静态 token 为 0，无归属）。
 	persisted := persistManualProbes(apiType, raw, results, uid)
 

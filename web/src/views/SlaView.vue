@@ -123,7 +123,7 @@
             </tr></thead>
             <tbody>
               <tr v-for="n in tk.sla.byNode" :key="n.nodeId">
-                <td class="mono nowrap">{{ n.nodeId }}</td>
+                <td class="mono nowrap" :title="n.nodeId">{{ n.label || n.nodeId }}</td>
                 <td><span class="dot" :class="n.nodeOnline === false ? 'offline' : 'online'"></span></td>
                 <td class="mono" :class="upTone(n.availability)">{{ fmtPct(n.availability) }}</td>
                 <td class="mono"><span class="ok-200">{{ n.up }}</span>/<span class="err">{{ n.down }}</span><span v-if="n.invalid" class="dim" :title="'无法判定的样本数'"> · {{ n.invalid }} 不明</span></td>
@@ -706,11 +706,11 @@ async function toggleCompare(t) {
   }
   compareMap.value = { ...compareMap.value, [t.id]: { loading: true, nodes: [] } }
   const card = taskCards.value.find((c) => c.task.id === t.id)
-  const nodeList = (card?.sla?.byNode || []).slice(0, 8).map((n) => n.nodeId)
+  const nodeInfos = (card?.sla?.byNode || []).slice(0, 8).map((n) => ({ id: n.nodeId, name: n.label || n.nodeId }))
   const nodes = (await Promise.all(
-    nodeList.map((n) => fetchTaskSeries(t.id, winQS.value, n).catch(() => null)),
+    nodeInfos.map((n) => fetchTaskSeries(t.id, winQS.value, n.id).catch(() => null)),
   ))
-    .map((s, i) => (s ? { nodeId: nodeList[i], series: s.series || [] } : null))
+    .map((s, i) => (s ? { nodeId: nodeInfos[i].id, name: nodeInfos[i].name, series: s.series || [] } : null))
     .filter(Boolean)
   compareMap.value = { ...compareMap.value, [t.id]: { loading: false, nodes } }
 }
@@ -730,7 +730,7 @@ function nodeCompareOption(taskId) {
     xAxis: { type: 'time', ...chartAxis, axisLabel: { ...chartAxis.axisLabel, formatter: (v) => bucketLabel(v), hideOverlap: true } },
     yAxis: { type: 'value', ...chartAxis, axisLabel: { ...chartAxis.axisLabel, formatter: '{value} ms' } },
     series: nodes.map((n) => ({
-      name: n.nodeId, type: 'line', showSymbol: false,
+      name: n.name || n.nodeId, type: 'line', showSymbol: false,
       data: (n.series || [])
         .map((s) => {
           const t = bucketMs(s.time)

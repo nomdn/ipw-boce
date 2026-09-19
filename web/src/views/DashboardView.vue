@@ -44,7 +44,7 @@
             :title="`${n.nodeId} · 窗口内 ${num(n.total)} 次请求`">
             <input type="checkbox" :value="n.nodeId" v-model="pickedNodes" />
             <span class="dot" :class="pickedNodes.includes(n.nodeId) ? 'online' : 'offline'"></span>
-            <span>{{ n.nodeId }}</span>
+            <span :title="n.nodeId">{{ n.label || n.nodeId }}</span>
             <span class="dim">{{ num(n.total) }}</span>
           </label>
           <span v-if="!allNodes.length" class="dim">当前窗口内还没有任何节点上报</span>
@@ -331,11 +331,11 @@ const typeOption = computed(() => ({
 const nodeOption = computed(() => ({
   color: [C.bar], tooltip: { trigger: 'axis', ...tooltipBase },
   grid: { left: 56, right: 16, top: 12, bottom: 26 },
-  xAxis: { type: 'category', data: byNode.value.map((x) => shortNode(x.nodeId)), ...axis, axisLabel: { ...axis.axisLabel, interval: 0 } },
+  xAxis: { type: 'category', data: byNode.value.map((x) => shortNode(x.label || x.nodeId)), ...axis, axisLabel: { ...axis.axisLabel, interval: 0 } },
   yAxis: { type: 'value', minInterval: 1, ...axis },
   series: [{ type: 'bar', barMaxWidth: 28, data: byNode.value.map((x) => x.total), itemStyle: { color: C.bar, borderRadius: [4, 4, 0, 0] } }],
 }))
-function shortNode(id) { return (id || '').length > 12 ? id.slice(0, 12) + '…' : id }
+function shortNode(id) { return (id || '').length > 16 ? id.slice(0, 16) + '…' : id }
 
 // ================= user：我的任务报告 =================
 const myTasks = ref([])

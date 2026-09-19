@@ -112,7 +112,12 @@ func sugarTaskEntry(t *ProbeTask, hours float64) (gin.H, error) {
 					nrows = append(nrows, r)
 				}
 			}
-			nodeSeries = append(nodeSeries, gin.H{"nodeId": nid, "series": rowsToRoundSeries(t, nrows)})
+			// 曲线图例显示节点名：池 label 优先，UUID 兜底
+			name := nid
+			if st := findNode(nodePoolForType(t.APIType), nid); st != nil && st.Label != "" {
+				name = st.Label
+			}
+			nodeSeries = append(nodeSeries, gin.H{"nodeId": nid, "label": name, "series": rowsToRoundSeries(t, nrows)})
 		}
 		if len(nodeSeries) > 1 {
 			e["nodeSeries"] = nodeSeries // 单节点任务不给（与自身曲线重复）

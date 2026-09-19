@@ -21,7 +21,7 @@
           <label>节点</label>
           <select class="ak-select" v-model="f.node">
             <option value="">全部</option>
-            <option v-for="n in knownNodes" :key="n" :value="n">{{ n }}</option>
+            <option v-for="n in knownNodes" :key="n" :value="n">{{ nodeLabels[n] || n }}</option>
           </select>
         </div>
         <div class="form-field">
@@ -67,7 +67,7 @@
           <tbody>
             <tr v-for="(p, i) in probes" :key="rowKey(p, i)">
               <td class="mono nowrap">{{ fmtTime(p.createdAt) }}</td>
-              <td class="mono nowrap">{{ p.nodeId }}</td>
+              <td class="mono nowrap" :title="p.nodeId">{{ nodeLabels[p.nodeId] || p.nodeId }}</td>
               <td><span class="ak-tag ch">{{ apiLabel(p.apiType) }}</span></td>
               <td>
                 <span v-if="parseRow(p).kind" class="ak-tag ch kind">{{ parseRow(p).kind }}</span>
@@ -110,6 +110,7 @@ const rangeOpts = [
 const f = reactive({ range: 'all', node: '', type: '', target: '', limit: 100 })
 const probes = ref([])
 const knownNodes = ref([])
+const nodeLabels = ref({}) // nodeId -> label（节点简表，展示用）
 const loading = ref(false)
 const error = ref('')
 const exporting = ref(false)
@@ -150,7 +151,11 @@ const srcClass = (s) => {
 onMounted(async () => {
   load()
   // 节点过滤下拉数据源：节点简表（admin/user 都可访问；完整节点快照是 admin-only）
-  try { knownNodes.value = (await fetchNodesBrief()).map((n) => n.nodeId) } catch { /* 忽略 */ }
+  try { 
+    const brief = await fetchNodesBrief()
+    knownNodes.value = brief.map((n) => n.nodeId)
+    nodeLabels.value = Object.fromEntries(brief.filter((n) => n.label).map((n) => [n.nodeId, n.label]))
+  } catch { /* 忽略 */ }
 })
 
 function switchCat(v) {

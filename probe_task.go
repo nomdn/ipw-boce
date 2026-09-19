@@ -187,6 +187,14 @@ func (s *dataStore) runTaskSamples(t *ProbeTask) {
 		targets = pool
 	}
 
+	// 栈不匹配的节点不参与本轮：双栈任务只派双栈节点，单栈任务派双栈+对应栈节点
+	//（缺栈节点参与只会产出无意义的 down 样本，见 filterStackEligible）
+	targets = filterStackEligible(t, targets)
+	if len(targets) == 0 {
+		log.Printf("[sched] task#%d %s: no stack-eligible nodes, skip this round", t.ID, t.Name)
+		return
+	}
+
 	// 掉线节点不参与本轮拨测：只保留 nodes 表里在线(online=true)的节点。
 	// 在线状态来源与节点状态页一致（WS 版随注册/断开即时更新，HTTP 版由看门狗探活维护），
 	// 避免对已掉线节点每轮干等超时并产出无意义的 down 样本。
@@ -344,6 +352,47 @@ func filterOnline(targets []apiInfo) []apiInfo {
 	}
 	if len(dropped) > 0 {
 		log.Printf("[sched] skip offline nodes: %v", dropped)
+	}
+	return kept
+}
+
+// filterStackEligible 按任务的栈要求筛掉栈不匹配的节点（节点栈来自 node_defs.stack，空值/未知按双栈）：
+//   - RequireAllStacks（双栈拨测，v4+v6 都要命中）：只派 DualStack 节点——单栈节点缺栈必挂，
+//     参与只会产出无意义的 down 样本；
+//   - speed 单栈（Stack=v4/v6，缺省 v4，与 normalizeTaskRaw 的缺省前缀一致）：派 DualStack + 对应栈节点；
+//   - 其余（判定为任一栈通即可）：双栈与两种单栈节点都可参与。
+func filterStackEligible(t *ProbeTask, targets []apiInfo) []apiInfo {
+	if len(targets) == 0 {
+		return targets
+	}
+	var want map[string]bool // 允许参与的节点栈集合；nil = 不限制
+	switch {
+	case t.RequireAllStacks:
+		want = map[string]bool{stackDualStack: true}
+	case t.APIType == "speed":
+		st := t.Stack
+		if st != stackIPv4 && st != stackIPv6 {
+			st = stackIPv4
+		}
+		want = map[string]bool{stackDualStack: true, st: true}
+	default:
+		return targets
+	}
+	kept := make([]apiInfo, 0, len(targets))
+	var dropped []string
+	for _, n := range targets {
+		st := n.Stack
+		if st != stackIPv4 && st != stackIPv6 {
+			st = stackDualStack
+		}
+		if want[st] {
+			kept = append(kept, n)
+		} else {
+			dropped = append(dropped, n.ID)
+		}
+	}
+	if len(dropped) > 0 {
+		log.Printf("[sched] task#%d %s: skip stack-mismatch nodes: %v", t.ID, t.Name, dropped)
 	}
 	return kept
 }

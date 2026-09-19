@@ -19,8 +19,8 @@
     <div class="node-wall">
       <div v-for="n in nodes" :key="n.nodeId" class="node-card" :class="{ online: n.online }">
         <div class="node-head" style="display:flex;justify-content:space-between;align-items:center">
-          <span class="node-id">
-            <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.nodeId }}
+          <span class="node-id" :title="n.nodeId">
+            <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.label || n.nodeId }}
           </span>
           <span class="ak-tag ch" :class="n.online ? 'ak-tag--advanced' : 'ak-tag--neutral'">
             {{ n.online ? '在线' : '离线' }}

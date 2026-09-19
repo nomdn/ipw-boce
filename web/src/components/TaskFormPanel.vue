@@ -64,8 +64,7 @@
           <div class="node-picks">
             <label v-for="n in nodes" :key="n.nodeId" class="node-pick" :title="n.version ? '版本 ' + n.version : '未上报版本'">
               <input type="checkbox" :value="n.nodeId" v-model="picked" />
-              <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.nodeId }}
-              <span v-if="n.label" class="dim">{{ n.label }}</span>
+              <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.label || n.nodeId }}
             </label>
             <span v-if="!nodes || !nodes.length" class="dim">暂无可用节点</span>
           </div>

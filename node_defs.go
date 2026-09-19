@@ -76,6 +76,23 @@ func locationPoolSnapshot() []apiInfo {
 	return out
 }
 
+// poolLabelMap 节点 id → 池 label（两池合并；不在池内的节点无 label）。
+// 展示口径：界面节点名一律 label 优先，UUID 仅作兜底/悬浮提示。
+func poolLabelMap() map[string]string {
+	m := map[string]string{}
+	for _, n := range apiPoolSnapshot() {
+		if n.Label != "" {
+			m[n.ID] = n.Label
+		}
+	}
+	for _, n := range locationPoolSnapshot() {
+		if n.Label != "" {
+			m[n.ID] = n.Label
+		}
+	}
+	return m
+}
+
 // loadNodePoolsFromDB 进程启动时用数据库节点定义重建节点池（库未就绪则沿用 setting.json）
 func loadNodePoolsFromDB() {
 	if db == nil {
@@ -129,6 +146,7 @@ func applyNodeDefs(rows []NodeDef) {
 			ID:    row.NodeID,
 			URL:   strings.TrimSpace(row.URL),
 			WS:    wsFlag(row.WS),
+			Stack: row.Stack, // DualStack / IPv4 / IPv6（任务派发按栈过滤用）
 		}
 		// 双归属节点可同时进两个池，转发时按 apiType 选池
 		if inLocation {
