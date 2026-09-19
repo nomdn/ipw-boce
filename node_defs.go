@@ -551,12 +551,32 @@ func registerNodeDefRoutes(group *gin.RouterGroup) {
 		}
 		ctx, cancel := dbCtx()
 		defer cancel()
+		// 先取 nodeId（只取这一列，避免整行 Scan 被无关列的类型问题卡住）：
+		// 删除的语义是"不要这个节点"，快照级联清理要用它
+		var nodeIDs []string
+		if err := db.WithContext(ctx).Model(&NodeDef{}).Where("id = ?", id).
+			Pluck("node_id", &nodeIDs).Error; err != nil {
+			log.Printf("[node-defs] WARN lookup node_id before delete(id=%d): %v", id, err)
+		}
+		nodeID := ""
+		if len(nodeIDs) > 0 {
+			nodeID = nodeIDs[0]
+		}
 		res := db.WithContext(ctx).Where("id = ?", id).Delete(&NodeDef{})
 		if res.Error != nil {
 			apiError(c, http.StatusInternalServerError, res.Error.Error())
 			return
 		}
-		applyPoolChange(c, "")
+		applyPoolChange(c, nodeID)
+		// 级联清掉状态页快照（nodes 表），否则残留一条冻结的"假在线"；
+		// node_events 历史保留。若节点仍以 WS 在线，重连注册会重建快照（它确实还连着，属真实状态）。
+		if res.RowsAffected > 0 && nodeID != "" {
+			if existed, derr := deleteNodeRecord(nodeID); derr != nil {
+				log.Printf("[node-defs] WARN purge node snapshot(%s): %v", nodeID, derr)
+			} else if existed {
+				log.Printf("[node-defs] node %s snapshot purged with definition", nodeID)
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{"id": id, "deleted": res.RowsAffected > 0})
 	})
 }

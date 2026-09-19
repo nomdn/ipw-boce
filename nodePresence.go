@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"strings"
 	"time"
@@ -96,4 +97,20 @@ func nodeWasOffline(nodeID string) bool {
 		return true
 	}
 	return n.ID == 0 || !n.Online
+}
+
+// deleteNodeRecord 从 nodes 表删除该节点的在线快照行（节点从池里移除后清理状态页残留）。
+// 只删快照行，node_events 历史保留；若节点仍在池内，看门狗下次探活会重新写回（属预期）。
+// 返回行是否存在。
+func deleteNodeRecord(nodeID string) (bool, error) {
+	if db == nil {
+		return false, errors.New("db not ready")
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	res := db.WithContext(ctx).Where("node_id = ?", nodeID).Delete(&Node{})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }

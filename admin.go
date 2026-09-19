@@ -268,6 +268,27 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, events)
 	})
 
+	// 删除节点快照（admin only）：节点从池里移除后清掉状态页残留（nodes 表与 node_defs 是两套）。
+	// 只删快照行，node_events 历史保留；若节点仍在池内，看门狗下次探活会重新写回（属预期）。
+	restricted.DELETE("/nodes/:nodeId", func(c *gin.Context) {
+		id := c.Param("nodeId")
+		if strings.TrimSpace(id) == "" || id == "global" {
+			apiError(c, http.StatusBadRequest, "invalid node id")
+			return
+		}
+		existed, err := deleteNodeRecord(id)
+		if err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !existed {
+			apiError(c, http.StatusNotFound, "node not found")
+			return
+		}
+		refreshWatchedNodes()
+		c.JSON(http.StatusOK, gin.H{"deleted": id})
+	})
+
 	// 节点简表（登录即可，含 user）：任务表单"指定节点"勾选数据源。
 	// 脱敏：只给池内节点的基本信息与在线/版本，不给远端地址/上游 URL（那是 admin 视角）。
 	// 构建逻辑与 /api/v1/nodes 共用（见 rest.go nodeBriefItems）。
