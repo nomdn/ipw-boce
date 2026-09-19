@@ -79,7 +79,8 @@
         <section class="panel">
           <h2 class="panel-title">Webhook 通知</h2>
           <p class="dim" style="margin:0 0 10px;font-size:.78rem">
-            配置后，你的 SLA 任务掉线告警会同时推送到该地址（邮件/站内信照发）。
+            配置后，你的 SLA 任务掉线与恢复通知会同时推送到该地址（邮件 / 站内信照发）。
+            管理员账号还会收到服务节点的掉线与恢复上线通知（普通账号只收自己的任务告警）。
             格式按接收端选择：企业微信/钉钉群机器人选 WeCom，飞书自定义机器人选飞书，自建服务选通用。
           </p>
           <div class="form-field" style="margin-bottom:10px">
@@ -132,7 +133,7 @@
           <div v-if="tokenMsg" :class="tokenErr ? 'err' : 'ok-200'" style="margin-top:8px;font-size:.8rem">{{ tokenMsg }}</div>
           <div class="form-field" style="margin-top:12px">
             <label>调用示例</label>
-            <pre class="mono" style="margin:0;padding:8px 10px;background:rgba(132,131,131,.1);font-size:.72rem;overflow:auto">curl -H "Authorization: Bearer &lt;你的Token&gt;" \
+            <pre class="mono" style="margin:0;padding:8px 10px;background:var(--ui-tint-ghost);font-size:.72rem;overflow:auto">curl -H "Authorization: Bearer &lt;你的Token&gt;" \
   {{ apiBase }}/admin/tasks</pre>
           </div>
         </section>
@@ -444,15 +445,15 @@ async function changePw() {
 .verify-panel { grid-column: 1 / -1; }
 /* 我的用量 KPI（复用 SLA 页同款配色变量） */
 .usage-kpis { display: flex; gap: 10px; flex-wrap: wrap; }
-.usage-kpis .kpi { border: var(--ak-line-hairline) solid rgba(255,255,255,.08); padding: 8px 14px; min-width: 96px; }
+.usage-kpis .kpi { border: var(--ak-line-hairline) solid var(--ui-line); padding: 8px 14px; min-width: 96px; }
 .usage-kpis .kpi .k { font-size: .68rem; color: var(--ak-text-secondary); margin-bottom: 3px; }
 .usage-kpis .kpi .v { font-size: 1rem; font-weight: 600; }
 .usage-kpis .kpi.ok .v { color: var(--ak-signal-success); }
 .usage-kpis .kpi.bad .v { color: var(--ak-signal-danger); }
 .token-box {
   display: flex; align-items: center; gap: 10px; max-width: 560px;
-  padding: 8px 12px; background: rgba(74, 171, 234, .1);
-  border: 1px solid rgba(74, 171, 234, .35); border-radius: 4px;
+  padding: 8px 12px; background: color-mix(in srgb, var(--ak-signal-info) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ak-signal-info) 38%, transparent); border-radius: 4px;
   font-size: .78rem; word-break: break-all;
 }
 </style>

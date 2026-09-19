@@ -19,7 +19,7 @@ import (
 // registerTaskMineSeriesRoutes 挂到 /admin 组（admin.go 中调用）。
 func registerTaskMineSeriesRoutes(g *gin.RouterGroup) {
 	g.GET("/tasks/mine/series", func(c *gin.Context) {
-		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
+		tr := parseTimeRange(c, 24)
 		uid, role, _ := currentUserFromCtx(c)
 
 		ctx, cancel := dbCtx()
@@ -48,21 +48,18 @@ func registerTaskMineSeriesRoutes(g *gin.RouterGroup) {
 			return
 		}
 
-		to := time.Now().UTC()
-		from := to.Add(-time.Duration(hours*float64(time.Hour)))
-
 		// 2) 拉取这些任务窗口内的全部定时样本
 		var rows []ProbeResult
 		if err := db.WithContext(ctx).
 			Where("task_id IN ? AND source = ? AND created_at >= ? AND created_at <= ?",
-				ids, sourceSched, from, to).
+				ids, sourceSched, tr.From, tr.To).
 			Order("created_at asc, id asc").Find(&rows).Error; err != nil {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
 
 		// 3) 分桶粒度：窗口越大桶越粗，控制曲线点数（约 ≤240 点）
-		stepMin := stepForWindow(hours)
+		stepMin := stepForWindow(tr.Hours)
 		series := rowsToSeries(taskByID, rows, stepMin)
 		c.JSON(http.StatusOK, gin.H{"stepMinutes": stepMin, "series": series})
 	})
@@ -158,25 +155,17 @@ func stepForWindow(hours float64) int {
 // 每个点 = 一轮，多节点延迟在该点内取平均（不跨轮平均、也不按节点拆线），让曲线贴近逐次真实走势。
 //
 // 判定沿用 evalSample：invalid 不计可用率分母也不进 avg 分母；samples=该轮样本数（含 invalid）。
-// 返回每轮元素 { time, minute, samples, up, down, availability(%), avgMs }。
+// 返回每轮元素 { time, minute, samples, up, down, availability(%), avgMs }；
+// 点数超过 maxRoundPoints 时相邻若干轮会合并成一个点（该点额外带 rounds 字段）。
 func rowsToRoundSeries(t *ProbeTask, rows []ProbeResult) []gin.H {
-	type round struct {
-		at     time.Time // 该轮 CreatedAt（按秒取整）
-		samples int64
-		valid   int64
-		up      int64
-		down    int64
-		sumMs   int64
-		nLat    int64
-	}
-	agg := map[int64]*round{}
+	agg := map[int64]*roundAgg{}
 	var keys []int64 // 保序
 	for _, r := range rows {
 		at := r.CreatedAt.Round(time.Second).UTC()
 		k := at.Unix()
 		g := agg[k]
 		if g == nil {
-			g = &round{at: at}
+			g = &roundAgg{at: at}
 			agg[k] = g
 			keys = append(keys, k)
 		}
@@ -196,26 +185,74 @@ func rowsToRoundSeries(t *ProbeTask, rows []ProbeResult) []gin.H {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
-	series := make([]gin.H, 0, len(keys))
+	list := make([]*roundAgg, 0, len(keys))
 	for _, k := range keys {
-		g := agg[k]
-		avail := 0.0
-		if g.valid > 0 {
-			avail = math.Round(float64(g.up)/float64(g.valid)*10000) / 100
+		list = append(list, agg[k])
+	}
+
+	// 点数超限 → 相邻轮次等份合并（每个点 = merge 轮）：各计数直接累加，延迟按可达样本
+	// 加权求和后再平均。**含失败的轮不会被单独丢掉** —— down 照旧累加，红标仍落在合并点上，
+	// 只是从"每点 = 一轮"变成"每点 = 一组轮"。
+	merge := 1
+	if len(list) > maxRoundPoints {
+		merge = (len(list) + maxRoundPoints - 1) / maxRoundPoints
+	}
+	series := make([]gin.H, 0, (len(list)+merge-1)/merge)
+	for i := 0; i < len(list); i += merge {
+		end := i + merge
+		if end > len(list) {
+			end = len(list)
 		}
-		avgMs := 0.0
-		if g.nLat > 0 {
-			avgMs = math.Round(float64(g.sumMs)/float64(g.nLat)*10) / 10
+		acc := &roundAgg{at: list[i].at}
+		for _, x := range list[i:end] {
+			acc.samples += x.samples
+			acc.valid += x.valid
+			acc.up += x.up
+			acc.down += x.down
+			acc.sumMs += x.sumMs
+			acc.nLat += x.nLat
 		}
-		series = append(series, gin.H{
-			"time":         g.at.Format(time.RFC3339),
-			"minute":       k / 60,
-			"samples":      g.samples,
-			"up":           g.up,
-			"down":         g.down,
-			"availability": avail, // %
-			"avgMs":        avgMs,
-		})
+		series = append(series, roundToJSON(acc, end-i))
 	}
 	return series
+}
+
+// maxRoundPoints 单条曲线返回的最大点数。窗口放宽到 7/30/90 天后，节点每 10s 一轮会产生
+// 几万个点（JSON 数 MB、前端画不动），超出即按"多轮合并成一个点"降采样。
+const maxRoundPoints = 1500
+
+// roundAgg 一轮采样的聚合：多节点在该轮内取平均（不跨轮平均、也不按节点拆线）。
+type roundAgg struct {
+	at      time.Time
+	samples int64 // 该轮全部样本（含 invalid）
+	valid   int64 // 有明确 up/down 判定（可用率分母）
+	up      int64
+	down    int64
+	sumMs   int64 // 可达样本延迟总和
+	nLat    int64
+}
+
+// roundToJSON 单个（或合并后的）轮次组 → 曲线点。rounds > 1 表示该点由多轮合并而来。
+func roundToJSON(g *roundAgg, rounds int) gin.H {
+	avail := 0.0
+	if g.valid > 0 {
+		avail = math.Round(float64(g.up)/float64(g.valid)*10000) / 100
+	}
+	avgMs := 0.0
+	if g.nLat > 0 {
+		avgMs = math.Round(float64(g.sumMs)/float64(g.nLat)*10) / 10
+	}
+	h := gin.H{
+		"time":         g.at.Format(time.RFC3339),
+		"minute":       g.at.Unix() / 60,
+		"samples":      g.samples,
+		"up":           g.up,
+		"down":         g.down,
+		"availability": avail, // %
+		"avgMs":        avgMs,
+	}
+	if rounds > 1 {
+		h["rounds"] = rounds
+	}
+	return h
 }

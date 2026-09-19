@@ -1,5 +1,5 @@
 // ==================== ipw-boce /admin 接口封装 ====================
-import { http } from './http.js'
+import { http, downloadFile } from './http.js'
 
 // 服务状态
 export const fetchStatus = () => http.get('/admin/status')
@@ -17,6 +17,24 @@ export const submitVerifyCode = (code) => http.post('/admin/me/verify', { code }
 export const fetchNodes = () => http.get('/admin/nodes')
 export const fetchNodeEvents = (nodeId, limit = 100) =>
   http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/events?limit=${limit}`)
+// 节点可用率（由 node_events 事件流还原离线区间算得，见 node_uptime.go）
+// 列表：全部节点（不含逐日明细）；detail：单节点（含 daily 供趋势图）
+export const fetchNodesUptime = (days = 7) => http.get(`/admin/nodes/uptime?days=${days}`)
+export const fetchNodeUptime = (nodeId, days = 7) =>
+  http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/uptime?days=${days}`)
+// 节点事件历史导出 CSV（浏览器直接下载，带鉴权头）
+export const exportNodeEvents = (nodeId, days = 30) =>
+  downloadFile(
+    `/admin/nodes/${encodeURIComponent(nodeId)}/events/export?days=${days}`,
+    `node-events-${nodeId}.csv`,
+  )
+
+// ===== 计划维护窗口（节点告警免打扰，见 maintenance.go）=====
+// 只屏蔽通知、不屏蔽事实：事件流/状态页/可用率统计不受影响
+export const fetchMaintenance = () => http.get('/admin/maintenance')
+// { scope?, startAt, endAt, repeatDaily?, reason? }；scope 空 = 全部节点
+export const createMaintenance = (w) => http.post('/admin/maintenance', w)
+export const deleteMaintenance = (id) => http.del(`/admin/maintenance/${id}`)
 // 节点简表（登录即可，脱敏：池内节点 + 在线/版本，无远端地址）——任务表单"指定节点"勾选用
 export const fetchNodesBrief = () => http.get('/admin/nodes/brief')
 
@@ -28,19 +46,41 @@ export const testMyWebhook = () => http.post('/admin/me/webhook/test')
 export const createMyToken = () => http.post('/admin/me/token')
 export const revokeMyToken = () => http.del('/admin/me/token')
 
-// 统计
-export const fetchStatsSummary = (hours = 24) => http.get(`/admin/stats/summary?hours=${hours}`)
-export const fetchStatsTimeseries = (hours = 24) => http.get(`/admin/stats/timeseries?hours=${hours}`)
+// 统计（nodes 为节点 ID 数组，空/不传 = 全部节点）
+const nodesQS = (nodes) => (nodes && nodes.length ? `&nodes=${encodeURIComponent(nodes.join(','))}` : '')
+// 时间窗口参数：数字 = 相对窗口（hours=N，终点恒为“现在”）；
+// 字符串 = 原样拼接（start=/end= 绝对区间，见 utils/timeRange.js 与后端 timerange.go）。
+const winQ = (w, def = 24) => (typeof w === 'string' ? w : `hours=${w ?? def}`)
+export const fetchStatsSummary = (w = 24, nodes = []) =>
+  http.get(`/admin/stats/summary?${winQ(w)}${nodesQS(nodes)}`)
+export const fetchStatsTimeseries = (w = 24, nodes = []) =>
+  http.get(`/admin/stats/timeseries?${winQ(w)}${nodesQS(nodes)}`)
+// 数据可用范围：{ now, earliest, maxDays, retention }——时间范围选择器据此裁剪预设清单
+export const fetchTimeRange = () => http.get('/admin/stats/range')
 
 // 拨测明细（cat：sched=定时拨测 / biz=业务拨测）
-export const fetchProbes = ({ node, type, cat, since, limit = 100 } = {}) => {
+export const fetchProbes = ({ node, type, cat, since, target, limit = 100 } = {}) => {
   const q = new URLSearchParams()
   if (node) q.set('node', node)
   if (type) q.set('type', type)
   if (cat) q.set('cat', cat)
   if (since) q.set('since', since)
+  if (target) q.set('target', target)
   q.set('limit', limit)
   return http.get(`/admin/probes?${q.toString()}`)
+}
+
+// 拨测明细导出 CSV：参数与列表完全一致（含权限范围），只是改为下载
+export const exportProbes = ({ node, type, cat, since, target, limit } = {}) => {
+  const q = new URLSearchParams()
+  if (node) q.set('node', node)
+  if (type) q.set('type', type)
+  if (cat) q.set('cat', cat)
+  if (since) q.set('since', since)
+  if (target) q.set('target', target)
+  if (limit) q.set('limit', limit)
+  const qs = q.toString()
+  return downloadFile(`/admin/probes/export${qs ? `?${qs}` : ''}`, 'probes.csv')
 }
 
 // 一键拨测（批量）
@@ -90,18 +130,24 @@ export const updateTask = (id, t) => http.put(`/admin/tasks/${id}`, t)
 export const setTaskEnabled = (id, enabled) => http.patch(`/admin/tasks/${id}/enabled`, { enabled })
 export const deleteTask = (id) => http.del(`/admin/tasks/${id}`)
 // SLA 聚合：某任务在窗口内的可用率/延迟/错误率 + 最新样本特殊字段
-export const fetchTaskSla = (id, hours = 24) => http.get(`/admin/tasks/${id}/sla?hours=${hours}`)
+export const fetchTaskSla = (id, w = 24) => http.get(`/admin/tasks/${id}/sla?${winQ(w)}`)
 // 某任务的时序曲线（SLA 卡片延迟图）：{taskId,stepMinutes,series:[{time,samples,up,down,availability,avgMs}]}
 // node 传节点 id 时只返回该节点的曲线（多节点对比视图逐节点拉取叠加）
-export const fetchTaskSeries = (id, hours = 24, node = '') =>
-  http.get(`/admin/tasks/${id}/series?hours=${hours}${node ? `&node=${encodeURIComponent(node)}` : ''}`)
+export const fetchTaskSeries = (id, w = 24, node = '') =>
+  http.get(`/admin/tasks/${id}/series?${winQ(w)}${node ? `&node=${encodeURIComponent(node)}` : ''}`)
+// 曲线导出 CSV（同参数、同归属校验）
+export const exportTaskSeries = (id, w = 24, node = '') =>
+  downloadFile(
+    `/admin/tasks/${id}/series/export?${winQ(w)}${node ? `&node=${encodeURIComponent(node)}` : ''}`,
+    `sla-task-${id}.csv`,
+  )
 // 公开状态页分享（B3）：分享码即分享组——多选任务共用一个分享码；支持自定义分享码
 // shareTasks([ids], token?)：token 缺省随机 6 位 hex
 export const shareTasks = (ids, token) =>
   http.post('/admin/tasks/share', { ids, token: token || undefined })
 export const unshareTasks = (ids) => http.del('/admin/tasks/share', { ids })
 // 我的定时任务时序（当前用户自己任务 source=sched 分桶）：{stepMinutes, series:[...]}
-export const fetchMineSeries = (hours = 24) => http.get(`/admin/tasks/mine/series?hours=${hours}`)
+export const fetchMineSeries = (w = 24) => http.get(`/admin/tasks/mine/series?${winQ(w)}`)
 
 // ===== 上游节点池（数据库托管，仅 admin）=====
 // 节点定义列表（含停用）

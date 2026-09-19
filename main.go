@@ -83,6 +83,9 @@ type alertConfig struct {
 	Enabled       bool   `json:"enabled"`       // 总开关
 	To            string `json:"to"`            // 保留兼容字段，已不再作为收件人：告警按任务 owner 送达（见 alert.go）
 	DownThreshold int    `json:"downThreshold"` // 连续 N 轮任务全 down 才告警（缺省 3）
+	// BatchSeconds 节点告警的批次汇总窗口（秒，见 alert_batch.go）：窗口内多个节点同时掉线/恢复
+	// 合并成一条通知，避免中心侧抖动刷屏。缺省 10；显式写 0 = 关闭汇总（逐条立即发）。
+	BatchSeconds int `json:"batchSeconds"`
 }
 
 // middlewareConfig 仅用于解析 setting.json（JSON 键名统一用连接线，如 http-timeout-seconds）
@@ -287,8 +290,11 @@ func forwardUpstream(c *gin.Context, apiBaseUrl string, headers map[string]strin
 }
 
 // lookupAPIKey 查找 backendID 对应的 token。
-// 优先级: setting.json api-keys > 环境变量 API_KEYS (JSON 字符串)
+// 优先级: 库托管凭据（控制台节点表单，保存即生效）> setting.json api-keys > 环境变量 API_KEYS (JSON 字符串)
 func lookupAPIKey(backendID string) string {
+	if k := lookupNodeCredential(backendID).APIKey; k != "" {
+		return k
+	}
 	var apiKeys map[string]string
 	if len(API_KEYS) > 0 {
 		apiKeys = API_KEYS
@@ -303,9 +309,12 @@ func lookupAPIKey(backendID string) string {
 }
 
 // lookupWSKey 查找 nodeID 对应的 WS 注册校验 key。
-// 优先级: setting.json ws-keys > 环境变量 WS_KEYS (JSON 字符串)
+// 优先级: 库托管凭据（控制台节点表单，保存即生效）> setting.json ws-keys > 环境变量 WS_KEYS (JSON 字符串)
 // 与 lookupAPIKey 相互独立：api-keys 用于 HTTP 转发鉴权，ws-keys 用于 WS 注册校验。
 func lookupWSKey(nodeID string) string {
+	if k := lookupNodeCredential(nodeID).WSKey; k != "" {
+		return k
+	}
 	var wsKeys map[string]string
 	if len(WS_KEYS) > 0 {
 		wsKeys = WS_KEYS
@@ -797,20 +806,25 @@ func readConfig() error {
 	if mw.Smtp.TimeoutSec <= 0 {
 		mw.Smtp.TimeoutSec = 10
 	}
-	// alert：env JSON > setting.json > 缺省 {enabled:true, threshold:3}
+	// alert：env JSON > setting.json > 缺省 {enabled:true, threshold:3, batchSeconds:10}
 	haveAlertEnv := os.Getenv("ALERT") != ""
 	if err := envJSON("ALERT", &mw.Alert); err != nil {
 		return err
 	}
 	if !haveAlertEnv {
 		if !viper.IsSet("alert") {
-			mw.Alert = alertConfig{Enabled: true, DownThreshold: 3}
+			mw.Alert = alertConfig{Enabled: true, DownThreshold: 3, BatchSeconds: defaultAlertBatchSeconds}
 		} else if err := viperValue("alert", &mw.Alert); err != nil {
 			return fmt.Errorf("parse alert: %w", err)
 		}
 	}
 	if mw.Alert.DownThreshold <= 0 {
 		mw.Alert.DownThreshold = 3
+	}
+	// batchSeconds 缺省 10：只在"根本没配过"时补，显式写 0（关闭汇总）不能覆盖成 10
+	if mw.Alert.BatchSeconds == 0 && !viper.IsSet("alert.batchSeconds") &&
+		!strings.Contains(os.Getenv("ALERT"), "batchSeconds") {
+		mw.Alert.BatchSeconds = defaultAlertBatchSeconds
 	}
 
 	// ===== JWT 登录（见 auth.go） =====

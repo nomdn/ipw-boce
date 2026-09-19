@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +23,8 @@ import (
 //
 // 相比原版新增：注册/断开写入 nodes + node_events（在线快照与历史），
 // 心跳批量刷新 last_seen_at；节点经本通道发 report 消息上报统计与拨测明细（见 report.go）。
+//
+// nodes.remote_addr 记注册来源：取"尽力还原的真实来源地址"，不是 TCP 最后一跳——详见 remoteAddrForDisplay。
 //
 // 消息信封（JSON 文本帧）：{ "type": "...", "nodeId": "...", "ts": <unix秒>, "data": {...} }
 //   - 节点 → middleware：register / probe_result / pong / report / config_result / ota_result
@@ -101,6 +105,78 @@ func newWSServer() *wsServer {
 		otaWait:    make(map[string]chan json.RawMessage),
 		startedAt:  time.Now(),
 	}
+}
+
+// ==================== 来源地址解析（仅用于展示） ====================
+//
+// 注册时能直接拿到的只有 r.RemoteAddr —— 它是 TCP 的最后一跳。生产环境下节点与中心往往
+// 不在同一台机器，但中心前面常还有一层本机/内网代理（nginx、Caddy、frpc、CDN 回源代理……），
+// 此时最后一跳恒为 127.0.0.1:<临时端口>，看起来像"节点就在本机"。
+//
+// 所以这里做一次尽力而为的还原：
+//  1. 只有对端确实是代理时才采信转发头——对端是回环 / 内网地址，或命中 trusted-proxies 名单。
+//     从公网直连的节点即便自带 X-Forwarded-For 也不采信，避免这个展示字段被随意伪造。
+//  2. 转发头优先取 X-Forwarded-For 最左一个合法 IP（标准语义：最左即原始客户端），其次 X-Real-IP。
+//  3. 都不成立则回退对端 IP 本身，并去掉临时源端口——该端口每次重连都变，留着只会被误读成服务端口。
+//
+// 注意：转发头可被伪造，本值仅供控制台展示，不参与鉴权（wsKeys）与限流（ClientIP + trusted-proxies）。
+func remoteAddrForDisplay(r *http.Request) string {
+	peer := stripPort(r.RemoteAddr)
+	if ip := forwardedClientIP(r); ip != "" && (isLocalOrPrivate(peer) || isTrustedProxy(peer)) {
+		return ip
+	}
+	return peer
+}
+
+// forwardedClientIP 从转发头里取原始客户端 IP，取不到返回空串。
+func forwardedClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		for _, part := range strings.Split(xff, ",") {
+			if ip := net.ParseIP(strings.TrimSpace(part)); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+// stripPort 去掉 host:port 的端口；不带端口的写法（如 ::1）原样返回。
+func stripPort(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return strings.Trim(addr, "[]")
+}
+
+// isLocalOrPrivate 判断是否回环 / 内网 / 链路本地 / 未指定地址——这些都不可能是公网节点的真实
+// 来源，出现即说明它前面还有一跳本机或内网代理。
+func isLocalOrPrivate(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+}
+
+// isTrustedProxy 判断地址是否命中 trusted-proxies（IP 或 CIDR，逗号分隔）。该键为需重启键，
+// 全局量仅在启动期由 readConfig 赋值一次，故此处直接读不涉及并发写。
+func isTrustedProxy(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil || strings.TrimSpace(TRUSTED_PROXIES) == "" {
+		return false
+	}
+	for _, entry := range splitAndTrim(TRUSTED_PROXIES, ",") {
+		if entry == addr {
+			return true
+		}
+		if _, cidr, err := net.ParseCIDR(entry); err == nil && cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *wsServer) Handler(w http.ResponseWriter, r *http.Request) {
@@ -187,9 +263,12 @@ func (s *wsServer) Handler(w http.ResponseWriter, r *http.Request) {
 			}
 			s.peers[reg.NodeID] = peer
 			s.mu.Unlock()
-			log.Printf("[ws] node registered: %s", reg.NodeID)
+			// 来源地址：有本机/内网代理时 r.RemoteAddr 只是最后一跳，这里还原为真实来源；
+			// 日志同时打两者，便于排查"节点到底从哪连上来的"（口径见 remoteAddrForDisplay）
+			remote := remoteAddrForDisplay(r)
+			log.Printf("[ws] node registered: %s from %s (peer %s)", reg.NodeID, remote, r.RemoteAddr)
 			// 持久化：在线快照 + online 事件（含节点上报的版本号与能力清单，供节点状态页展示）
-			recordNodeOnline(reg.NodeID, r.RemoteAddr, reg.Version, reg.Capabilities)
+			recordNodeOnline(reg.NodeID, remote, reg.Version, reg.Capabilities)
 			// OTA 任务追踪钩子：节点重连上报的版本号命中在途任务判定 → 即时判 success（见 ota.go）
 			otaOnNodeRegistered(reg.NodeID, reg.Version)
 			s.sendJSON(c, wsMessage{Type: "register_ok", NodeID: reg.NodeID, TS: time.Now().Unix(), Data: mustRaw(struct {

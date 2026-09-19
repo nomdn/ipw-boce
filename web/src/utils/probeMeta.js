@@ -19,7 +19,16 @@ export const apiOptions = [
   { value: 'dns', label: 'DNS 解析', desc: '域名解析（可选记录类型）' },
 ]
 
-const labelMap = Object.fromEntries(apiOptions.map((o) => [o.value, o.label.replace(/\s·.*$/, '').trim()]))
+// probeHistoryTypes：拨测明细页「拨测方案」筛选用。
+// = SLA 候选方案（apiOptions）+ 只进明细、不做 SLA 任务的类型（IP 归属地 location）。
+// 与 apiOptions 分开是有意的：任务表单只允许后端 knownProbeTaskTypes 里的方案，
+// 而明细表里会出现节点上报/一键拨测产生的 location 记录，筛选项必须覆盖到。
+export const probeHistoryTypes = [
+  ...apiOptions,
+  { value: 'location', label: 'IP 归属地', desc: 'IP 归属地查询' },
+]
+
+const labelMap = Object.fromEntries(probeHistoryTypes.map((o) => [o.value, o.label.replace(/\s·.*$/, '').trim()]))
 // apiOptions 写出来"中文 · 副标题"，单值取前面中文短名给表格列/tag 用。
 // 解析时若匹配不到，返回原 apiType，避免缺失项显示空白。
 

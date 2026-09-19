@@ -27,7 +27,7 @@
         <table class="ak-table">
           <thead>
             <tr>
-              <th>节点 ID</th><th>名称</th><th>归属池</th><th>协议栈</th><th>通道</th><th>上游地址</th><th>状态</th>
+              <th>节点 ID</th><th>名称</th><th>归属池</th><th>协议栈</th><th>通道</th><th>上游地址</th><th>状态</th><th>凭据</th>
               <th style="width:230px">操作</th>
             </tr>
           </thead>
@@ -49,6 +49,12 @@
                   {{ n.enabled ? '已启用' : '已停用' }}
                 </span>
               </td>
+              <td class="cred-cell">
+                <span class="cred-mark" :class="{ on: n.hasWsKey }"
+                  title="WS 注册密钥（ws-keys）：节点连上中间件时用它证明身份；未设置表示该节点无需验证">WS {{ n.hasWsKey ? '已设置' : '未设置' }}</span>
+                <span class="cred-mark" :class="{ on: n.hasApiKey }"
+                  title="HTTP 访问令牌（api-keys）：中间件访问该节点 HTTP 接口时携带；WS 通道的节点用不到">HTTP {{ n.hasApiKey ? '已设置' : '未设置' }}</span>
+              </td>
               <td class="ops">
                 <button class="link-btn" @click="toggleEnabled(n)">{{ n.enabled ? '停用' : '启用' }}</button>
                 <button class="link-btn" @click="openEdit(n)">编辑</button>
@@ -56,7 +62,7 @@
               </td>
             </tr>
             <tr v-if="!defs.length">
-              <td colspan="8" class="dim">暂无节点。未配置任何节点时，转发会回退到配置文件里的默认上游。</td>
+              <td colspan="9" class="dim">暂无节点。未配置任何节点时，转发会回退到配置文件里的默认上游。</td>
             </tr>
           </tbody>
         </table>
@@ -76,19 +82,26 @@
       </div>
 
       <div class="rt-bar">
-        <select class="ak-select" v-model="rt.nodeId" @change="rtReset">
-          <option value="">— 选择节点 —</option>
-          <option v-for="n in rtNodes" :key="n.id" :value="n.id">
-            {{ n.id }}{{ n.label ? ' · ' + n.label : '' }}
-          </option>
-        </select>
-        <button class="ak-button" :disabled="!rt.nodeId || rt.busy" @click="rtPull">
-          {{ rt.busy ? '处理中…' : '拉取配置' }}
-        </button>
-        <button class="ak-button" :disabled="!rt.nodeId || rt.busy" @click="rtRefresh">刷新远端配置</button>
-        <label class="rt-persist">
-          <input type="checkbox" v-model="rt.persist" /> 写回节点 setting.json
-        </label>
+        <div class="tb-group">
+          <select class="ak-select" v-model="rt.nodeId" @change="rtReset">
+            <option value="">— 选择节点 —</option>
+            <option v-for="n in rtNodes" :key="n.id" :value="n.id">
+              {{ n.id }}{{ n.label ? ' · ' + n.label : '' }}
+            </option>
+          </select>
+        </div>
+        <!-- 勾选项单独成组：不嵌进下拉组，避免组内换行后在下拉右侧留出空洞 -->
+        <div class="tb-group">
+          <label class="rt-persist">
+            <input type="checkbox" v-model="rt.persist" /> 写回节点 setting.json
+          </label>
+        </div>
+        <div class="tb-group tb-group--actions">
+          <button class="ak-button" :disabled="!rt.nodeId || rt.busy" @click="rtPull">
+            {{ rt.busy ? '处理中…' : '拉取配置' }}
+          </button>
+          <button class="ak-button" :disabled="!rt.nodeId || rt.busy" @click="rtRefresh">刷新远端配置</button>
+        </div>
         <span v-if="rt.channel" class="rt-channel" :class="rt.channel">
           {{ rt.channel === 'ws' ? 'WS 通道' : 'HTTP 通道' }}
         </span>
@@ -171,7 +184,7 @@
     </section>
 
     <!-- ===== 节点远端配置托管 ===== -->
-    <div class="grid-2" style="grid-template-columns: 340px 1fr">
+    <div class="grid-2" style="grid-template-columns: 340px minmax(0, 1fr)">
       <!-- 左侧：配置项列表 -->
       <section class="panel">
         <h2 class="panel-title">托管配置 <span class="hl">/ node-configs</span></h2>
@@ -268,6 +281,31 @@
             </button>
             <span class="dim sw-hint">WS 节点须已注册到中间件并保持长连接</span>
           </div>
+          <label class="ak-field">
+            <span class="ak-label">WS 注册密钥</span>
+            <div class="key-row">
+              <input class="ak-input" type="password" autocomplete="new-password" v-model="dlg.form.wsKey"
+                :placeholder="keyPlaceholder('wsKey')" @input="dlg.form.wsKeyTouched = true" />
+              <button v-if="dlg.isEdit && dlg.hasWsKey" class="link-btn danger"
+                @click.prevent="clearCred('wsKey')">清除</button>
+            </div>
+            <span class="dim key-hint">
+              节点连上中间件时用它证明身份（对应配置文件的 ws-keys）。留空表示该节点无需验证；
+              保存即生效，<b>无需重启中间件</b>。明文不回显，只显示是否已设置。
+            </span>
+          </label>
+          <label class="ak-field">
+            <span class="ak-label">HTTP 访问令牌</span>
+            <div class="key-row">
+              <input class="ak-input" type="password" autocomplete="new-password" v-model="dlg.form.apiKey"
+                :placeholder="keyPlaceholder('apiKey')" @input="dlg.form.apiKeyTouched = true" />
+              <button v-if="dlg.isEdit && dlg.hasApiKey" class="link-btn danger"
+                @click.prevent="clearCred('apiKey')">清除</button>
+            </div>
+            <span class="dim key-hint">
+              中间件访问该节点 HTTP 接口时携带（对应配置文件的 api-keys）。走 WS 通道的节点用不到，可留空。
+            </span>
+          </label>
           <div class="switch-row">
             <span class="ak-label">状态</span>
             <button class="ak-toggle" :class="{ on: dlg.form.enabled }" @click.prevent="dlg.form.enabled = !dlg.form.enabled">
@@ -321,14 +359,19 @@ const online = ref([])          // 已接入但未配置的节点（补录下拉
 const adoptId = ref('')         // 下拉框当前选中
 const uiDialog = useDialog()
 
-const emptyForm = { nodeId: '', label: '', pools: ['api'], stack: 'DualStack', url: '', ws: false, enabled: true, sortOrder: 0 }
+// 凭据两项：输入框留空 = 不改；*Touched 记录用户是否动过输入框，决定提交时是否带上该字段
+// （不带 = 后端保持原值，带空串 = 清除）
+const emptyForm = {
+  nodeId: '', label: '', pools: ['api'], stack: 'DualStack', url: '', ws: false,
+  enabled: true, sortOrder: 0, apiKey: '', wsKey: '', apiKeyTouched: false, wsKeyTouched: false,
+}
 
 // poolsOf 解析存储的 pool 字段（"api,location" → ['api','location']）；空值按 api 处理
 function poolsOf(raw) {
   const arr = String(raw || '').split(',').map((s) => s.trim()).filter(Boolean)
   return arr.length ? arr : ['api']
 }
-const dlg = reactive({ show: false, isEdit: false, id: 0, form: { ...emptyForm }, err: '', busy: false })
+const dlg = reactive({ show: false, isEdit: false, id: 0, form: { ...emptyForm }, err: '', busy: false, hasApiKey: false, hasWsKey: false })
 
 onMounted(() => { load(); loadDefs() })
 async function load() {
@@ -349,6 +392,8 @@ function openCreate() {
   dlg.isEdit = false
   dlg.id = 0
   dlg.form = { ...emptyForm, pools: [...emptyForm.pools] } // 数组需拷贝，避免共享引用
+  dlg.hasApiKey = false
+  dlg.hasWsKey = false
   dlg.err = ''
 }
 
@@ -376,8 +421,25 @@ function openEdit(n) {
     nodeId: n.nodeId, label: n.label || '', pools: poolsOf(n.pool),
     stack: n.stack || 'DualStack', url: n.url || '', ws: !!n.ws,
     enabled: !!n.enabled, sortOrder: n.sortOrder || 0,
+    // 凭据明文不回显：输入框始终为空，靠 has* 标记提示"已设置"；留空即不改，要清除用旁边的按钮
+    apiKey: '', wsKey: '', apiKeyTouched: false, wsKeyTouched: false,
   }
+  dlg.hasApiKey = !!n.hasApiKey
+  dlg.hasWsKey = !!n.hasWsKey
   dlg.err = ''
+}
+
+// keyPlaceholder 凭据输入框的占位提示：编辑态且已设置时说明"留空即不改"
+function keyPlaceholder(k) {
+  const set = k === 'wsKey' ? dlg.hasWsKey : dlg.hasApiKey
+  if (dlg.isEdit && set) return '已设置，留空则保持不变'
+  return k === 'wsKey' ? '留空 = 该节点无需验证身份' : '留空 = 不设置'
+}
+
+// clearCred 清除某项凭据：置空并标记为已改动，保存后即从库中移除（改回用配置文件的同名键）
+function clearCred(k) {
+  dlg.form[k] = ''
+  dlg.form[k + 'Touched'] = true
 }
 
 function closeDialog() {
@@ -410,6 +472,9 @@ async function saveDialog() {
       stack: form.pools.includes('api') ? form.stack : '',
       enabled: form.enabled, sortOrder: form.sortOrder || 0,
     }
+    // 凭据：只有用户动过输入框（或点了清除）才带上该字段——不带即不动库里的值
+    if (form.apiKeyTouched) payload.apiKey = form.apiKey
+    if (form.wsKeyTouched) payload.wsKey = form.wsKey
     if (dlg.isEdit) await updateNodeDef(dlg.id, payload)
     else await createNodeDef(payload)
     dlg.show = false
@@ -708,29 +773,29 @@ async function reloadCurrent() {
 .rt-channel {
   font-size: .75rem; padding: 2px 8px; border-radius: 3px; letter-spacing: .05em;
 }
-.rt-channel.ws { background: rgba(0, 176, 80, .14); color: #00b050; }
-.rt-channel.http { background: rgba(255, 171, 0, .14); color: #ffab00; }
+.rt-channel.ws { background: color-mix(in srgb, var(--ak-signal-success) 18%, transparent); color: var(--ak-signal-success); }
+.rt-channel.http { background: color-mix(in srgb, var(--ak-signal-warn) 18%, transparent); color: var(--ak-signal-warn); }
 .rt-err {
   margin: 0 0 12px; padding: 8px 12px; font-size: .82rem;
-  background: rgba(255, 59, 48, .1); color: #ff3b30; border-radius: 4px;
+  background: color-mix(in srgb, var(--ak-signal-danger) 18%, transparent); color: var(--ak-signal-danger); border-radius: 4px;
 }
 .rt-lock {
   font-size: .68rem; padding: 1px 6px; margin-left: 6px; border-radius: 3px;
-  background: rgba(132, 131, 131, .2);
+  background: var(--ui-tint);
 }
-.rt-lock.warn { background: rgba(255, 171, 0, .16); color: #ffab00; }
-.rt-changed { color: #00b050; font-size: .78rem; }
+.rt-lock.warn { background: color-mix(in srgb, var(--ak-signal-warn) 20%, transparent); color: var(--ak-signal-warn); }
+.rt-changed { color: var(--ak-signal-success); font-size: .78rem; }
 .rt-result {
   margin-top: 14px; padding: 10px 12px; border-radius: 4px; font-size: .82rem;
-  background: rgba(132, 131, 131, .1);
+  background: var(--ui-tint-ghost);
 }
 .rt-line { margin-bottom: 4px; word-break: break-all; }
 .rt-warn {
   margin-top: 8px; padding: 6px 10px; border-radius: 3px;
-  background: rgba(255, 171, 0, .12); color: #ffab00;
+  background: color-mix(in srgb, var(--ak-signal-warn) 16%, transparent); color: var(--ak-signal-warn);
 }
 .rt-persist-warn { line-height: 1.5; }
-.ok-text { color: #00b050; }
+.ok-text { color: var(--ak-signal-success); }
 .pool-tags { display: flex; gap: 4px; flex-wrap: wrap; }
 .link-btn {
   background: none;
@@ -785,11 +850,11 @@ async function reloadCurrent() {
 .cfg-list { display: flex; flex-direction: column; gap: 6px; max-height: 60vh; overflow: auto; }
 .cfg-row {
   display: flex; flex-direction: column; gap: 5px; padding: 9px 10px;
-  border: var(--ak-line-hairline) solid rgba(255,255,255,.08);
+  border: var(--ak-line-hairline) solid var(--ui-line);
   cursor: pointer; transition: background var(--ak-motion-fast);
 }
-.cfg-row:hover { background: rgba(255,255,255,.04); }
-.cfg-row.active { border-left: 3px solid var(--ak-signal-info); background: rgba(74,171,234,.1); }
+.cfg-row:hover { background: var(--ui-tint); }
+.cfg-row.active { border-left: 3px solid var(--ak-signal-info); background: color-mix(in srgb, var(--ak-signal-info) 16%, transparent); }
 /* 第二行：元信息(左) + 操作按钮(右)；nodeId 独占首行，长名不挤压按钮 */
 .cfg-row .row2 { display: flex; align-items: center; gap: 8px; }
 .cfg-row .row2 .dim { flex: 1; min-width: 0; word-break: break-all; }
@@ -799,4 +864,12 @@ async function reloadCurrent() {
 .cfg-row .ops .del:hover { opacity: 1; }
 .cfg-row .ops .copy { padding: 3px 8px; font-size: .72rem; white-space: nowrap; }
 .cfg-row.active .copy { border-color: var(--ak-signal-info); color: var(--ak-signal-info); }
+/* 凭据列：只显示"已设置 / 未设置"，明文由后端保管、不回显 */
+.cred-cell { white-space: nowrap; font-size: 0.72rem; }
+.cred-mark { display: inline-block; margin-right: 8px; color: var(--ak-text-secondary); }
+.cred-mark.on { color: var(--ak-signal-success); }
+/* 凭据输入行：输入框占满，清除按钮贴右 */
+.key-row { display: flex; align-items: center; gap: 8px; }
+.key-row .ak-input { flex: 1; }
+.key-hint { display: block; margin-top: 4px; font-size: 0.72rem; line-height: 1.55; }
 </style>

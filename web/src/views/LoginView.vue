@@ -191,8 +191,8 @@ onBeforeUnmount(() => cdTimer && clearInterval(cdTimer))
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    linear-gradient(var(--ui-tint) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ui-tint) 1px, transparent 1px);
   background-size: 44px 44px;
   mask-image: radial-gradient(circle at 50% 45%, #000 0%, transparent 72%);
 }
@@ -200,11 +200,9 @@ onBeforeUnmount(() => cdTimer && clearInterval(cdTimer))
   position: relative;
   width: min(400px, calc(100vw - 40px));
   background: var(--ak-surface-inverse);
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.12);
-  border-top: 4px solid var(--ak-signal-info);
+  border: var(--ak-line-hairline) solid var(--ui-line-strong);
   padding: 34px 32px 30px;
-  clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 0 100%);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  /* 圆角 / 去剪角 / 细蓝顶边 / 投影统一由 theme.css 的「形态层」给出 */
 }
 .login-badge {
   font-family: var(--ak-font-mono);

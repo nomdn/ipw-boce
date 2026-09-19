@@ -21,7 +21,7 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| 拨测数据持久化 | `probe_results` 表：detail/ssl/dns/tcping/speed 的拨测明细，含 raw/status/latency/body(截断64KB)/error/source/origin，由节点上报写入 |
+| 拨测数据持久化 | `probe_results` 表：detail/ssl/dns/tcping/speed/location 的拨测明细，含 raw/status/latency/body(截断64KB)/error/source/origin，由节点上报写入 |
 | 统计聚合 | `request_stats` 表按 `分钟 × 节点 × apiType` 累加，数据唯一来源是节点上报（见下方上报协议）；所有 apiType 都计入 |
 | 节点在线持久化 | `nodes` 表在线快照（注册/断开/心跳刷新）+ `node_events` 在线/离线历史；进程重启自动清离线快照防僵尸记录 |
 | 远端配置托管 | `GET /remote-config/:nodeId`（global 为底、节点配置逐键覆盖）；`/admin/node-configs/*` CRUD 维护。**节点侧 `access-token` / `report-token` 属受保护凭据，远端下发不会覆盖**（节点硬编码名单，托管配置里写了也不生效，refresh 应答的 `protectedIgnored` 会列出被跳过的键）——这两项只能在节点本地用 ENV / setting.json 设置 |
@@ -29,6 +29,7 @@
 | 管理 API | `/admin/*`，配置 `admin-token` 后需 `Authorization: Bearer` |
 | 数据保留期 | `data-retention-days`（默认30，0=永久），每小时清理过期拨测/统计/事件 |
 | 节点池控制台托管 | 上游节点改由数据库 `node_defs` 维护（见 node_defs.go）：管理员在控制台「配置分发 → 上游节点池」增删改，保存即热更新全局池，无需改 setting.json 重启；库为空时才回退 setting.json。同一节点可同时归属 api 与 location 两池（`pool` 逗号分隔，如 `api,location`）；停用则该节点退出全部池。已接入（WS 在线/在线快照）但库里无配置的节点会在控制台以下拉框提示补录 |
+| 节点凭据控制台托管 | `api-keys`（转发鉴权）与 `ws-keys`（WS 注册校验）原先只能在 env / setting.json 里配、改一次要重启；现可随节点定义入库：控制台「上游节点池」表单里填「WS 注册密钥 / HTTP 访问令牌」，保存即生效、**无需重启**（与节点池同源重建索引）。明文不回显，列表只显示「已设置 / 未设置」；留空 = 不改，清除按钮 = 删除该凭据并回落配置文件同名键。读取口径逐键判定：**库里有值优先，否则回落 `env > setting.json`**，老部署升级后行为不变。`node_defs` 新增 `api_key` / `ws_key` 两列（AutoMigrate 增量，旧库直接启动即可） |
 | 节点 OTA 升级 | 控制台建任务下发（`ota_tasks` 表，见 ota.go），节点下载新二进制→校验→原子替换→重启（交接逻辑同 middleware-go/ota.go：预检→替换→优雅停机→拉起→健康检查，失败回滚 .old）。通道同运行时配置：WS `ota` 消息优先、HTTP 回退节点 `POST /v1/ota`；下载源二选一——`url` 直发或 `version`+资产基址（节点按平台自动匹配 `lemonipw-{goos}-{goarch}` 资产，可选 sha256 强校验；GitHub 官方基址且节点配了 `gh-proxy` 时自动走代理）。节点重启必然断开 WS，最终结果以**重连注册上报的新版本号**为准（WS 注册钩子即时判定 + 兜底轮询 + 15 分钟超时收敛）；节点能力清单新增 `ota`，明确不支持的节点下发前即拒绝。节点本地可配 `node-ota=false`（env `NODE_OTA`）禁用 OTA（只读容器等），节点会拒绝指令并回传原因；该开关也可在控制台「节点配置」里热改（运行时 PATCH 即时生效，无需重启） |
 | 运行时配置持久化提醒 | 节点侧配置优先级 远端 > ENV > 本地 setting.json，运行时 patch 只改节点内存（persist 也只写本地文件），重启后 ENV/本地文件会顶掉改动。patch 响应带 `unpersistedKeys`（未进托管远端配置的键）与 `persistHint` 提醒；控制台「同步到托管配置」一键把改动合并进该节点的托管配置（`POST /admin/node-configs/:nodeId/merge`），重启后由 remote-config-url 自动恢复 |
 
@@ -72,7 +73,7 @@
       "total": 1, "errors": 0, "latencySumMs": 12, "latencyMaxMs": 12,
       "minute": 0 }                               // unix 分钟桶；0 = 收集器当前分钟
   ],
-  "probes": [                                     // 拨测明细（apiType：detail/ssl/dns/tcping/speed）
+  "probes": [                                     // 拨测明细（apiType：detail/ssl/dns/tcping/speed/location）
     { "nodeId": "cn-jiangsu", "apiType": "tcping", "raw": "qq.com",
       "status": 200, "latencyMs": 33,
       "body": {"ok": true} }                      // body 兼容 JSON 对象或字符串
@@ -141,14 +142,44 @@ GET    /admin/status                        版本/运行时长/WS在线数/数�
 GET    /admin/nodes                         节点在线快照（含 version：节点上报的版本号；admin only）
 GET    /admin/nodes/brief                   节点池简表（登录即可：enabled 节点 + 在线/版本，脱敏无上游地址；任务表单勾选源）
 GET    /admin/nodes/:nodeId/events?limit=   节点在线/离线历史
-GET    /admin/probes?node=&type=&since=&limit=  拨测记录（倒序）
-GET    /admin/stats/summary?hours=24        按 apiType / 节点聚合
-GET    /admin/stats/timeseries?hours=24     按分钟时间序列
+GET    /admin/nodes/:nodeId/events/export?days=30  上面这份历史导出 CSV（UTF-8 BOM + CRLF，Excel 直接开）
+GET    /admin/nodes/uptime?days=7          节点可用率（全部节点；不含逐日明细）
+                                            · 每节点：availability / seconds / onlineSeconds / offlineSeconds / downCount
+                                            · 数据源只有 node_events（online/offline 事件流），由它还原"离线区间"
+                                            · 口径：窗口起点状态取"窗口开始前最后一条事件"；节点首见之前不算宕机；
+                                              统计窗口不超出 data-retention-days（事件会被清，越界会把宕机算成在线）见 node_uptime.go
+GET    /admin/nodes/:nodeId/uptime?days=7  单节点可用率（含 daily 逐日明细，供趋势图）
+GET    /admin/probes?node=&type=&since=&limit=&target=&cat=  拨测记录（倒序；target 对目标模糊匹配）
+GET    /admin/probes/export?...            同上参数与权限范围的 CSV 导出（默认上限 2 万行，?limit= 可调）
+# —— 时间窗口参数（下列按窗口取数的接口通用，解析见 timerange.go）——
+#   · ?hours=N          相对窗口「最近 N 小时」，终点恒为当前时刻（缺省按各接口自身默认）
+#   · ?start=&end=      绝对区间；接受 RFC3339（含毫秒）/ Unix 秒 / Unix 毫秒三种写法，
+#                       end 缺省 = 现在（于是「今天」只需传 start，窗口天然跟随当前时刻）
+#   跨度上限 90 天；首尾颠倒或同刻会被夹成最小窗口；非法值按“未提供”处理（回落默认，不报错）。
+#   ⚠️ 能看多远由 data-retention-days 决定（默认 30 天），超出保留期的窗口查出来是空的 ——
+#      控制台的时间范围选择器会按 /admin/stats/range 的 maxDays 直接隐藏这类预设。
+GET    /admin/stats/summary?hours=24&nodes=a,b  按 apiType / 节点聚合（nodes 可选：只看这些节点；含 allNodes 全量节点供筛选项）
+GET    /admin/stats/timeseries?hours=24&nodes=a,b  时间序列（等宽分桶，桶粒度随窗口放大；nodes 同上，空 = 全部节点）
+GET    /admin/stats/range                   数据可用范围 {now, earliest, maxDays, retention}（控制台据此裁剪时间预设）
+
+# —— 计划维护窗口（节点告警免打扰，见 maintenance.go）——
+#    语义同任务级 quietHours：只屏蔽通知、不屏蔽事实（offline/online 事件照写、状态页与可用率不受影响）
+#    配对规则：掉线被窗口吞掉的那次，其"恢复上线"也一并吞掉，不会留下孤立的上线通知
+#    两种形态：一次性绝对时间段（割接/发布）/ 每日重复只比时钟（本地时区，支持跨零点）
+GET    /admin/maintenance                   窗口列表（含 active 当前是否命中 / expired 一次性且已过）
+POST   /admin/maintenance                   新建（{scope?, startAt, endAt, repeatDaily?, reason?}）
+                                            · scope 空或 "global" = 全部节点；其余取值 = 该 nodeId
+                                            · startAt/endAt 支持 RFC3339 与 "2006-01-02T15:04"（无时区按服务器本地时区）；
+                                              每日重复窗口也可只给时刻 "03:00"（锚到当天，仅比时钟）
+                                            · repeatDaily=true 时允许 end <= start（跨零点），但起止时刻不能相同
+DELETE /admin/maintenance/:id               删除（一次性窗口结束 30 天后由保留期清理自动删除）
 # —— 上游节点池（数据库托管，取代 setting.json 静态节点池；见 node_defs.go）——
 GET    /admin/node-defs                     节点定义列表（含停用）
-POST   /admin/node-defs                     新增（{nodeId,label,url,ws,pool|pools,stack,enabled,sortOrder}）
+POST   /admin/node-defs                     新增（{nodeId,label,url,ws,pool|pools,stack,enabled,sortOrder,apiKey,wsKey}）
                                             · pool 可多选："api" / "location" / "api,location"（也可用 pools:["api","location"]）
                                             · 双归属节点：location/asn 请求走 location 池，其余走 api 池；stack 仅在归属 api 时有意义
+                                            · apiKey / wsKey：该节点的 HTTP 访问令牌与 WS 注册密钥，入库后立即生效（无需重启中间件）
+                                            · 明文不回显：出参只给 hasApiKey / hasWsKey 两个标记；不传 = 保持原值，传空串 = 清除（回落配置文件同名键）
 PUT    /admin/node-defs/:id                 更新（按主键 id；未传字段保持原值）
 DELETE /admin/node-defs/:id                 删除
 GET    /admin/node-defs/online              已接入但库里无配置的节点（控制台补录下拉框数据源）
@@ -214,8 +245,9 @@ POST   /admin/tasks                         新建（自动把当前登录 JWT �
 PUT    /admin/tasks/:id                     更新（不改 owner；不改 enabled——启停走下方专用端点）
 PATCH  /admin/tasks/:id/enabled             启停
 DELETE /admin/tasks/:id                     删除
-GET    /admin/tasks/:id/sla?hours=24        某任务整窗 SLA 聚合
-GET    /admin/tasks/:id/series?hours=24&node=  时序曲线（?node= 只返回该节点曲线，多节点对比用）
+GET    /admin/tasks/:id/sla?hours=24        某任务整窗 SLA 聚合（窗口参数支持 ?start=&end=，下同）
+GET    /admin/tasks/:id/series?hours=24&node=  时序曲线（按采样轮次打点，超 1500 轮自动多轮合并；?node= 只返回该节点曲线）
+GET    /admin/tasks/:id/series/export?hours=24&node=  上面这份曲线的 CSV 导出（同归属校验）
 GET    /admin/tasks/meta                    可选拨测类型/间隔元信息
 POST   /admin/tasks/share                   批量分享：body {ids:[], token?} —— 多选任务共用一个令牌；
                                             token 缺省随机 6 位 hex、可自定义（3~32 位小写字母/数字/连字符）
@@ -257,7 +289,7 @@ DELETE /admin/me/token                      吊销个人 API Token（旧 token �
 ```
 GET /api/v1/tasks?page=&pageSize=&tag=           任务列表 {items,total,page,pageSize}（全字段，id 倒序）
 GET /api/v1/tasks/:id                            任务详情（非本人 403，不存在 404）
-GET /api/v1/tasks/:id/sla?hours=24               顶层汇总 + byNode 明细
+GET /api/v1/tasks/:id/sla?hours=24|&start=&end=  顶层汇总 + byNode 明细（窗口参数同 /admin，见 timerange.go）
 GET /api/v1/probes?node=&type=&source=&since=&limit=&offset=
                                                  拨测明细（精简无 body）
 POST /api/v1/probes                              一键拨测（同步聚合）：body {apiType,raw,query?,nodes?}
@@ -284,11 +316,32 @@ curl -H "Authorization: Bearer ipt_xxxx" https://<collector>/api/v1/tasks
 - **任务标签**：任务可打逗号分隔标签（`tags`），列表 `?tag=` 子串过滤（/admin/tasks 与 /api/v1/tasks 皆可）。
 - **服务节点掉线监控**（见 nodeHealth.go）：监控配置池（api-base-url 三栈 + ip-location-api）里全部节点。
   - HTTP 版节点（非 ws）：每 1 小时 GET 该节点 `url`（health 接口就在根路径、无追加路径）探活；连续 2 次失败判 down（约 2h）。
-  - WS 版节点（ws:true）：靠心跳（middleware 每 20s ping、空闲 75s 剔除），连续 3 轮(约 3 分钟)不在线判 down。
+  - WS 版节点（ws:true）：靠心跳判活（middleware 每 20s ping+status、空闲 >75s 剔除）。断连/剔除那一刻即置离线并写事件
+    （节点状态页与事件历史**即时**变红），但**告警要过 20s 宽限窗口**：窗口内节点恢复注册就整条不报（含随后的「恢复上线」），
+    避免秒级闪断、节点重启刷屏；窗口过后仍离线才发 `node_down`。判定与通报只有一处入口：`store.go recordNodeOffline`
+    （`nodeDownGraceDelay = 20s`；空闲剔除那条路本身已是 75s 后）。
   - 仅对"本进程内曾在线"的节点告警（冷启动未连上/从未探活成功不报，避免误报）；down 翻转通知一次、恢复复位后可再报。
-  - 投递：发给**所有启用 admin**，每人**邮件+站内信同时发**（kind=`node_down`）。
+  - 投递：发给**所有启用 admin**（`role=admin` 且 `enabled`），每人**邮件 + 站内信 + Webhook 三路同时发**（互不回退）：
+    邮件需有邮箱且 SMTP 可用；站内信 kind 区分 `node_down`(掉线) / `node_up`(恢复)；Webhook 推给 admin 在个人资料自配的地址
+    （generic 报文带 `nodeId`）。**Webhook 同样只覆盖 admin 角色**——节点告警是系统级事件、收件人就是管理员组，
+    普通用户即便配了 Webhook 也收不到。
+  - **上线通知**：只通报"掉线后恢复"——即这次故障确实发过掉线告警、节点随后复联时补一条 `node_up`。
+    冷启动首次上线、池中从未探活成功的节点、计划内 OTA 重启的复联、中心重启后的重连都不报，
+    保证群里的"上线"总能对上先前那条"掉线"。
   - **OTA 在途豁免**：节点有在途 OTA 任务（dispatched）时的掉线不告警（计划内重启必然断连一次），
-    offline 事件照记可追溯；任务失败终结且节点仍未恢复上线时补报（见 ota.go）。
+    offline 事件照记可追溯；这次计划内的复联同样不报"上线"；任务失败终结且节点仍未恢复上线时补报掉线，
+    并撤销豁免（该节点日后复联会正常补一条"上线"，与此掉线配对，见 ota.go）。
+  - **计划维护窗口**（见 maintenance.go）：割接 / 发布 / 例行重启前先建窗口，窗口内的掉线/恢复都不推送；
+    只屏蔽通知、不屏蔽事实——事件流、状态页、可用率统计一律照旧，事后仍看得出"这段时间确实断过"。
+    scope 为 `global`（全部节点）或某个 nodeId；支持一次性时间段与每日重复（本地时区，可跨零点）。
+  - **批次汇总 / 风暴抑制**（见 alert_batch.go，`alert.batchSeconds` 缺省 10s）：中心侧抖动、机房整体重启会让
+    多个节点同时掉线，逐条推送会刷屏。同一时间窗内的告警先进队列、到点统一投递：只 1 个节点时文案与原来完全一致，
+    ≥2 个则合并成一条"批量掉线：N 个节点"清单。显式配 `batchSeconds: 0` 可关闭汇总（逐条立即发）。
+  - **三道静默互不重叠**：① 20s 掉线宽限滤秒级闪断 → ② 维护窗口按计划静默 → ③ 批次汇总合并同批多节点。
+    三层都在通知层，纯内存、与 down 锁存同生命周期，进程重启即丢弃待发批次（最坏少发一条，不会重复或错配）。
+    因此单节点掉线告警的实际到达时间 ≈ `20s 宽限 + batchSeconds`（缺省共约 30s）；状态页与事件历史仍是**即时**的。
+  - **可用率报表**（见 node_uptime.go）：`/admin/nodes/uptime?days=` 由事件流还原离线区间算可用率、
+    宕机次数与累计宕机时长，单节点端点另带逐日明细；控制台节点页有可用率列与趋势图。
 - **删除用户会级联删除其创建的任务与该用户的站内信**；同时始终保留至少 1 个启用 admin（禁删自己、不能降级/禁用最后一个 admin）。
 
 ## SLA 判定口径
@@ -309,16 +362,17 @@ curl -H "Authorization: Bearer ipt_xxxx" https://<collector>/api/v1/tasks
 | 页面 | 路由 | 权限 | 内容 |
 | --- | --- | --- | --- |
 | 统计大盘 | `/` | 全部（按角色分流） | admin：全站请求统计（KPI + 趋势 + 按接口/节点分布）；普通用户：本人任务的可用率与延迟大盘 |
-| 节点状态 | `/nodes` | admin | 节点卡片墙（在线/版本/远端地址/首见）；上下线事件历史；OTA 任务列表与下发对话框（按版本或直发 URL，可选 sha256） |
+| 节点状态 | `/nodes` | admin | 节点卡片墙（在线/版本/远端地址/首见/**可用率**）；上下线事件历史（可导出 CSV）、单节点可用率趋势；计划维护窗口管理；OTA 任务列表与下发对话框（按版本或直发 URL，可选 sha256） |
 | 一键拨测 | `/probe` | 全部 | 选类型 / 目标 / 节点实时批量拨测，结果按类型结构化渲染 |
-| 拨测明细 | `/records` | 全部 | 按「定时拨测 / 业务拨测」分类查询（普通用户只见自己发起的） |
-| SLA 监控 | `/sla` | 全部（需验证邮箱） | 任务卡片（可用率 / 延迟曲线 / 失败轮次标记 / 节点对比 / 逐节点明细）、任务 CRUD、批量分享 |
+| 拨测明细 | `/records` | 全部 | 按「定时拨测 / 业务拨测」分类 + 时间范围 / 节点 / 拨测方案 / 目标模糊匹配查询，结果可导出 CSV（普通用户只见自己发起的） |
+| SLA 监控 | `/sla` | 全部（需验证邮箱） | 任务卡片（可用率 / 延迟曲线 / 失败轮次标记 / 节点对比 / 逐节点明细）、任务 CRUD、批量分享、曲线导出 CSV |
 | 配置分发 | `/config` | admin | 上游节点池（数据库托管）、节点运行时配置读写、托管配置编辑 |
 | 用户管理 | `/users` | admin | 用户增删改、启停、重置口令 |
 | 个人资料 | `/profile` | 全部 | 邮箱验证、改口令、Webhook 通知、个人 API Token、我的用量 |
 | 登录 / 注册 | `/login` | 公开 | JWT 登录；开启 JWT 后支持邮箱验证码自助注册 |
 | 公开状态页 | `/s/:token` | 公开 | 免登录只读 SLA 分享页（30s 自刷新） |
 
+- **节点卡片的「远端」**：记录的是节点**连上中心时的来源地址**（注册时尽力还原：对端为回环/内网或命中 `trusted-proxies` 时取 `X-Forwarded-For` 最左 IP，否则取对端 IP 本身，均不带端口）。显示 `127.0.0.1` 或内网地址并不代表节点就在本机，而是说明**中心前面还有一层本机/内网代理**（nginx、Caddy、frpc、CDN 回源代理等），该值为"最后一跳"。该字段仅用于展示，**不参与鉴权与限流**（两者各自走 wsKeys 与 ClientIP + trusted-proxies）。
 - **权限边界**：前端 `meta.role` 只控制菜单显隐与路由跳转，真正的权限收紧在后端 `adminOnly` 中间件，不要依赖前端做安全边界。
 - **实时推送**：SLA 页经 `WS /console/sla?hours=&token=` 接收实时帧，断线按 1s→15s 指数退避重连，重连后补拉全量；切换窗口重建连接。
 - **构建 / 开发**：
@@ -337,7 +391,7 @@ curl -H "Authorization: Bearer ipt_xxxx" https://<collector>/api/v1/tasks
 
 原版全部键位不变（port / http-timeout-seconds / rate-limit / ws-port / remote-config-url / remote-ignore-config / cors / trusted-proxies / api-base-url / ip-location-api / api-keys / ws-keys），新增：
 
-> **节点池已迁到数据库**：`api-base-url` / `ip-location-api` 现为**迁移兜底**——两个池分别判定，某池在 `node_defs` 表里一条记录都没有时才回退到 setting.json；一旦在控制台录入过该池的节点，就完全以数据库为准（该池节点被全部停用即为空池，属管理员明确意图）。新建部署可直接在控制台「上游节点池」录入，不必再写这两个键。`api-keys`（转发鉴权）仍在配置文件，按 backendID 匹配控制台里的节点 ID。
+> **节点池已迁到数据库**：`api-base-url` / `ip-location-api` 现为**迁移兜底**——两个池分别判定，某池在 `node_defs` 表里一条记录都没有时才回退到 setting.json；一旦在控制台录入过该池的节点，就完全以数据库为准（该池节点被全部停用即为空池，属管理员明确意图）。新建部署可直接在控制台「上游节点池」录入，不必再写这两个键。`api-keys`（转发鉴权）与 `ws-keys`（WS 注册校验）现在也可以直接在控制台「上游节点池」的节点表单里配置（存库、保存即生效、无需重启，明文不回显）；**库里有值优先**，控制台没配的节点仍按这里的值匹配节点 ID。
 
 | 键 | 缺省 | 说明 |
 | --- | --- | --- |
@@ -351,7 +405,8 @@ curl -H "Authorization: Bearer ipt_xxxx" https://<collector>/api/v1/tasks
 | `user-task-limit` | 20 | 普通用户可建任务数上限，0=不限 |
 | `user-min-interval` | 0 | 普通用户建任务的最小间隔（秒），0=跟随全局最小值（10s） |
 | `smtp` | host 空=禁用 | SMTP 发信配置（host/user/password/from/fromName/port/ssl/startTLS/insecure/timeoutSec）。发信对象按任务 owner 动态解析 |
-| `alert` | enabled+threshold3 | 掉线告警策略（enabled/to/downThreshold）。某 SLA 任务连续 N 轮判定整组 down 时，通知其「所有者」（见 alert.go）：邮件+站内信同时发（有邮箱走邮件；站内信恒发）。`to` 字段已不再作为收件兜底（保留兼容）。节点掉线监控参数为固定值（见 nodeHealth.go），无需配置 |
+| `alert` | enabled+threshold3+batchSeconds10 | 掉线告警策略（enabled/to/downThreshold/batchSeconds）。某 SLA 任务连续 N 轮判定整组 down 时，通知其「所有者」（见 alert.go）：邮件+站内信+Webhook 三路同时发（有邮箱走邮件；站内信恒发；配了 Webhook 才推）。`to` 字段已不再作为收件兜底（保留兼容）。节点掉线与恢复通知发给所有启用 admin，策略参数为固定值（掉线通报先等 20s 宽限确认，窗口内恢复则整条不报；见 store.go / nodeHealth.go），无需配置。`batchSeconds`（缺省 10，显式 0 = 关闭）是节点告警的批次汇总窗口：窗口内多个节点同时掉线/恢复合并成一条（见 alert_batch.go） |
+| `api-keys` / `ws-keys` | 空 | 节点凭据的**回落源**：控制台未给该节点配凭据时才用这里的值（`api-keys` = 转发时注入的 `Authorization: Bearer` token，按节点 ID 匹配；`ws-keys` = 节点 WS 注册校验 key）。也可用 ENV `API_KEYS` / `WS_KEYS`（JSON 字符串） |
 | `ota-asset-base` | GitHub Releases | 节点 OTA 按版本下发时的资产基址（节点拼 `{base}/{tag}/lemonipw-{goos}-{goarch}`；自建镜像源时改成自己的地址） |
 
 上述键均可由环境变量覆盖（`DATABASE_DRIVER` / `DATABASE_DSN` / `DATABASE` / `ADMIN_TOKEN` / `DATA_RETENTION_DAYS` / `REPORT_TOKEN` / `JWT_SECRET` / `JWT_EXPIRY_SECONDS` / `ADMIN_USER` / `ADMIN_PASSWORD` / `USER_TASK_LIMIT` / `USER_MIN_INTERVAL` / `SMTP` / `ALERT`，以及原版那一组 `PORT` / `HTTP_TIMEOUT` / `RATE_LIMIT` / `WS_PORT` / `CORS` / `TRUSTED_PROXIES` / `REMOTE_CONFIG_URL` / `REMOTE_IGNORE_CONFIG` / `API_BASE_URLS` / `IP_LOCATION_APIS` / `API_KEYS` / `WS_KEYS`）。

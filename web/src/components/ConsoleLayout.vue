@@ -39,6 +39,10 @@
           <div class="crumb">{{ route.meta.title || '' }}</div>
         </div>
         <div class="top-actions">
+          <!-- 主题切换：亮 / 暗，选择存 localStorage（首屏由 index.html 内联脚本预置，避免闪色） -->
+          <button class="theme-btn" :title="isLight ? '切换到暗色' : '切换到亮色'" @click="toggleTheme">
+            <span class="theme-ico" v-html="isLight ? moonSvg : sunSvg"></span>
+          </button>
           <!-- 站内信铃铛（仅 JWT 登录用户可见；静态 token 无可视用户则不显示） -->
           <div v-if="auth.userId" class="notice-wrap" ref="noticeWrap">
             <button class="bell-btn" :class="{ has: unread > 0 }" @click="toggleNotices" title="站内信">
@@ -66,8 +70,6 @@
               </div>
             </div>
           </div>
-
-          <span class="ak-tag ch" :class="onlineCtl.tagClass">{{ onlineCtl.text }}</span>
         </div>
       </header>
 
@@ -88,20 +90,24 @@
 import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth.js'
-import { http } from '../api/http.js'
 import { fetchNotices, fetchUnreadCount, markNoticesRead, clearNotices } from '../api/boce.js'
 import { useDialog } from '../composables/useDialog.js'
+import { useTheme } from '../composables/useTheme.js'
 import { timeAgo } from '../utils/format.js'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 const dialog = useDialog()
+const { isLight, toggle: toggleTheme } = useTheme()
 
 const boltSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3.6 13.6H10L8.5 22l9.9-11.9H12L13 2z" fill="currentColor"/></svg>'
 const usersSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-4 0-8 2-8 5v1h16v-1c0-3-4-5-8-5z" fill="currentColor"/></svg>'
 const userSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-5 0-9 2.5-9 6v1h18v-1c0-3.5-4-6-9-6z" fill="currentColor"/></svg>'
 const bellSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2zm6-6v-5a6 6 0 0 0-4.5-5.8V4.5a1.5 1.5 0 1 0-3 0v.7A6 6 0 0 0 6 11v5l-2 2v1h16v-1l-2-2z" fill="currentColor"/></svg>'
+// 主题切换图标：亮色时显示月亮（点击去暗色），暗色时显示太阳
+const moonSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 14.4A8.5 8.5 0 0 1 9.6 3.8 8.7 8.7 0 1 0 20.2 14.4z" fill="currentColor"/></svg>'
+const sunSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M18.8 5.2l-1.6 1.6M6.8 17.2l-1.6 1.6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>'
 
 // ===== 窄屏适配：<768px 侧边栏收起为抽屉 =====
 const mobileQuery = '(max-width: 767px)'
@@ -128,23 +134,6 @@ const allNavs = [
 
 // admin-only 页面（节点/配置/用户）仅 admin 可见；其余登录可见
 const navs = computed(() => allNavs.filter((it) => !it.admin || auth.isAdmin))
-
-// 顶栏：健康心跳（轮询 /admin/status，仅显示已连接的节点数，不阻塞）
-const wsPeers = ref(0)
-let timer = null
-const onlineCtl = computed(() => ({
-  text: `已连接节点 ${wsPeers.value}`,
-  tagClass: wsPeers.value > 0 ? 'ak-tag--advanced' : 'ak-tag--neutral',
-}))
-
-async function pollStatus() {
-  try {
-    const s = await http.get('/admin/status')
-    wsPeers.value = s?.wsPeers ?? 0
-  } catch {
-    /* 状态接口失败静默 */
-  }
-}
 
 // 未验证邮箱 → 跳到个人资料的"验证邮箱"区
 function goVerify() {
@@ -221,7 +210,7 @@ async function viewNotice(n) {
 }
 // 通知类别文案（与后端 noticeKind 对应）
 function kindText(kind) {
-  return { node_down: '节点掉线', sla_down: '任务掉线' }[kind] || '通知'
+  return { node_down: '节点掉线', node_up: '节点上线', sla_down: '任务掉线' }[kind] || '通知'
 }
 // 清空
 async function clearAll() {
@@ -260,8 +249,6 @@ onMounted(() => {
   syncViewport()
   mq = window.matchMedia(mobileQuery)
   mq.addEventListener('change', syncViewport)
-  pollStatus()
-  timer = setInterval(pollStatus, 20000)
   if (auth.userId) {
     refreshUnread()
     noticeTimer = setInterval(refreshUnread, 30000)
@@ -271,7 +258,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (mq) mq.removeEventListener('change', syncViewport)
   document.body.style.overflow = '' // 极端情况：抽屉开着就卸载，需还回滚动
-  clearInterval(timer)
   if (noticeTimer) clearInterval(noticeTimer)
   document.removeEventListener('click', onDocClick)
 })

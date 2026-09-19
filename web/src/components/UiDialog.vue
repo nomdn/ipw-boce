@@ -134,11 +134,10 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
   /* 石墨深面：与暗色控制台层级一致（--ak-surface-panel 是亮面板，这里改用 raised 深面） */
   background: var(--ak-surface-raised);
   color: var(--ak-text-primary);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--ui-line-strong);
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
   outline: none;
-  /* 工业几何：单处剪角，克制 */
-  clip-path: polygon(0 0, calc(100% - var(--ak-cut-md, 14px)) 0, 100% var(--ak-cut-md, 14px), 100% 100%, 0 100%);
+  /* 圆角 / 去剪角 / 细蓝顶边 / 投影统一由 theme.css 的「形态层」给出 */
 }
 .ud-top {
   display: flex;
@@ -196,8 +195,8 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
 }
 /* ak-button 在弹窗内收缩到内容宽度（ak-ui 默认固定尺寸仅适合主行动） */
 .ud-foot :deep(.ak-button) { width: auto; height: auto; padding: 7px 18px; }
-/* 动作配色：危险红 / 主行动（accent 强调） */
-.ud-ok--danger { background: var(--ak-signal-danger); border-color: var(--ak-signal-danger); color: #fff; }
+/* 动作配色：危险红 / 主行动（accent 强调）。实底配白字，用不随卡片深浅变的重映射无关变量。 */
+.ud-ok--danger { background: var(--ui-solid-danger); border-color: var(--ui-solid-danger); color: #fff; }
 .ud-ok--danger:hover { filter: brightness(1.08); }
 .ud-ok--action { background: var(--ak-signal-action, var(--ak-signal-accent)); border-color: var(--ak-signal-action, var(--ak-signal-accent)); color: #111; }
 .ud-ok--action:hover { filter: brightness(1.08); }

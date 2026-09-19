@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -338,7 +339,37 @@ func otaNotifyIfStillDown(t OTATask, reason string) {
 	if err := db.WithContext(ctx).Where("node_id = ?", t.NodeID).Limit(1).Find(&n).Error; err != nil || n.ID == 0 || n.Online {
 		return
 	}
+	// 撤销在途期间打下的"上线豁免"：这次是任务终结仍离线的**真掉线**，已按掉线通报，
+	// 节点日后复联就该正常补一条"恢复上线"，与这条掉线配对。
+	takeOtaExempt(t.NodeID)
 	go notifyNodeDown(monitorNode{id: t.NodeID, label: n.Label, ws: true}, "WS 版", reason, 1)
+}
+
+// ==================== OTA 计划内重启的"上线"豁免 ====================
+//
+// OTA 重启必然伴随一次真实断连：掉线告警已豁免（见 store.go recordNodeOffline），
+// 同理这次计划内的复联也不该单独报一条"节点恢复上线"——否则群里会出现一条没有对应掉线的孤立上线。
+// 断连时打标记（markOtaExempt），节点下次注册时一次性消费（takeOtaExempt）。
+// 纯内存、与 down 通知锁存同生命周期：进程重启即清空，最坏情况是多收到一次上线通知。
+var (
+	otaExemptMu sync.Mutex
+	otaExemptS  = map[string]bool{}
+)
+
+// markOtaExempt 记下"这次断连是 OTA 计划内重启"，供下次注册时抑制上线通知
+func markOtaExempt(nodeID string) {
+	otaExemptMu.Lock()
+	otaExemptS[nodeID] = true
+	otaExemptMu.Unlock()
+}
+
+// takeOtaExempt 取出并清除豁免标记，返回此前是否存在（一次性消费）
+func takeOtaExempt(nodeID string) bool {
+	otaExemptMu.Lock()
+	defer otaExemptMu.Unlock()
+	found := otaExemptS[nodeID]
+	delete(otaExemptS, nodeID)
+	return found
 }
 
 // otaVersionHit 重连版本是否命中任务判定：

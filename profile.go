@@ -232,7 +232,7 @@ func registerProfileRoutes(admin *gin.RouterGroup) {
 			return
 		}
 		// pushUserWebhook 失败只记日志；测试端点需要把结果回给用户，这里复用报文构造手动发一次
-		if err := webhookDeliver(u, "测试通知：IPW-BOCE webhook 通道已打通", "webhook_test", 0); err != nil {
+		if err := webhookDeliver(u, "测试通知：IPW-BOCE webhook 通道已打通", "webhook_test", 0, ""); err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"ok": false, "error": err.Error()})
 			return
 		}

@@ -101,3 +101,53 @@ export const http = {
   patch: (path, body) => request('PATCH', path, body === undefined ? {} : body),
   del: (path, body) => request('DELETE', path, body),
 }
+
+// ==================== 文件下载（CSV 导出） ====================
+// 导出端点同样走鉴权头（Bearer / 个人 Token），所以不能用 <a href> 直链——必须先 fetch 成 Blob。
+// 文件名优先取后端的 Content-Disposition（服务端已生成带时间戳的名字），取不到再用兜底名。
+function filenameFrom(resp, fallback) {
+  const cd = resp.headers.get('Content-Disposition') || ''
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd)
+  if (!m) return fallback
+  try {
+    return decodeURIComponent(m[1])
+  } catch {
+    return m[1]
+  }
+}
+
+export async function downloadFile(path, fallbackName = 'export.csv') {
+  const headers = {}
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const resp = await fetch(API_BASE + path, { headers })
+  if (resp.status === 401 && onUnauthorized) onUnauthorized()
+  if (!resp.ok) {
+    let raw = `HTTP ${resp.status}`
+    try {
+      const t = await resp.text()
+      if (t) {
+        try {
+          const j = JSON.parse(t)
+          raw = j.statusMessage || j.error || j.message || raw
+        } catch {
+          raw = t
+        }
+      }
+    } catch {
+      /* 读体失败就沿用状态码文案 */
+    }
+    throw new ApiError(resp.status, localizeError(raw))
+  }
+  const blob = await resp.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filenameFrom(resp, fallbackName)
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  // 立即回收，避免长时间占用内存（下载已由浏览器接管）
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+  return a.download
+}

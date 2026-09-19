@@ -13,14 +13,15 @@ import (
 // 任务掉线告警在"所有者无邮箱"（或邮件路径不可用）时，落到站内信，所有者登录控制台后
 // 在顶栏铃铛查看（见 web ConsoleLayout 通知下拉）。内容为纯文本告警，可标记已读。
 //
-// 写入口：alert.go deliverDownAlert → createNotice；
+// 写入口：alert.go deliverToOwner（任务告警 → 任务所有者）；
+// nodeHealth.go notifyAdmins（节点掉线/恢复 → 所有启用 admin，含邮件与 Webhook 两路并行）。
 // 读入口：/admin/notices（列表/未读数/标记已读），见 registerNoticeRoutes。
 
 // AppNotice 一条站内通知
 type AppNotice struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	UserID    uint      `gorm:"index" json:"userId"`   // 收件用户 users.id
-	Kind      string    `gorm:"size:24" json:"kind"`   // sla_down（SLA 任务掉线）| node_down（服务节点掉线）
+	Kind      string    `gorm:"size:24" json:"kind"`   // sla_down（SLA 任务掉线）| node_down（服务节点掉线）| node_up（服务节点恢复上线）
 	TaskID    uint      `json:"taskId,omitempty"`      // 关联任务 id（kind=sla_down 时）；节点告警为 0
 	Title     string    `gorm:"size:256" json:"title"` // 主题（与邮件 subject 一致）
 	Body      string    `gorm:"type:text" json:"body"` // 正文

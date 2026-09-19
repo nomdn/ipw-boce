@@ -110,20 +110,21 @@ func restTask(c *gin.Context) {
 	c.JSON(http.StatusOK, taskWithOwner(t))
 }
 
-// restTaskSla GET /api/v1/tasks/:id/sla?hours=
+// restTaskSla GET /api/v1/tasks/:id/sla?hours= | ?start=&end=
 // 结构（已与需求确认）：顶层汇总 + byNode，不含 special/judge 等内部渲染字段。
+// 窗口：?hours= 相对（缺省 24），或 ?start=/&end= 绝对区间（见 timerange.go）。
 func restTaskSla(c *gin.Context) {
 	t, ok := restTaskVisible(c)
 	if !ok {
 		return
 	}
-	hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
-	resp, err := computeTaskSla(t.ID, time.Duration(hours*float64(time.Hour)))
+	tr := parseTimeRange(c, 24)
+	resp, err := computeTaskSlaRange(t.ID, tr.From, tr.To)
 	if err != nil {
 		restError(c, http.StatusNotFound, "not_found", err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, slaSugar(t.ID, hours, resp))
+	c.JSON(http.StatusOK, slaSugar(t.ID, tr.Hours, resp))
 }
 
 // slaSugar 把内部 slaTaskResp 重排成语法糖层确认的结构（顶层汇总 + byNode 节点明细）。

@@ -10,29 +10,48 @@
     </div>
 
     <div class="toolbar">
-      <div class="form-field">
-        <label>节点</label>
-        <select class="ak-select" v-model="f.node">
-          <option value="">全部</option>
-          <option v-for="n in knownNodes" :key="n" :value="n">{{ n }}</option>
-        </select>
+      <div class="tb-group">
+        <div class="form-field">
+          <label>时间范围</label>
+          <select class="ak-select" v-model="f.range" @change="load">
+            <option v-for="r in rangeOpts" :key="r.value" :value="r.value">{{ r.label }}</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>节点</label>
+          <select class="ak-select" v-model="f.node">
+            <option value="">全部</option>
+            <option v-for="n in knownNodes" :key="n" :value="n">{{ n }}</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>拨测方案</label>
+          <select class="ak-select" v-model="f.type">
+            <option value="">全部</option>
+            <option v-for="t in typeOpts" :key="t.value" :value="t.value">{{ t.label }}</option>
+          </select>
+        </div>
+        <!-- 目标模糊匹配：匹配节点侧 raw（含 v4/、dns 记录类型前缀），输入即按子串过滤 -->
+        <div class="form-field">
+          <label>目标</label>
+          <input class="ak-input" v-model.trim="f.target" placeholder="域名 / IP / URL 片段"
+            style="width:190px" @keyup.enter="load" />
+        </div>
+        <div class="form-field">
+          <label>条数</label>
+          <select class="ak-select" v-model="f.limit" @change="load">
+            <option :value="50">50</option>
+            <option :value="100">100</option>
+            <option :value="200">200</option>
+          </select>
+        </div>
       </div>
-      <div class="form-field">
-        <label>拨测方案</label>
-        <select class="ak-select" v-model="f.type">
-          <option value="">全部</option>
-          <option v-for="t in typeOpts" :key="t.value" :value="t.value">{{ t.label }}</option>
-        </select>
+      <div class="tb-group tb-group--actions">
+        <button class="ak-button ak-button--outline" @click="load">查询</button>
+        <button class="ak-button ak-button--outline" :disabled="exporting" @click="doExport">
+          {{ exporting ? '导出中…' : '导出 CSV' }}
+        </button>
       </div>
-      <div class="form-field">
-        <label>条数</label>
-        <select class="ak-select" v-model="f.limit" @change="load">
-          <option :value="50">50</option>
-          <option :value="100">100</option>
-          <option :value="200">200</option>
-        </select>
-      </div>
-      <button class="ak-button ak-button--outline" @click="load">查询</button>
     </div>
     <div v-if="loading" class="loading-center"><span class="ak-loading"></span></div>
     <div v-else-if="error" class="dim" style="color:var(--ak-signal-danger);margin:6px 0 10px">{{ error }}</div>
@@ -46,7 +65,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in probes" :key="p.id">
+            <tr v-for="(p, i) in probes" :key="rowKey(p, i)">
               <td class="mono nowrap">{{ fmtTime(p.createdAt) }}</td>
               <td class="mono nowrap">{{ p.nodeId }}</td>
               <td><span class="ak-tag ch">{{ apiLabel(p.apiType) }}</span></td>
@@ -68,24 +87,38 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { fetchProbes, fetchNodesBrief } from '../api/boce.js'
+import { fetchProbes, fetchNodesBrief, exportProbes } from '../api/boce.js'
 import { fmtTime } from '../utils/format.js'
-import { apiOptions, apiLabel, parseProbeRaw } from '../utils/probeMeta.js'
+import { apiOptions, probeHistoryTypes, apiLabel, parseProbeRaw } from '../utils/probeMeta.js'
 
 const cats = [
   { value: 'sched', label: '定时拨测' },
   { value: 'biz', label: '业务拨测' },
 ]
-// 拨测方案下拉：value 是后端 apiType slug，label 是面向用户的中文方案名（见 utils/probeMeta.js）
-const typeOpts = apiOptions
 const cat = ref('sched') // 当前页签
-const f = reactive({ node: '', type: '', limit: 100 })
+// 拨测方案下拉：value 是后端 apiType slug，label 是面向用户的中文方案名（见 utils/probeMeta.js）。
+// 定时拨测只可能由 SLA 任务产生（= apiOptions），业务拨测还含节点上报/一键拨测的诊断类（= probeHistoryTypes）——
+// 按页签给对应选项，避免在定时拨测里出现永远筛不到东西的"IP 归属地"。
+const typeOpts = computed(() => (cat.value === 'sched' ? apiOptions : probeHistoryTypes))
+// 时间范围：value 是小时数（'all' = 不限），提交时换算成 since（RFC3339）交给后端
+const rangeOpts = [
+  { value: 'all', label: '全部时间' },
+  { value: '1', label: '近 1 小时' },
+  { value: '24', label: '近 24 小时' },
+  { value: '168', label: '近 7 天' },
+]
+const f = reactive({ range: 'all', node: '', type: '', target: '', limit: 100 })
 const probes = ref([])
 const knownNodes = ref([])
 const loading = ref(false)
 const error = ref('')
+const exporting = ref(false)
 
 const curLabel = computed(() => cats.find((c) => c.value === cat.value)?.label || '')
+
+// 行 key：接口刻意不返回主键 id（ProbeResult.ID 是 json:"-"），
+// 直接绑 p.id 会让整表 key 全是 undefined（Vue 报重复 key），故用业务字段拼一个稳定值。
+const rowKey = (p, i) => `${p.createdAt}|${p.nodeId}|${p.apiType}|${p.raw}|${i}`
 
 // 解析每条样本的 raw → { kind, target }（speed 拆 v4/v6，dns 拆记录类型）
 // 缓存解析结果（同一 raw 重复出现时省一次正则）
@@ -125,20 +158,47 @@ function switchCat(v) {
   cat.value = v
   f.node = ''
   f.type = ''
+  f.target = ''
   load()
+}
+
+// 时间范围 → since：'all' 不带时间条件，其余按"距现在 N 小时"取 RFC3339（后端按 UTC 比较）
+function sinceOf(range) {
+  const h = Number(range)
+  if (!h) return ''
+  return new Date(Date.now() - h * 3600 * 1000).toISOString()
 }
 
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    probes.value = await fetchProbes({ node: f.node, type: f.type, cat: cat.value, limit: f.limit })
+    probes.value = await fetchProbes({
+      node: f.node, type: f.type, cat: cat.value, limit: f.limit,
+      since: sinceOf(f.range), target: f.target,
+    })
   } catch (e) {
     // 失败时不能只清空列表——否则与"该筛选条件下确实没有样本"无法区分
     probes.value = []
     error.value = e?.message || '加载失败'
   } finally {
     loading.value = false
+  }
+}
+
+// 导出当前筛选条件下的全部明细（不带 limit，后端默认上限 2 万行），权限范围与列表一致
+async function doExport() {
+  exporting.value = true
+  error.value = ''
+  try {
+    await exportProbes({
+      node: f.node, type: f.type, cat: cat.value,
+      since: sinceOf(f.range), target: f.target,
+    })
+  } catch (e) {
+    error.value = e?.message || '导出失败'
+  } finally {
+    exporting.value = false
   }
 }
 </script>
@@ -167,13 +227,13 @@ async function load() {
 }
 .seg-item:hover { color: var(--ak-text-primary); }
 .seg-item.active {
-  background: var(--ak-signal-info);
+  background: var(--ui-solid-info);
   color: #fff;
   font-weight: 600;
 }
 .ak-tag.ch.kind {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.18);
+  background: var(--ui-tint-hover);
+  border-color: var(--ui-line-ctl);
   color: var(--ak-text-secondary);
   font-size: 0.72rem;
 }

@@ -66,6 +66,7 @@
     "alert": {
         "enabled": true,          // 总开关
         "to": "",                 // 已弃用：告警按任务 owner 送达，本字段不再作为收件人
-        "downThreshold": 3        // 连续 N 轮任务全 down 才告警（缺省 3）
+        "downThreshold": 3,       // 连续 N 轮任务全 down 才告警（缺省 3）
+        "batchSeconds": 10        // 节点告警批次汇总窗口秒；同一窗口内多个节点掉线/恢复合并成一条（缺省 10，0 = 关闭逐条发）
     }
 }

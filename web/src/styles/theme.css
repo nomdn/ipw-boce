@@ -1,0 +1,435 @@
+/* ============================================================
+   ipw-boce 控制台 · 主题层
+   ------------------------------------------------------------
+   三层结构（从下往上）：
+     1) 暗色 token   :root —— ak-ui 的深色基线
+     2) 亮色 token   html[data-theme='light'] —— 浅灰底 + 近白卡片 + 黑字 + 蓝点缀
+     3) 统一形态层   html[data-theme] —— 亮 / 暗共用的一套"软化"形态语言
+   约定：形态与配色分离。
+     · 形态 = 圆角 / 剪角 / 描边粗细 / 投影 / 饰线 / 留白，两主题一致；
+     · 配色 = 具体色值，走本文件的两级语义变量（暗底基线 + 亮色覆盖）。
+   形态层选择器一律带 `html[data-theme]` 前缀：各页面 <style scoped> 里的
+   `.x[data-v-xxx]` 特异性是 (0,2,0)，只有 (0,2,1) 的带前缀写法才压得住它，
+   否则"软化"只对全局类生效、对 scoped 组件（弹窗 / 配置行 / 登录卡…）失效。
+
+   历史：曾经是「暗色工业硬派（直角 + 剪角 + 3~4px 实色粗饰线）
+   / 亮色软化」两套语言。代价是同一个组件切主题就"换了个东西"，
+   且暗色的方块感偏重。现统一为软化语言：小圆角 + 极淡描边 + 轻投影，
+   层级靠底色差与留白建立；彩色只留「面板标题前一小段竖条」与语义顶线做点缀。
+   色彩语义（信号色、图表色）不受影响。
+   ============================================================ */
+
+/* ---------- 1. 暗色基线（默认） ---------- */
+:root {
+  /* 分隔线：按强度递增 */
+  --ui-line-faint: rgba(255, 255, 255, 0.05);
+  --ui-line-soft: rgba(255, 255, 255, 0.06);
+  --ui-line: rgba(255, 255, 255, 0.08);
+  --ui-line-strong: rgba(255, 255, 255, 0.14);
+  --ui-line-ctl: rgba(255, 255, 255, 0.18);
+  --ui-line-hover: rgba(255, 255, 255, 0.34);
+  --ui-line-stronger: rgba(255, 255, 255, 0.4);
+
+  /* 轻填充：幽灵/常规/交互/强调/滚动条 */
+  --ui-tint-ghost: rgba(255, 255, 255, 0.02);
+  --ui-tint: rgba(255, 255, 255, 0.04);
+  --ui-tint-hover: rgba(255, 255, 255, 0.05);
+  --ui-tint-strong: rgba(255, 255, 255, 0.1);
+  --ui-tint-deep: rgba(255, 255, 255, 0.16);
+
+  /* 文本 */
+  --ui-text-placeholder: rgba(248, 248, 245, 0.35);
+  --ui-text-body: rgba(248, 248, 245, 0.88);
+
+  /* 装饰竖条 / 饰线：面板标题前 3px 短竖条用它。
+     暗色下就是信号蓝；亮色下换成参考站的亮青蓝 #22bbff。 */
+  --ui-rail: var(--ak-signal-info);
+
+  /* 面与阴影 */
+  --ui-aside-bg: var(--ak-surface-inverse);
+  --ui-scrim: rgba(17, 19, 21, 0.6);
+  --ui-code-bg: rgba(0, 0, 0, 0.25);
+  --ui-shadow-lift: rgba(0, 0, 0, 0.4);
+  --ui-shadow-drawer: rgba(0, 0, 0, 0.55);
+  --ui-shadow-panel: 0 12px 28px rgba(0, 0, 0, 0.4);
+  --ui-shadow-card: 0 24px 60px rgba(0, 0, 0, 0.5);
+
+  /* 语义底纹 */
+  --ui-nav-active: rgba(74, 171, 234, 0.14);
+  --ui-accent-tint: rgba(246, 84, 14, 0.06);
+
+  /* 实底填充（配白字的小徽标/激活段） */
+  --ui-solid-info: #4aabea;
+  --ui-solid-danger: #e33b3b;
+
+  /* 图表（供 echarts 引用） */
+  --chart-grid: #1f2a33;
+  --chart-axis: rgba(240, 240, 235, 0.45);
+  --chart-label: rgba(248, 248, 245, 0.72);
+  --chart-tooltip-bg: #101316;
+  --chart-tooltip-border: rgba(255, 255, 255, 0.2);
+  --chart-tooltip-text: #f8f8f5;
+  --chart-tint: rgba(255, 255, 255, 0.04);
+  --chart-tint-strong: rgba(255, 255, 255, 0.18);
+  /* 单序列柱状图（按节点请求量）的主色：暗色沿用信号黄（与原样一致），
+     亮色换成蓝 —— 大面积深琥珀黄压在浅底上最显生硬。 */
+  --chart-bar: #ffd802;
+
+  /* ---- 形态层色值（两主题形态一致、只有色值不同，用在文件末尾「统一形态层」）----
+     暗色是近黑石墨底：描边给一点点白，"浮起"主要靠影子（深底上要把影子加重才看得见）。 */
+  --ui-surface-line: var(--ui-line);                       /* 卡片/面板/浮层描边 */
+  --ui-surface-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 3px 12px rgba(0, 0, 0, 0.28);
+  --ui-float-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --ui-focus-ring: color-mix(in srgb, var(--ak-color-primary) 22%, transparent);
+  --ui-th-bg: var(--ui-tint-ghost);                        /* 表头底纹 */
+  --ui-icon-btn-bg: var(--ui-tint);                        /* 顶栏图标按钮底 */
+  --ui-nav-active-ink: var(--ak-text-primary);             /* 侧栏激活项文字 */
+  --ui-dot-glow: 0 0 6px var(--ak-signal-success);         /* 在线状态点发光 */
+  --ui-tint-info: color-mix(in srgb, var(--ak-signal-info) 16%, transparent);
+
+  /* 中文字距：ak-ui 的 0.12em 是给英文大写标签设计的，套在中文小标签上显得字距
+     松散、发"硬"。两主题统一收到接近默认字距。 */
+  --ak-type-wide: 0.02em;
+}
+
+/* ---------- 亮色（对齐参考站：浅灰底 + 近白卡片 + 黑字 + 亮蓝点缀） ---------- */
+html[data-theme='light'] {
+  /* 面：浅灰内容区 + 近白卡片 + 纯白控件/浮层 */
+  --ak-surface-canvas: #e2e4e6;                    /* 内容区底（浅灰，与卡片拉开一档） */
+  --ak-surface-panel: #f2f3f5;                     /* 卡片/面板（近白，与页面底拉开一档） */
+  --ak-surface-muted: #e9ebee;                     /* 卡内嵌块等次级面（比卡片略深） */
+  --ak-surface-raised: #ffffff;                    /* 输入框/弹窗/浮层：纯白 */
+  --ak-surface-inverse: #f2f3f5;                   /* 卡片底座（= 近白面板） */
+  --ak-text-primary: #1f2328;                      /* 正文深灰（不用纯黑：浅底上纯黑大字最显生硬） */
+  --ak-text-secondary: #71787f;
+  --ak-text-inverse: #ffffff;                      /* 仅备位；亮色下已无"深底白字"容器 */
+  --ak-shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.06);
+
+  /* 品牌主色：参考站的亮青蓝。压深到 #1288cc 才压得住白字（按钮/激活段实底用）。 */
+  --ak-color-primary: #1288cc;
+
+  /* 分隔线：细、浅（参考站边框几乎不可见 —— 层级靠色差与留白，不靠描边） */
+  --ui-line-faint: rgba(0, 0, 0, 0.035);
+  --ui-line-soft: rgba(0, 0, 0, 0.05);
+  --ui-line: rgba(0, 0, 0, 0.07);
+  --ui-line-strong: rgba(0, 0, 0, 0.1);
+  --ui-line-ctl: rgba(0, 0, 0, 0.12);
+  --ui-line-hover: rgba(0, 0, 0, 0.26);
+  --ui-line-stronger: rgba(0, 0, 0, 0.3);
+
+  /* 轻填充 */
+  --ui-tint-ghost: rgba(0, 0, 0, 0.012);
+  --ui-tint: rgba(0, 0, 0, 0.025);
+  --ui-tint-hover: rgba(0, 0, 0, 0.04);
+  --ui-tint-strong: rgba(0, 0, 0, 0.06);
+  --ui-tint-deep: rgba(0, 0, 0, 0.12);
+
+  /* 文本 */
+  --ui-text-placeholder: #aab1b8;
+  --ui-text-body: #1f2328;
+
+  /* 装饰竖条：参考站按钮/左竖条的亮青蓝。亮色下这条只做小面积点缀
+     （面板标题前 3×14px 的短竖条）。 */
+  --ui-rail: #22bbff;
+
+  /* 面与阴影 */
+  --ui-aside-bg: var(--ak-surface-canvas);         /* 侧栏退到内容区同色，靠 1px 线分隔 */
+  --ui-scrim: rgba(255, 255, 255, 0.84);           /* 顶栏：半透明白 + 模糊 */
+  --ui-code-bg: rgba(0, 0, 0, 0.04);
+  --ui-shadow-lift: rgba(0, 0, 0, 0.1);
+  --ui-shadow-drawer: rgba(0, 0, 0, 0.16);
+  --ui-shadow-panel: 0 6px 20px rgba(0, 0, 0, 0.1);
+  --ui-shadow-card: 0 16px 40px rgba(0, 0, 0, 0.14);
+
+  /* 语义底纹 */
+  --ui-nav-active: rgba(34, 187, 255, 0.14);       /* 侧栏激活项：亮蓝底纹 */
+  --ui-accent-tint: rgba(34, 187, 255, 0.1);
+
+  /* 实底填充（配白字的小徽标/激活段）——压深到白字可读 */
+  --ui-solid-info: #1288cc;
+  --ui-solid-danger: #d93a4c;
+
+  /* 装饰色：白底上要**压深**（与暗色"提亮加饱和"相反），否则浅色字在白卡片上看不清。
+     info 取参考站的文字蓝；accent/warn 保留暖色，作第 4/5 区分色。 */
+  --ak-signal-info: #1c93d6;      /* 蓝（参考站链接色） */
+  --ak-signal-action: #c98a00;    /* 黄 */
+  --ak-signal-accent: #e2620f;    /* 橙（次级区分色） */
+  --ak-signal-success: #12a150;   /* 绿 */
+  --ak-signal-danger: #d93a4c;    /* 红 */
+  --ak-signal-warn: #c2410c;      /* 琥珀 */
+  --ak-signal-disabled: #a8aeb5;
+
+  /* 图表：曲线画在**近白卡片**里 → 网格/轴/文字转深色（与暗色相反）；
+     信号色与上面同值（NODE_COLORS 等写死数组的前三位要跟这几个对齐）。 */
+  --chart-grid: rgba(0, 0, 0, 0.07);
+  --chart-axis: rgba(0, 0, 0, 0.35);
+  --chart-label: #5c646c;
+  --chart-tooltip-bg: #ffffff;
+  --chart-tooltip-border: rgba(0, 0, 0, 0.12);
+  --chart-tooltip-text: #15181c;
+  --chart-tint: rgba(0, 0, 0, 0.04);
+  --chart-tint-strong: rgba(0, 0, 0, 0.16);
+  --chart-cyan: #1c93d6;
+  --chart-yellow: #c98a00;
+  --chart-green: #12a150;
+  --chart-red: #d93a4c;
+  --chart-orange: #e2620f;
+  --chart-gray: #9aa1a8;
+  --chart-bar: #1c93d6;
+
+  /* ---- 形态层色值：浅底上描边要"看得见但不抢"，影子要极轻 ---- */
+  --ui-surface-line: rgba(0, 0, 0, 0.05);
+  --ui-surface-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 10px rgba(0, 0, 0, 0.03);
+  --ui-float-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  --ui-focus-ring: color-mix(in srgb, var(--ak-color-primary) 15%, transparent);
+  --ui-th-bg: rgba(0, 0, 0, 0.022);
+  --ui-icon-btn-bg: rgba(255, 255, 255, 0.72);
+  --ui-nav-active-ink: #0a7cb0;
+  --ui-dot-glow: none;                             /* 浅底上的光晕会糊成一团，去掉 */
+  --ui-tint-info: color-mix(in srgb, var(--ak-signal-info) 7%, transparent);
+}
+
+/* ---------- 亮色下的组件补偿（只保留纯配色差异，形态见末尾"统一形态层"） ----------
+   亮色已经是"浅底深字"的常规形态，绝大多数 ak-ui 组件不需要额外覆盖。
+   下面只处理少数与浅底不合的硬编码。 */
+
+/* ak-button 基座：白底 + 深字 + 细边框（参考站的次级按钮形态） */
+html[data-theme='light'] .ak-button {
+  color: #15181c;
+  background-color: #ffffff;
+  box-shadow: none;
+  border: 1px solid var(--ui-line-ctl);
+}
+html[data-theme='light'] .ak-button:hover:not(:disabled) {
+  background-color: #f0f2f4;
+  border-color: var(--ui-line-hover);
+}
+/* 主行动按钮：实底蓝 + 白字（--ak-color-primary 已在亮色段改成参考站蓝） */
+html[data-theme='light'] .ak-button.ak-button--action {
+  color: #ffffff;
+  background-color: var(--ak-color-primary);
+  border-color: transparent;
+}
+/* 描边按钮：不写死颜色，交给作用域（浅底上自动变深字 + 细描边） */
+html[data-theme='light'] .ak-button.ak-button--outline {
+  color: var(--ak-text-primary);
+  border-color: var(--ui-line-stronger);
+  background: transparent;
+}
+
+/* 载入指示器：ak-ui 默认亮黄，浅底上偏弱，改用信号蓝 */
+html[data-theme='light'] .ak-loading {
+  --ak-loading-color: var(--ak-signal-info);
+}
+
+/* 侧栏 / 顶栏：浅色框架。内部组件都走变量，无需重映射。 */
+html[data-theme='light'] .console-aside {
+  background: var(--ui-aside-bg);
+  border-right-color: var(--ui-line);
+  color: var(--ak-text-primary);
+}
+html[data-theme='light'] .console-topbar {
+  background: var(--ui-scrim);
+  border-bottom-color: var(--ui-line);
+  color: var(--ak-text-primary);
+}
+
+/* 代码块 / raw JSON */
+html[data-theme='light'] pre.raw-json,
+html[data-theme='light'] .fv-raw-pre {
+  background: var(--ui-code-bg);
+  color: var(--ui-text-body);
+}
+
+/* 滚动条 */
+html[data-theme='light'] ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+}
+
+/* ============================================================
+   统一形态层（亮 / 暗共用）
+   ------------------------------------------------------------
+   一套语言四个动作：
+     面   小圆角 + 极淡描边 + 一层轻投影，层级靠「底色差 + 留白」；
+     线   实色粗饰线一律取消，彩色只留面板标题前一小段短竖条；
+     控件 细描边 + 小圆角，聚焦给柔光环（不再是 2px 硬描边）；
+     块   筛选条 / 配置行的"左粗条"改成整块浅色底纹。
+   ============================================================ */
+
+/* ---- 3.1 面：去掉剪角，改小圆角 + 极淡描边 + 轻投影 ---- */
+html[data-theme] :is(.panel, .kpi-card, .node-card, .probe-card, .ev-panel, .login-card) {
+  border-color: var(--ui-surface-line);
+  border-radius: 10px;
+  box-shadow: var(--ui-surface-shadow);
+  clip-path: none;
+}
+/* 面板左边原本是 3px 实色竖条 → 收成 1px 普通描边（彩色改由标题前竖条承担） */
+html[data-theme] .panel {
+  border-left-width: 1px;
+}
+/* KPI / 节点卡 / 浮层面板顶部原本 3~4px 实色彩条 → 压到 2px（语义色保留） */
+html[data-theme] :is(.kpi-card, .node-card, .ev-panel, .login-card) {
+  border-top-width: 2px;
+}
+/* 浮层：同样去剪角、圆角略大，投影保留"浮起来"的量级（比卡片重） */
+html[data-theme] :is(.dlg, .ud-panel, .notice-panel) {
+  border-color: var(--ui-surface-line);
+  border-radius: 12px;
+  clip-path: none;
+  box-shadow: var(--ui-float-shadow);
+}
+/* 弹窗 / 登录卡保留一条细蓝顶边做识别 */
+html[data-theme] :is(.dlg, .ud-panel, .login-card) {
+  border-top: 2px solid var(--ui-rail);
+}
+
+/* ---- 3.2 饰线：粗彩条收掉，彩色只留"面板标题前一小段竖条" ---- */
+html[data-theme] .panel h2.panel-title {
+  letter-spacing: 0;
+  font-weight: 600;
+}
+html[data-theme] .panel h2.panel-title::before {
+  content: '';
+  flex: none;
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--ui-rail);
+}
+/* 顶部彩条：3.1 把描边色统一成了"面描边"，这里把语义色还回来（宽度已压到 2px）。
+   暗色用实色 —— 深底上彩色细线不刺眼，而 KPI 五色顶线本身就是信息。 */
+html[data-theme] .kpi-card { border-top-color: var(--ui-rail); }
+html[data-theme] .kpi-card.kpi--action { border-top-color: var(--ak-signal-action); }
+html[data-theme] .kpi-card.kpi--accent { border-top-color: var(--ak-signal-accent); }
+html[data-theme] .kpi-card.kpi--success { border-top-color: var(--ak-signal-success); }
+html[data-theme] .kpi-card.kpi--danger { border-top-color: var(--ak-signal-danger); }
+html[data-theme] .node-card { border-top-color: var(--ak-signal-disabled); }
+html[data-theme] .node-card.online { border-top-color: var(--ak-signal-success); }
+/* 浮层面板（OTA 事件）保留细蓝顶边，与弹窗 / 登录卡一致 */
+html[data-theme] .ev-panel { border-top-color: var(--ui-rail); }
+
+/* 亮色：浅底上实色顶线生硬 → 无语义的收成一线浅灰，语义色淡化到 4x%。
+   （这几条的语义色必须是 (0,3,1) 才能压过上面对应的 kpi--* 规则，故逐个列举，
+     不能用 :is() 合并 —— :is() 只取参数里最高的特异性，合并后反而降级。） */
+html[data-theme='light'] .kpi-card,
+html[data-theme='light'] .node-card,
+html[data-theme='light'] .kpi-card.kpi--action,
+html[data-theme='light'] .kpi-card.kpi--accent {
+  border-top-color: rgba(0, 0, 0, 0.055);
+}
+html[data-theme='light'] .kpi-card.kpi--danger {
+  border-top-color: color-mix(in srgb, var(--ak-signal-danger) 42%, transparent);
+}
+html[data-theme='light'] .kpi-card.kpi--success {
+  border-top-color: color-mix(in srgb, var(--ak-signal-success) 42%, transparent);
+}
+html[data-theme='light'] .node-card.online {
+  border-top-color: color-mix(in srgb, var(--ak-signal-success) 48%, transparent);
+}
+/* 筛选条 / 托管配置行：左粗条改圆角块 */
+html[data-theme] .node-filter {
+  border-left-width: 1px;
+  border-radius: 8px;
+}
+html[data-theme] .node-filter .nf-btn {
+  border-radius: 6px;
+}
+html[data-theme] .cfg-row {
+  border-radius: 8px;
+}
+html[data-theme] .cfg-row.active {
+  border-left-width: 1px;
+  border-color: color-mix(in srgb, var(--ak-signal-info) 30%, transparent);
+  background: var(--ui-tint-info);
+}
+
+/* ---- 3.3 控件：细描边 + 小圆角，聚焦给柔光环（去掉输入框左侧 4px 实色竖条） ---- */
+html[data-theme] .ak-input,
+html[data-theme] .ak-textarea,
+html[data-theme] .ak-select {
+  border: 1px solid var(--ui-line-ctl);
+  border-left: 1px solid var(--ui-line-ctl);
+  border-radius: 6px;
+}
+html[data-theme] .ak-input:focus,
+html[data-theme] .ak-textarea:focus,
+html[data-theme] .ak-select:focus {
+  border-color: var(--ak-color-primary);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ui-focus-ring);
+}
+
+/* ---- 3.4 导航与按钮：左竖条 → 圆角底纹块 ---- */
+html[data-theme] .console-nav .nav-item {
+  border-radius: 6px;
+}
+html[data-theme] .console-nav .nav-item.router-link-exact-active {
+  color: var(--ui-nav-active-ink);
+  font-weight: 500;
+}
+html[data-theme] .console-nav .nav-item.router-link-exact-active::before {
+  display: none;
+}
+html[data-theme] .ak-button {
+  border-radius: 6px;
+}
+html[data-theme] :is(.bell-btn, .theme-btn, .menu-btn, .aside-close) {
+  border-radius: 8px;
+  border-color: var(--ui-line);
+  background: var(--ui-icon-btn-bg);
+}
+
+/* ---- 3.5 标签：ak-ui 原版是「剪角 + 左侧实色竖条 + 800 字重 + 大写宽字距」，
+        那是给深底设计的工业标签；压小圆角块上就是一块硬邦邦的小色块。
+        统一改轻量 chip：去剪角、去竖条、去粗体，文字色仍跟语义信号色走
+        （ConfigView 靠 --advanced/--neutral 区分启用状态与归属池，语义不能丢）。 ---- */
+html[data-theme] .ak-tag {
+  --ak-tag-text: var(--ak-tag-signal);
+  --ak-tag-surface: color-mix(in srgb, var(--ak-tag-signal) 11%, transparent);
+  min-height: 0;
+  padding: 3px 8px;
+  border-color: transparent;
+  border-radius: 5px;
+  clip-path: none;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+html[data-theme] .ak-tag::before {
+  display: none;
+}
+
+/* ---- 3.6 零碎：表格头底纹、状态点去发光、小块圆角 ---- */
+html[data-theme] table.ak-table th {
+  background: var(--ui-th-bg);
+  letter-spacing: 0.02em;
+}
+html[data-theme] .dot.online {
+  box-shadow: var(--ui-dot-glow);
+}
+html[data-theme] .fv-pill {
+  border-radius: 6px;
+}
+html[data-theme] .sla-kpis .kpi {
+  border-radius: 8px;
+}
+
+/* ---- 3.7 排版与留白：大数值降字重、内容区放宽 ---- */
+html[data-theme] .kpi-card .kpi-value {
+  font-weight: 500;
+}
+/* 内容区留白放宽只用于宽屏：`html[data-theme] .x` 的特异性高于窄屏媒体查询里的 `.x`，
+   若不加 min-width 限定，会把 app.css 中「≤767px 收窄留白」的那套整段顶掉（手机端反而更挤）。 */
+@media (min-width: 768px) {
+  html[data-theme] .console-body {
+    padding: 24px 28px 44px;
+  }
+  html[data-theme] .panel {
+    padding-inline: 20px;
+  }
+  html[data-theme] .kpi-strip {
+    gap: 16px;
+  }
+  html[data-theme] .node-wall {
+    gap: 16px;
+  }
+}

@@ -28,15 +28,14 @@ import (
 func registerTaskSlaRoutes(g *gin.RouterGroup) {
 	// 某任务在窗口内的 SLA：按节点聚合（含最新样本特殊字段快照）
 	g.GET("/tasks/:id/sla", func(c *gin.Context) {
-		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
-		slaForTask(c, idParam(c), time.Duration(hours*float64(time.Hour)))
+		slaForTask(c, idParam(c), parseTimeRange(c, 24))
 	})
 
 	// 某任务在窗口内的时序曲线（SLA 卡片的延迟曲线 + 失败时间段红标）
 	// 归属同 SLA：user 仅可查自己创建的任务；admin/静态 token 不限。
 	// ?node=<nodeId>：只返回该节点的曲线（多节点对比视图前端逐节点拉取叠加，见 SlaView）。
 	g.GET("/tasks/:id/series", func(c *gin.Context) {
-		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
+		tr := parseTimeRange(c, 24)
 		node := strings.TrimSpace(c.Query("node"))
 		taskID := idParam(c)
 		ctx, cancel := dbCtx()
@@ -50,11 +49,9 @@ func registerTaskSlaRoutes(g *gin.RouterGroup) {
 			apiError(c, http.StatusForbidden, "not your task")
 			return
 		}
-		to := time.Now().UTC()
-		from := to.Add(-time.Duration(hours * float64(time.Hour)))
 		q := db.WithContext(ctx).
 			Where("task_id = ? AND source = ? AND created_at >= ? AND created_at <= ?",
-				taskID, sourceSched, from, to)
+				taskID, sourceSched, tr.From, tr.To)
 		if node != "" {
 			q = q.Where("node_id = ?", node)
 		}
@@ -63,7 +60,7 @@ func registerTaskSlaRoutes(g *gin.RouterGroup) {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
-		stepMin := stepForWindow(hours)
+		stepMin := stepForWindow(tr.Hours)
 		// 延迟曲线按采样轮次打点（每轮多节点取平均、不拆线不跨轮聚合），见 rowsToRoundSeries
 		series := rowsToRoundSeries(&t, rows)
 		resp := gin.H{"taskId": taskID, "stepMinutes": stepMin, "mode": "round", "series": series}
@@ -72,6 +69,9 @@ func registerTaskSlaRoutes(g *gin.RouterGroup) {
 		}
 		c.JSON(http.StatusOK, resp)
 	})
+
+	// 曲线导出 CSV：同参数、同归属校验（实现见 export.go）
+	g.GET("/tasks/:id/series/export", exportTaskSeriesHandler)
 
 	// ===== 公开状态页分享（B3，owner/admin；页面见 public_status.go / 前端 /s/:token）=====
 	// 令牌即"分享组"：批量把多选任务绑到同一令牌上（多选分享）；支持自定义令牌。POST 生成/重置，DELETE 关闭。
@@ -237,7 +237,8 @@ var errTaskNotFound = errors.New("task not found")
 
 // slaForTask gin handler：查询某任务 source=sched 样本并按节点聚合
 // user 仅可查看自己创建的任务；admin/静态 token 不限。
-func slaForTask(c *gin.Context, taskID uint, dur time.Duration) {
+// tr 同时支持相对窗口（?hours=）与绝对区间（?start=&end=），见 timerange.go。
+func slaForTask(c *gin.Context, taskID uint, tr timeRange) {
 	ctx, cancel := dbCtx()
 	defer cancel()
 	var t ProbeTask
@@ -249,7 +250,7 @@ func slaForTask(c *gin.Context, taskID uint, dur time.Duration) {
 		apiError(c, http.StatusForbidden, "not your task")
 		return
 	}
-	resp, err := computeTaskSla(taskID, dur)
+	resp, err := computeTaskSlaRange(taskID, tr.From, tr.To)
 	if err != nil {
 		if err == errTaskNotFound {
 			apiError(c, http.StatusNotFound, err.Error())
@@ -262,16 +263,22 @@ func slaForTask(c *gin.Context, taskID uint, dur time.Duration) {
 }
 
 // computeTaskSla 核心聚合（HTTP handler 与 WS 实时推送共用）：
-// 查询某任务 source=sched 窗口样本，按节点聚合返回完整 SLA 快照。errTaskNotFound 表示任务不存在。
+// 「最近 dur」的相对窗口，内部转调 computeTaskSlaRange（保留该签名，WS 推送与公开
+// REST 接口都按相对窗口订阅，不需要绝对区间）。
 func computeTaskSla(taskID uint, dur time.Duration) (*slaTaskResp, error) {
+	to := time.Now().UTC()
+	return computeTaskSlaRange(taskID, to.Add(-dur), to)
+}
+
+// computeTaskSlaRange 按绝对区间 [from, to] 聚合某任务 source=sched 样本，
+// 按节点聚合返回完整 SLA 快照。errTaskNotFound 表示任务不存在。
+func computeTaskSlaRange(taskID uint, from, to time.Time) (*slaTaskResp, error) {
 	ctx, cancel := dbCtx()
 	defer cancel()
 	var t ProbeTask
 	if err := db.WithContext(ctx).First(&t, taskID).Error; err != nil {
 		return nil, errTaskNotFound
 	}
-	to := time.Now().UTC()
-	from := to.Add(-dur)
 
 	var rows []ProbeResult
 	if err := db.WithContext(ctx).

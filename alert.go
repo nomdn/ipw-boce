@@ -37,8 +37,9 @@ import (
 
 // 站内信类型（AppNotice.Kind）
 const (
-	noticeKindSLA  = "sla_down"  // SLA 定时拨测任务掉线 → 发给任务 owner
-	noticeKindNode = "node_down" // 拨测服务节点掉线 → 发给所有启用 admin
+	noticeKindSLA    = "sla_down"  // SLA 定时拨测任务掉线 → 发给任务 owner
+	noticeKindNode   = "node_down" // 拨测服务节点掉线 → 发给所有启用 admin
+	noticeKindNodeUp = "node_up"   // 拨测服务节点恢复上线（仅"掉线后回归"）→ 发给所有启用 admin
 )
 
 // smtpReady SMTP 邮件路径是否可用（host/user/from 齐备且 alert.enabled）。
@@ -199,7 +200,7 @@ func deliverToOwner(owner *User, subject, body, event string, taskID uint, quiet
 	}
 	// 3) Webhook 路径：所有者在个人资料里配了接收端就推（第三条投递路径，失败仅记日志）
 	if !quiet {
-		pushUserWebhook(owner, subject, body, event, taskID)
+		pushUserWebhook(owner, subject, body, event, taskID, "")
 	}
 }
 
@@ -238,25 +239,28 @@ func inQuietHours(t *ProbeTask) bool {
 	return cur >= a || cur < b // 跨零点窗口
 }
 
-// pushUserWebhook 向用户自配的 Webhook 推送通知（任务告警等），失败仅记日志，不影响邮件/站内信主路径。
-func pushUserWebhook(u *User, title, content, event string, taskID uint) {
+// pushUserWebhook 向用户自配的 Webhook 推送通知（任务告警、节点告警、测试消息），
+// 失败仅记日志，不影响邮件/站内信主路径。
+// nodeID 非空表示节点类事件（node_down / node_up），用于在 generic 报文里带上节点 id。
+func pushUserWebhook(u *User, title, content, event string, taskID uint, nodeID string) {
 	if strings.TrimSpace(u.WebhookURL) == "" {
 		return
 	}
-	if err := webhookDeliver(u, title+"\n"+content, event, taskID); err != nil {
-		log.Printf("[alert] ERROR webhook push owner#%d (%s): %v", u.ID, event, err)
+	if err := webhookDeliver(u, title+"\n"+content, event, taskID, nodeID); err != nil {
+		log.Printf("[alert] ERROR webhook push user#%d (%s): %v", u.ID, event, err)
 	} else {
-		log.Printf("[alert] webhook push owner#%d (%s) ok", u.ID, event)
+		log.Printf("[alert] webhook push user#%d (%s) ok", u.ID, event)
 	}
 }
 
 // webhookDeliver 实际投递 Webhook，报文格式按 WebhookType：
-//   - "" / generic：结构化 JSON {"event","taskId","title","content"}（自建接收端用）
+//   - "" / generic：结构化 JSON {"event","taskId","title","nodeId"?}（自建接收端用）；
+//     nodeId 仅在节点类事件（node_down / node_up）时出现，任务类事件不带该键。
 //   - wecom：企业微信/钉钉群机器人 text 格式 {"msgtype":"text","text":{"content":...}}
 //   - feishu：飞书自定义机器人 text 格式 {"msg_type":"text","content":{"text":...}}
 //
 // URL 为空 = 未配置（no-op 返回 nil）；HTTP 状态 ≥400 视为失败。
-func webhookDeliver(u *User, text, event string, taskID uint) error {
+func webhookDeliver(u *User, text, event string, taskID uint, nodeID string) error {
 	url := strings.TrimSpace(u.WebhookURL)
 	if url == "" {
 		return nil
@@ -271,7 +275,11 @@ func webhookDeliver(u *User, text, event string, taskID uint) error {
 	case "feishu":
 		payload = map[string]any{"msg_type": "text", "content": map[string]string{"text": text}}
 	default: // generic
-		payload = map[string]any{"event": event, "taskId": taskID, "title": text}
+		m := map[string]any{"event": event, "taskId": taskID, "title": text}
+		if strings.TrimSpace(nodeID) != "" {
+			m["nodeId"] = nodeID
+		}
+		payload = m
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

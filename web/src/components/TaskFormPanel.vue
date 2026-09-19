@@ -44,65 +44,75 @@
       </div>
     </div>
 
+    <!-- 第二行：同类控件各自成组 —— 判定/范围（输入+下拉+勾选）｜通知与标签（输入）｜开关项（勾选）｜操作（按钮） -->
     <div class="form-row">
-      <div class="form-field">
-        <label>期望状态码</label>
-        <input class="ak-input" v-model.trim="form.expectStatus" placeholder="2xx 或 200,301" style="width:130px" />
-      </div>
-      <!-- 节点范围：宽度 150 让"全部节点 / 指定节点"四字完整显示 -->
-      <div class="form-field">
-        <label>节点范围</label>
-        <select class="ak-select" v-model="form.nodeScope" style="width:150px">
-          <option value="all">全部节点</option>
-          <option value="custom">指定节点</option>
-        </select>
-      </div>
-      <div class="form-field" v-if="form.nodeScope === 'custom'" style="flex:1;min-width:260px">
-        <label>节点（勾选）</label>
-        <div class="node-picks">
-          <label v-for="n in nodes" :key="n.nodeId" class="node-pick" :title="n.version ? '版本 ' + n.version : '未上报版本'">
-            <input type="checkbox" :value="n.nodeId" v-model="picked" />
-            <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.nodeId }}
-            <span v-if="n.label" class="dim">{{ n.label }}</span>
-          </label>
-          <span v-if="!nodes || !nodes.length" class="dim">暂无可用节点</span>
+      <div class="tb-group">
+        <div class="form-field">
+          <label>期望状态码</label>
+          <input class="ak-input" v-model.trim="form.expectStatus" placeholder="2xx 或 200,301" style="width:130px" />
+        </div>
+        <!-- 节点范围：宽度 150 让"全部节点 / 指定节点"四字完整显示 -->
+        <div class="form-field">
+          <label>节点范围</label>
+          <select class="ak-select" v-model="form.nodeScope" style="width:150px">
+            <option value="all">全部节点</option>
+            <option value="custom">指定节点</option>
+          </select>
+        </div>
+        <div class="form-field" v-if="form.nodeScope === 'custom'" style="flex:1;min-width:260px">
+          <label>节点（勾选）</label>
+          <div class="node-picks">
+            <label v-for="n in nodes" :key="n.nodeId" class="node-pick" :title="n.version ? '版本 ' + n.version : '未上报版本'">
+              <input type="checkbox" :value="n.nodeId" v-model="picked" />
+              <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.nodeId }}
+              <span v-if="n.label" class="dim">{{ n.label }}</span>
+            </label>
+            <span v-if="!nodes || !nodes.length" class="dim">暂无可用节点</span>
+          </div>
+        </div>
+        <!-- 全选/清空属于上面的节点勾选，跟着它走，不跟「保存」混在一起 -->
+        <div class="form-field" v-if="form.nodeScope === 'custom' && nodes && nodes.length" style="min-width:120px">
+          <label>&nbsp;</label>
+          <div class="node-picks">
+            <button type="button" class="ak-button ak-button--outline" style="font-size:.72rem;padding:3px 8px"
+              @click="picked = nodes.map(n => n.nodeId)">全选</button>
+            <button type="button" class="ak-button ak-button--outline" style="font-size:.72rem;padding:3px 8px"
+              @click="picked = []">清空</button>
+          </div>
+        </div>
+        <div class="form-field">
+          <label>免打扰时段</label>
+          <input class="ak-input" v-model.trim="form.quietHours" placeholder="23:00-07:00，留空不静默" style="width:170px" />
+        </div>
+        <div class="form-field">
+          <label>标签</label>
+          <input class="ak-input" v-model.trim="form.tags" placeholder="逗号分隔，如 生产,核心" style="width:180px" />
         </div>
       </div>
-      <div class="form-field" v-if="form.nodeScope === 'custom' && nodes && nodes.length" style="min-width:120px">
-        <label>&nbsp;</label>
-        <div class="node-picks">
-          <button type="button" class="ak-button ak-button--outline" style="font-size:.72rem;padding:3px 8px"
-            @click="picked = nodes.map(n => n.nodeId)">全选</button>
-          <button type="button" class="ak-button ak-button--outline" style="font-size:.72rem;padding:3px 8px"
-            @click="picked = []">清空</button>
-        </div>
+
+      <div class="tb-group tb-group--checks">
+        <label class="chk" v-if="form.apiType === 'detail'">
+          <input type="checkbox" v-model="form.bothProtocols" /> HTTP 与 HTTPS 均需命中才算成功
+        </label>
+        <label class="chk" v-if="form.apiType === 'detail' || form.apiType === 'ssl'">
+          <input type="checkbox" v-model="form.requireAllStacks" /> IPv4 与 IPv6 均可用才算通过
+        </label>
+        <label class="chk" v-if="form.apiType === 'ssl'">
+          <input type="checkbox" v-model="form.certExpiredDown" /> 证书过期视为不可用
+        </label>
+        <label class="chk">
+          <input type="checkbox" v-model="form.notifyRecover" /> 恢复时也通知
+        </label>
+        <label class="chk" title="勾选后，公开分享页不显示该任务的拨测目标">
+          <input type="checkbox" v-model="form.hideTarget" /> 分享页隐藏拨测目标
+        </label>
       </div>
-      <label class="chk" v-if="form.apiType === 'detail'">
-        <input type="checkbox" v-model="form.bothProtocols" /> HTTP 与 HTTPS 均需命中才算成功
-      </label>
-      <label class="chk" v-if="form.apiType === 'detail' || form.apiType === 'ssl'">
-        <input type="checkbox" v-model="form.requireAllStacks" /> IPv4 与 IPv6 均可用才算通过
-      </label>
-      <label class="chk" v-if="form.apiType === 'ssl'">
-        <input type="checkbox" v-model="form.certExpiredDown" /> 证书过期视为不可用
-      </label>
-      <label class="chk">
-        <input type="checkbox" v-model="form.notifyRecover" /> 恢复时也通知
-      </label>
-      <label class="chk" title="勾选后，公开分享页不显示该任务的拨测目标">
-        <input type="checkbox" v-model="form.hideTarget" /> 分享页隐藏拨测目标
-      </label>
-      <div class="form-field">
-        <label>免打扰时段</label>
-        <input class="ak-input" v-model.trim="form.quietHours" placeholder="23:00-07:00，留空不静默" style="width:170px" />
-      </div>
-      <div class="form-field">
-        <label>标签</label>
-        <input class="ak-input" v-model.trim="form.tags" placeholder="逗号分隔，如 生产,核心" style="width:180px" />
-      </div>
+
       <span style="flex:1"></span>
-      <button class="ak-button ak-button--outline" @click="emit('cancel')">取消</button>
-      <button class="ak-button ak-button--action" @click="emit('submit')" :disabled="saving">保存</button>
+      <div class="tb-group tb-group--actions">
+        <button class="ak-button ak-button--outline" @click="emit('cancel')">取消</button>
+        <button class="ak-button ak-button--action" @click="emit('submit')" :disabled="saving">保存</button>
+      </div>
     </div>
     <div v-if="msg" :class="err ? 'err' : 'ok-200'" style="margin-top:8px;font-size:.8rem">{{ msg }}</div>
   </section>
@@ -136,6 +146,8 @@ const typeDesc = computed(() => apiOptions.find((t) => t.value === props.form.ap
 
 <style scoped>
 .type-desc { font-size: .7rem; margin-top: 3px; min-height: 1em; }
+/* 操作按钮组：即使换行到下一行也贴着右缘，保存/取消位置稳定不漂 */
+.tb-group--actions { margin-left: auto; }
 .node-picks {
   display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center;
   max-width: 560px;

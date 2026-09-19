@@ -155,7 +155,49 @@ func applyNodeDefs(rows []NodeDef) {
 	}
 	nodePoolMu.Unlock()
 
+	// 凭据索引与节点池同源重建：控制台保存后即刻生效，无需重启
+	applyNodeCredentials(rows)
+
 	refreshWatchedNodes()
+}
+
+// ==================== 库托管凭据（api-keys / ws-keys） ====================
+//
+// 凭据原只存在 env > setting.json（API_KEYS / WS_KEYS 仅启动时读一次），改一次要重启进程。
+// 现随节点定义入库：控制台在节点表单里填写，保存即生效、无需重启
+// （applyPoolChange → reloadNodePools → applyNodeDefs → applyNodeCredentials 会同步重建索引）。
+//
+// 读取口径逐键判定：库里有非空值 → 用库；否则回落 env > setting.json，老部署升级后行为不变。
+// 明文永不经接口回显（见 db.go 里 NodeDef 的 json:"-"），列表只返回是否已设置。
+var nodeCredMu sync.RWMutex
+var nodeCreds = map[string]nodeCredential{}
+
+// nodeCredential 一个节点的两项凭据
+type nodeCredential struct {
+	APIKey string // 中心 → 该节点 HTTP 接口的访问令牌（对应 api-keys）
+	WSKey  string // 该节点 → 中心的 WS 注册校验密钥（对应 ws-keys）
+}
+
+// lookupNodeCredential 查库托管的凭据（没有则返回零值）
+func lookupNodeCredential(nodeID string) nodeCredential {
+	nodeCredMu.RLock()
+	defer nodeCredMu.RUnlock()
+	return nodeCreds[nodeID]
+}
+
+// applyNodeCredentials 用节点定义重建凭据索引。含停用节点：凭据与是否入池无关，
+// 停用只是不进池，节点仍可能连上来注册。
+func applyNodeCredentials(rows []NodeDef) {
+	next := make(map[string]nodeCredential, len(rows))
+	for _, r := range rows {
+		if r.APIKey == "" && r.WSKey == "" {
+			continue
+		}
+		next[r.NodeID] = nodeCredential{APIKey: r.APIKey, WSKey: r.WSKey}
+	}
+	nodeCredMu.Lock()
+	nodeCreds = next
+	nodeCredMu.Unlock()
 }
 
 // ==================== 已接入但未配置的节点（控制台补录下拉框数据源） ====================
@@ -237,11 +279,14 @@ type nodeDefInput struct {
 	Label     string   `json:"label"`
 	URL       string   `json:"url"`
 	WS        *bool    `json:"ws"`
-	Pool      string   `json:"pool"`       // 逗号分隔多选："api" / "location" / "api,location"
-	Pools     []string `json:"pools"`      // 数组形式，与 pool 二选一；两者都给时以 pools 为准
+	Pool      string   `json:"pool"`  // 逗号分隔多选："api" / "location" / "api,location"
+	Pools     []string `json:"pools"` // 数组形式，与 pool 二选一；两者都给时以 pools 为准
 	Stack     string   `json:"stack"`
 	Enabled   *bool    `json:"enabled"`
 	SortOrder *int     `json:"sortOrder"`
+	// 凭据：nil（未传）=不改；空串=清除；非空=设置。明文不回显，前端靠 hasApiKey / hasWsKey 判断是否已设置
+	APIKey *string `json:"apiKey"`
+	WSKey  *string `json:"wsKey"`
 }
 
 // normalize 校验并规整入参，返回规整后的 pool 与 stack。
@@ -347,6 +392,11 @@ func registerNodeDefRoutes(group *gin.RouterGroup) {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// 凭据明文不回显：只告诉前端"是否已设置"，供列表与表单做标记
+		for i := range rows {
+			rows[i].HasAPIKey = rows[i].APIKey != ""
+			rows[i].HasWSKey = rows[i].WSKey != ""
+		}
 		c.JSON(http.StatusOK, rows)
 	})
 
@@ -386,10 +436,19 @@ func registerNodeDefRoutes(group *gin.RouterGroup) {
 			Enabled:   in.Enabled == nil || *in.Enabled, // 未传默认启用
 			SortOrder: derefInt(in.SortOrder),
 		}
+		// 凭据：新增时未传即视为未设置（空串）
+		if in.APIKey != nil {
+			row.APIKey = strings.TrimSpace(*in.APIKey)
+		}
+		if in.WSKey != nil {
+			row.WSKey = strings.TrimSpace(*in.WSKey)
+		}
 		if err := db.WithContext(ctx).Create(&row).Error; err != nil {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
+		row.HasAPIKey = row.APIKey != ""
+		row.HasWSKey = row.WSKey != ""
 		applyPoolChange(c, row.NodeID)
 		c.JSON(http.StatusOK, row)
 	})
@@ -458,6 +517,13 @@ func registerNodeDefRoutes(group *gin.RouterGroup) {
 			"sort_order": derefInt(in.SortOrder),
 			"updated_at": time.Now().UTC(),
 		}
+		// 凭据：nil 不动、空串清除、非空设置（列名取显式 column 标签）
+		if in.APIKey != nil {
+			updates["api_key"] = strings.TrimSpace(*in.APIKey)
+		}
+		if in.WSKey != nil {
+			updates["ws_key"] = strings.TrimSpace(*in.WSKey)
+		}
 		if label := strings.TrimSpace(in.Label); label != "" {
 			updates["label"] = label
 		}
@@ -470,6 +536,8 @@ func registerNodeDefRoutes(group *gin.RouterGroup) {
 		}
 		var fresh NodeDef
 		_ = db.WithContext(ctx).Where("id = ?", id).First(&fresh).Error
+		fresh.HasAPIKey = fresh.APIKey != ""
+		fresh.HasWSKey = fresh.WSKey != ""
 		applyPoolChange(c, in.NodeID)
 		c.JSON(http.StatusOK, fresh)
 	})

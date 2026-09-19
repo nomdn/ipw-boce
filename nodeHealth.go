@@ -14,9 +14,10 @@ import (
 // ==================== 服务节点(拨测节点)掉线监控 ====================
 //
 // 监控对象：setting.json 节点池（api-base-url 三栈 + ip-location-api）里配置的全部服务节点。
-// 两种连路各自判活：
-//   - WS 版节点（节点条目 "ws": true）：靠心跳——节点维持 WS 长连接，middleware maintenanceLoop
-//     每 20s ping、空闲 >75s 剔除。本模块据此(peer 是否在线)判 up/down。
+// 两种连路各自判活 —— 但**本模块只管 HTTP 版**：
+//   - WS 版节点（节点条目 "ws": true）：不用本模块判定。判活靠 ws.go 心跳（maintenanceLoop 每 20s
+//     ping+status、空闲 >75s 剔除），翻转与通报收敛在 store.go 的 recordNodeOffline /
+//     recordNodeOnline 单点——断连即置离线，通报则先过 nodeDownGraceDelay 宽限窗口再确认发送。
 //   - HTTP 版节点（缺省，非 ws）：middleware 每 1 小时 GET 该节点 url（health 接口就在 url 根路径，
 //     无任何追加路径）探活；返回 2xx/3xx 视为 up，网络错或 >=4xx 视为 down；连续失败才判 down。
 //
@@ -24,9 +25,20 @@ import (
 //   - 仅对"曾经在线"的节点告警：新启动即未连上/从未探活成功的节点(如停用、池中占位)不上报，
 //     避免冷启动误报。
 //   - down 翻转(up→down) 时通知一次(每事件一封)，up 复位后可再次告警——即"每事件一次"。
+//   - WS 版的掉线通报另带 20s 宽限窗口：窗口内节点恢复注册则**整条不报**（掉线与随后的"恢复上线"
+//     都不报），避免秒级闪断刷屏；窗口过后仍离线才发。判定与通报见 store.go recordNodeOffline。
 //
-// 通知投递（与用户确认）：节点掉线 → 发给**所有启用的 admin 账号**，
-//   每个 admin **同时**发 SMTP 邮件(有邮箱且 SMTP 可用) + 落一条站内信(铃铛可见)。
+// 三道"计划内静默"叠加在通知层（采集与事件流一律如实记录，只影响"怎么告诉人"）：
+//   - 掉线宽限（store.go nodeDownGraceDelay，20s）：秒级闪断整条不报
+//   - 计划维护窗口（maintenance.go）：窗口内的掉线/恢复都不报，且成对抑制（不会孤立上线）
+//   - 批次汇总（alert_batch.go，alert.batchSeconds 缺省 10s）：同批多节点合并成一条，避免刷屏
+//
+// 通知投递（与用户确认）：节点掉线/恢复 → 发给**所有启用的 admin 账号**（role=admin 且 enabled），
+//   每个 admin **同时**走三路（互不回退）：SMTP 邮件(有邮箱且 SMTP 可用) + 站内信(铃铛可见) +
+//   Webhook(个人资料自配才推)。节点告警是系统级事件，Webhook 同样只覆盖 admin 角色。
+//   down → kind=node_down / event=node_down；up → kind=node_up / event=node_up。
+//   "上线"只在**掉线后恢复**时通报（冷启动首次上线、OTA 计划内重启复联、中心重启后重连都不报），
+//   见 notifyNodeUp 与 store.go recordNodeOnline。
 
 // 探活与防抖参数（固定值，无配置项）
 const (
@@ -34,7 +46,6 @@ const (
 	nodeHTTPInterval  = time.Hour        // HTTP 版探活周期：每 1 小时
 	nodeHTTPTimeout   = 10 * time.Second // 单次 HTTP 探活超时
 	nodeHTTPDownFails = 2                // HTTP 版连续探活失败达此数才判 down（约 2 小时）
-	nodeWSDownTicks   = 3                // WS 版连续多少轮(60s)不在线判 down（约 3 分钟，容忍重连）
 )
 
 // monitorNode 一个被监控节点（来自配置池，id 去重）
@@ -55,8 +66,6 @@ type nodeWatchState struct {
 	// HTTP 版
 	httpLast  time.Time // 上次探活时间
 	httpFails int       // 连续失败次数
-	// WS 版
-	wsDownTicks int // 连续判不在线的轮数
 }
 
 // nodeWatcher 全局看门狗状态
@@ -186,9 +195,8 @@ func (w *nodeWatcher) tick(first bool) {
 	w.mu.Unlock()
 
 	for _, st := range states {
-		if st.node.ws {
-			w.checkWS(st)
-		} else {
+		// WS 版节点不归本模块管（见文件头注释）：判活与通报在 ws.go 心跳 + store.go 单点驱动
+		if !st.node.ws {
 			w.checkHTTP(st, first)
 		}
 	}
@@ -234,9 +242,11 @@ func (w *nodeWatcher) checkHTTP(st *nodeWatchState, first bool) {
 		wasDown := st.down
 		st.everOnline = true
 		st.httpFails = 0
+		recovered := false
 		if wasDown {
 			// 从离线恢复：翻回在线并写库（markNodeUp 内部做事件去重）
 			st.down = false
+			recovered = true
 			log.Printf("[node] %s(%s) recovered (http)", st.node.id, st.node.label)
 			markNodeUp(st.node, "http probe ok", version, caps)
 		} else if !st.upWritten {
@@ -246,7 +256,15 @@ func (w *nodeWatcher) checkHTTP(st *nodeWatchState, first bool) {
 			log.Printf("[node] %s(%s) http up, now tracked in node list", st.node.id, st.node.label)
 			markNodeUp(st.node, "http probe ok", version, caps)
 		}
+		// 出锁后再用节点信息（refreshWatchedNodes 会在锁内改写 st.node），先复制一份避免竞态
+		node := st.node
 		w.mu.Unlock()
+		// 只有"判过 down 又探活成功"才算恢复上线：首次入库的那次不发通知
+		// （cold start / 池中新补的节点都不该报"恢复"），与 WS 版的判定口径一致。
+		if recovered {
+			log.Printf("[node] %s(%s) http recovered, notify admins", node.id, node.label)
+			go notifyNodeUp(node, "HTTP 版", "探活恢复")
+		}
 		return
 	}
 	// 探活失败：累计，达到阈值且从未告警过本次 down 才翻转
@@ -269,79 +287,123 @@ func (w *nodeWatcher) checkHTTP(st *nodeWatchState, first bool) {
 	}
 }
 
-// checkWS 根据 WS peer 是否在线判定（DB online 快照由 ws.go 心跳维护）。
-func (w *nodeWatcher) checkWS(st *nodeWatchState) {
-	online := false
-	if wsSrv != nil {
-		wsSrv.mu.Lock()
-		_, online = wsSrv.peers[st.node.id]
-		wsSrv.mu.Unlock()
-	}
-	w.mu.Lock()
-	if online {
-		if !st.everOnline {
-			st.everOnline = true
-		}
-		if st.down {
-			st.down = false
-			st.wsDownTicks = 0
-			log.Printf("[node] %s(%s) ws recovered", st.node.id, st.node.label)
-		}
-		w.mu.Unlock()
+// notifyNodeDown 通知所有启用 admin：邮件(有邮箱且 SMTP 可用) + 站内信 + Webhook 三路。
+// 每 down 事件一次由调用方状态机保证（见 checkHTTP 的 down 翻转、store.go recordNodeOffline 的锁存）。
+//
+// 这里还叠了两道**计划内静默**（顺序有意义）：
+//  1. 计划维护窗口（maintenance.go）：窗口内的掉线不推送，并打标记让随后的恢复一并静默——保证配对，
+//     不会出现"掉线被吞、恢复照发"的孤立上线通知。
+//  2. 批次汇总（alert_batch.go）：同一时间窗内多个节点掉线合并成一条；只有 1 个节点时文案与原来完全一致。
+func notifyNodeDown(n monitorNode, mode, reason string, streak int) {
+	if hit, w := maintenanceHit(n.id, time.Now()); hit {
+		markMaintSuppressed(n.id)
+		log.Printf("[node] %s down but inside maintenance window (%s), down/up alert suppressed", n.id, w.describe())
 		return
 	}
-	if !st.everOnline {
-		w.mu.Unlock()
-		return // 启动后从未连上：不告警
-	}
-	st.wsDownTicks++
-	if st.wsDownTicks >= nodeWSDownTicks && !st.down {
-		st.down = true
-	}
-	w.mu.Unlock()
-
-	// WS 节点掉线通知改由 registry 单点驱动（store.go recordNodeOffline 在 real online→offline
-	// 翻转时发），与节点状态页严格一致、且覆盖未入配置池的临时 WS 节点。
-	// 此处仅维护 down 状态，不再重复发 notifyNodeDown，避免对配置池节点双重告警。
+	enqueueNodeAlert(nodeAlertDown, nodeAlertItem{n: n, mode: mode, reason: reason, streak: streak})
 }
 
-// notifyNodeDown 通知所有启用 admin：每个 admin 同时发邮件(有邮箱且 SMTP 可用) + 站内信。
-// 每 down 事件一次由调用方状态机保证（见 checkHTTP/checkWS 的 down 翻转）。
-func notifyNodeDown(n monitorNode, mode, reason string, streak int) {
-	admins := enabledAdmins()
-	if len(admins) == 0 {
-		log.Printf("[node] %s down but no enabled admin to notify", n.id)
+// notifyNodeUp 通知所有启用 admin：某节点"掉线后恢复上线"。
+//
+// 只在**真的掉过线**时才会被调用（判定见 store.go recordNodeOnline / nodeHealth.go checkHTTP）：
+// 冷启动首次上线、从未探活成功的节点、OTA 计划内重启的复联、中心重启后的重连都不发，
+// 保证群里的"上线"总能对上先前那条"掉线"，不会出现孤立的恢复通知。
+func notifyNodeUp(n monitorNode, mode, reason string) {
+	// 掉线被维护窗口吞掉的那次：恢复也不报，否则会留下一条没有前置掉线的孤立上线通知
+	if takeMaintSuppressed(n.id) {
+		log.Printf("[node] %s back online but its down was suppressed by maintenance window, up alert suppressed", n.id)
 		return
 	}
-	subject := "[IPW-BOCE] 服务节点掉线：" + n.label
-	body := buildNodeDownBody(n, mode, reason, streak)
+	enqueueNodeAlert(nodeAlertUp, nodeAlertItem{n: n, mode: mode, reason: reason})
+}
+
+// display 告警文案里的节点名。优先级：节点池 label（管理员配的中文名，最可读）
+// → nodes 表 label（HTTP 版节点由探活写入）→ nodeId 兜底。
+// 必须兜底：WS 版节点注册只写 nodes(online/version/…)，不带 label，
+// 直接取库内 label 会渲染成"节点:  (mock-cn-sh)"这种空白名。
+func (n monitorNode) display() string {
+	if s := strings.TrimSpace(n.label); s != "" {
+		return s
+	}
+	if s := poolLabelFor(n.id); s != "" {
+		return s
+	}
+	return n.id
+}
+
+// poolLabelFor 在配置池快照（api + location，读锁）里找该节点的 label；未入池/未配名返回空串。
+func poolLabelFor(nodeID string) string {
+	for _, item := range apiPoolSnapshot() {
+		if item.ID == nodeID {
+			return strings.TrimSpace(item.Label)
+		}
+	}
+	for _, item := range locationPoolSnapshot() {
+		if item.ID == nodeID {
+			return strings.TrimSpace(item.Label)
+		}
+	}
+	return ""
+}
+
+// nodeLine 告警正文的节点行：有可读节点名时写「名称 (id)」，否则只写 id（不出现"空名 (id)"）
+func nodeLine(n monitorNode) string {
+	d := n.display()
+	if d == n.id {
+		return fmt.Sprintf("节点: %s\n", n.id)
+	}
+	return fmt.Sprintf("节点: %s (%s)\n", d, n.id)
+}
+
+// notifyAdmins 单节点告警的三路投递，收件人 = **所有启用 admin**（role=admin 且 enabled）。
+// 多节点汇总通知走 notifyAdminsForNodeIDs（见 alert_batch.go）。
+func notifyAdmins(n monitorNode, kind, event, subject, body string) {
+	notifyAdminsForNodeIDs([]string{n.id}, kind, event, subject, body)
+}
+
+// notifyAdminsForNodeIDs 三路投递（互不回退）的公共实现；nodeIDs 用于日志与 generic webhook 的
+// nodeId 字段（汇总通知时是逗号串，单节点时就是单个 id，对既有接收端向后兼容）：
+//   - 邮件：有邮箱且 SMTP 可用才发；缺邮箱/不可用/失败仅记日志
+//   - 站内信：admin 启用即落（kind 区分 node_down / node_up）
+//   - Webhook：admin 在个人资料配了接收端就推。节点告警是系统级事件、收件人就是管理员组，
+//     所以 Webhook 也只覆盖 admin 角色——普通用户即便配了 Webhook 也收不到节点告警
+//     （与邮件/站内信的收件范围保持一致，见 users.go enabledAdmins）。
+func notifyAdminsForNodeIDs(nodeIDs []string, kind, event, subject, body string) {
+	admins := enabledAdmins()
+	ids := strings.Join(nodeIDs, ",")
+	if len(admins) == 0 {
+		log.Printf("[node] %s %s but no enabled admin to notify", ids, event)
+		return
+	}
 	for i := range admins {
 		a := &admins[i]
 		// 1) 邮件：有邮箱且 SMTP 可用才发；缺邮箱/不可用/失败仅记日志，不影响站内信
 		if e := strings.TrimSpace(a.Email); e != "" {
 			if !smtpReady() {
-				log.Printf("[node] %s down: admin#%d email set but smtp not ready, email skipped", n.id, a.ID)
+				log.Printf("[node] %s %s: admin#%d email set but smtp not ready, email skipped", ids, event, a.ID)
 			} else if err := mailSender([]string{e}, subject, body); err != nil {
-				log.Printf("[node] ERROR send node-down mail to %s: %v", e, err)
+				log.Printf("[node] ERROR send node-%s mail to %s: %v", event, e, err)
 			} else {
-				log.Printf("[node] sent node-down mail -> admin#%d <%s>", a.ID, e)
+				log.Printf("[node] sent node-%s mail -> admin#%d <%s>", event, a.ID, e)
 			}
 		} else {
-			log.Printf("[node] %s down: admin#%d has no email, email skipped", n.id, a.ID)
+			log.Printf("[node] %s %s: admin#%d has no email, email skipped", ids, event, a.ID)
 		}
 		// 2) 站内信：admin 启用即落（与邮件并存）
-		if err := createNotice(a.ID, noticeKindNode, 0, subject, body); err != nil {
-			log.Printf("[node] ERROR create node-down notice admin#%d: %v", a.ID, err)
+		if err := createNotice(a.ID, kind, 0, subject, body); err != nil {
+			log.Printf("[node] ERROR create node-%s notice admin#%d: %v", event, a.ID, err)
 		} else {
-			log.Printf("[node] in-app node-down notice -> admin#%d", a.ID)
+			log.Printf("[node] in-app node-%s notice -> admin#%d", event, a.ID)
 		}
+		// 3) Webhook：配了接收端就推（未配置 = no-op，失败仅记日志）
+		pushUserWebhook(a, subject, body, event, 0, ids)
 	}
 }
 
 func buildNodeDownBody(n monitorNode, mode, reason string, streak int) string {
 	var b strings.Builder
 	b.WriteString("拨测服务节点疑似掉线，请及时处理。\n\n")
-	fmt.Fprintf(&b, "节点: %s (%s)\n", n.label, n.id)
+	b.WriteString(nodeLine(n))
 	fmt.Fprintf(&b, "连接方式: %s\n", mode)
 	fmt.Fprintf(&b, "判定依据: %s\n", reason)
 	fmt.Fprintf(&b, "持续判离线次数: %d\n", streak)
@@ -350,5 +412,20 @@ func buildNodeDownBody(n monitorNode, mode, reason string, streak int) string {
 	}
 	fmt.Fprintf(&b, "时间: %s\n\n", time.Now().UTC().Format(time.RFC3339))
 	b.WriteString("—— ipw-boce 自动告警")
+	return b.String()
+}
+
+// buildNodeUpBody 上线通知正文。与掉线正文对称，便于接收端对照（同一节点的掉线/恢复配对）。
+func buildNodeUpBody(n monitorNode, mode, reason string) string {
+	var b strings.Builder
+	b.WriteString("拨测服务节点已恢复上线。\n\n")
+	b.WriteString(nodeLine(n))
+	fmt.Fprintf(&b, "连接方式: %s\n", mode)
+	fmt.Fprintf(&b, "恢复依据: %s\n", reason)
+	if mode == "HTTP 版" {
+		fmt.Fprintf(&b, "探活地址: %s\n", n.url)
+	}
+	fmt.Fprintf(&b, "时间: %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	b.WriteString("—— ipw-boce 自动通知")
 	return b.String()
 }

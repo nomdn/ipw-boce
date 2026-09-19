@@ -1,26 +1,32 @@
 <template>
   <div>
-    <!-- 顶栏：窗口 + 刷新 + 新建任务 -->
+    <!-- 顶栏：左边一列下拉 / 输入（参数），右边一排按钮（操作），两类各自成组、不穿插 -->
     <div class="toolbar">
-      <div class="form-field">
-        <label>统计窗口</label>
-        <select class="ak-select" v-model="hours" @change="onWindowChange">
-          <option :value="1">近 1 小时</option>
-          <option :value="6">近 6 小时</option>
-          <option :value="24">近 24 小时</option>
-          <option :value="72">近 72 小时</option>
-          <option :value="168">近 7 天</option>
-        </select>
+      <div class="tb-group">
+        <div class="form-field">
+          <label>统计窗口</label>
+          <TimeRangePicker
+            :model-value="range"
+            :max-days="rangeMaxDays"
+            aria-label="统计窗口"
+            @update:model-value="onRangeChange"
+          />
+        </div>
+        <div class="form-field">
+          <label>标签过滤</label>
+          <input class="ak-input" v-model.trim="tagFilter" @keyup.enter="load(true)" placeholder="留空 = 全部" style="width:140px" />
+        </div>
       </div>
-      <button class="ak-button ak-button--outline" @click="load">刷新</button>
-      <input class="ak-input" v-model.trim="tagFilter" @keyup.enter="load(true)" placeholder="按标签过滤" style="width:140px" />
-      <button class="ak-button ak-button--outline" :disabled="!tasks.length" @click="toggleSelectAll">
-        {{ allSelected ? '取消全选' : '全选' }}
-      </button>
-      <button class="ak-button ak-button--outline" :disabled="!selCount" @click="openBatchShare">
-        分享所选{{ selCount ? `（${selCount}）` : '' }}
-      </button>
-      <button class="ak-button ak-button--action" @click="openCreate">＋ 新建定时拨测</button>
+      <div class="tb-group tb-group--actions">
+        <button class="ak-button ak-button--outline" @click="load">刷新</button>
+        <button class="ak-button ak-button--outline" :disabled="!tasks.length" @click="toggleSelectAll">
+          {{ allSelected ? '取消全选' : '全选' }}
+        </button>
+        <button class="ak-button ak-button--outline" :disabled="!selCount" @click="openBatchShare">
+          分享所选{{ selCount ? `（${selCount}）` : '' }}
+        </button>
+        <button class="ak-button ak-button--action" @click="openCreate">＋ 新建定时拨测</button>
+      </div>
       <span v-if="error" class="err">加载失败：{{ error }}</span>
       <span v-if="!loading && !tasks.length && !error" class="dim" style="font-size:.85rem">
         暂无定时拨测任务 —— 点击「新建定时拨测」配置一组，系统会按时对节点拨测并累计 SLA
@@ -55,6 +61,9 @@
               @click="toggle(tk.task)">{{ tk.task.enabled ? '运行中' : '已停' }}</button>
             <button class="ak-button ak-button--outline sm" :class="{ off: trendCollapsed[tk.task.id] }" @click="toggleTrend(tk.task.id)">{{ trendCollapsed[tk.task.id] ? '展开曲线' : '延迟曲线' }}</button>
             <button class="ak-button ak-button--outline sm" @click="toggleCompare(tk.task)">{{ compareMap[tk.task.id] ? '关闭对比' : '节点对比' }}</button>
+            <button class="ak-button ak-button--outline sm" :disabled="exportingId === tk.task.id"
+              title="导出当前统计窗口的完整曲线（含每轮成功率与平均延迟）"
+              @click="exportSeries(tk.task)">{{ exportingId === tk.task.id ? '导出中…' : '导出 CSV' }}</button>
             <button class="ak-button ak-button--outline sm" @click="shareSingle(tk.task)">{{ shareMap[tk.task.id] ? '重生成链接' : '分享' }}</button>
             <button v-if="shareMap[tk.task.id]" class="ak-button ak-button--outline sm danger" @click="closeBatchShare(tk.task)">关闭分享</button>
             <button class="ak-button ak-button--outline sm" @click="openEdit(tk.task)">编辑</button>
@@ -185,21 +194,32 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   fetchTasks, fetchTaskSla, createTask, updateTask, setTaskEnabled, deleteTask, fetchTaskMeta, fetchTaskSeries,
-  fetchNodesBrief, shareTasks, unshareTasks,
+  fetchNodesBrief, shareTasks, unshareTasks, exportTaskSeries, fetchTimeRange,
 } from '../api/boce.js'
 import { getToken } from '../api/http.js'
 import { WS_BASE } from '../config.js'
 import { fmtTime, timeAgo } from '../utils/format.js'
 import { useDialog } from '../composables/useDialog.js'
+import { useTheme, readChartTheme } from '../composables/useTheme.js'
 import EChart from '../components/EChart.vue'
 import TaskFormPanel from '../components/TaskFormPanel.vue'
+import TimeRangePicker from '../components/TimeRangePicker.vue'
 import { apiOptions, apiLabel, dnsKindLabel } from '../utils/probeMeta.js'
+import { fromQuery, rangeQuery, resolveRange, toQuery } from '../utils/timeRange.js'
 
 const dialog = useDialog()
-const hours = ref(24)
+const route = useRoute()
+const router = useRouter()
+// 统计窗口：{ key, start?, end? } —— 相对窗口 / 自然周期 / 自定义区间，见 utils/timeRange.js。
+// 初值取自地址栏，于是窗口可分享、可回退、刷新不丢。
+const range = ref(fromQuery(route.query))
+const rangeMaxDays = ref(0) // 后端可查上限（天），用于隐藏必然查空的预设项
+// 当前窗口的查询串（相对窗口 → hours=N；绝对区间 → start/end），所有取数都带上它
+const winQS = computed(() => rangeQuery(range.value))
 // 拨测方案候选：fetchTaskMeta 返回的 types 可覆盖（追加业务后端新增的探针类）
 const types = ref(apiOptions.map((o) => o.value))
 const tasks = ref([])
@@ -229,6 +249,8 @@ function toggleTrend(id) {
 }
 // C2 节点对比：taskId -> { loading, nodes:[{nodeId, series}] }
 const compareMap = ref({})
+// 正在导出的任务 id（0 = 空闲），仅用于按钮 loading 态
+const exportingId = ref(0)
 const loading = ref(false)
 const error = ref('')
 
@@ -257,18 +279,39 @@ let wsTimer = null
 let wsEverOpened = false
 let wsUserClosed = false
 let wsRetry = 0
+let lastLoadAt = 0 // 最近一次取数时刻（WS 重连补拉据此去重，见 ws.onopen）
 
-function onWindowChange() {
+// 切换窗口（预设 / 平移 / 自定义区间都走这里）：写回地址栏 → 重新取数 → 按新窗口重订实时推送。
+// 不锁按钮 —— 大窗口慢（7 天是上万点），让人随时能切回去，而不是被禁住十几秒。
+let loadSeq = 0
+function onRangeChange(next) {
+  range.value = next
+  syncUrl()
   load(true)
-  connectSla() // 窗口变了，重建 WS 用新 hours 订阅，避免收到的快照窗口错位
+  connectSla()
+}
+
+// 窗口写回地址栏（保留页面上的其它参数，如标签过滤）
+function syncUrl() {
+  const q = { ...route.query, ...toQuery(range.value) }
+  if (range.value.key !== 'custom') {
+    delete q.start
+    delete q.end
+  }
+  router.replace({ query: q })
 }
 
 function connectSla() {
   if (wsUserClosed) return
   if (ws) { try { ws.onclose = null; ws.onmessage = null; ws.close() } catch {} }
+  ws = null
+  // 实时推送只能按“最近 N 小时”订阅：自然周期（今天/本周/本月）与自定义区间都是绝对区间，
+  // 推来的快照对不上，索性不订 —— 这类窗口是回顾性查看，不需要秒级刷新。
+  const r = resolveRange(range.value)
+  if (r.kind !== 'rel') return
   const token = getToken()
   const url =
-    `${WS_BASE}/console/sla?hours=${hours.value}` +
+    `${WS_BASE}/console/sla?hours=${Math.round(r.hours)}` +
     (token ? `&token=${encodeURIComponent(token)}` : '')
   try {
     ws = new WebSocket(url)
@@ -277,7 +320,10 @@ function connectSla() {
     return
   }
   ws.onopen = () => {
-    if (wsEverOpened) load() // 重连成功补拉全量，补齐错过的推送
+    // 重连成功补拉全量，补齐断线期间错过的推送；走 silent —— 卡片已在屏幕上，
+    // 不该整页闪成加载态（切窗口会重建 WS，用非 silent 会让卡片整块消失十几秒）。
+    // 刚加载过（同一窗口已由 onRangeChange 拉过全量）则跳过，避免重复请求两遍。
+    if (wsEverOpened && Date.now() - lastLoadAt > 5000) load(true)
     else wsEverOpened = true
     wsRetry = 0
   }
@@ -310,17 +356,24 @@ function applySlaSnapshot(taskId, sla) {
   // 顺带刷新该任务时序（失败段红标需最新 down 桶）
   refreshTaskSeries(taskId)
 }
-// 判断后端推送窗口是否等于当前 hours（后端 window.from/to 为 UTC）
+// 判断后端推送窗口是否就是当前窗口（后端 window.from/to 为 UTC）。
+// 绝对区间一律不接收实时快照 —— 推送的永远是“最近 N 小时”，与历史区间不是一回事。
 function matchWindow(win) {
   if (!win?.from || !win?.to) return false
+  const r = resolveRange(range.value)
+  if (r.kind !== 'rel') return false
   const spanH = (new Date(win.to) - new Date(win.from)) / 3600000
-  return Math.abs(spanH - Number(hours.value)) < 1
+  return Math.abs(spanH - r.hours) < 1
 }
 
 onMounted(() => {
   load()
   loadBrief()
   connectSla()
+  // 可查范围（保留期 / 接口上限）：选择器据此隐藏必然查空的预设
+  fetchTimeRange()
+    .then((r) => { rangeMaxDays.value = r?.maxDays || 0 })
+    .catch(() => {})
 })
 onBeforeUnmount(closeSla)
 
@@ -335,44 +388,45 @@ async function loadBrief() {
 }
 
 // silent=true：后台刷新（保存/启停/切窗口后），不显示全屏加载态——已有卡片原地更新，
-// 避免"每操作一次就整页重载"的体验
+// 避免"每操作一次就整页重载"的体验。
+// 代次在函数内自增：每次取数都算一个新代次，任何更早发出的取数（含 WS 重连补拉）回来时
+// 都会被丢弃 —— 否则一次慢的补拉会在用户切走窗口之后把旧窗口数据盖回界面。
 async function load(silent) {
+  const my = ++loadSeq
+  lastLoadAt = Date.now()
   if (!silent) loading.value = true
   error.value = ''
+  const stale = () => my !== loadSeq
   try {
     const meta = await fetchTaskMeta().catch(() => null)
     if (meta?.types) types.value = meta.types
     const list = await fetchTasks(tagFilter.value || undefined)
     tasks.value = list || []
-    // 并发拉取每个任务的 SLA 与时序曲线
-    const res = await Promise.all(
-      tasks.value.map(async (t) => {
-        const [sla, series] = await Promise.all([
-          fetchTaskSla(t.id, hours.value).catch(() => null),
-          fetchTaskSeries(t.id, hours.value).catch(() => null),
+    if (stale()) return
+    // 并发拉取每个任务的 SLA 与时序曲线；两类数据谁先到先上屏 —— SLA 很轻、曲线很重
+    // （7 天是上万点），切大窗口时 KPI 与节点表格先刷新，不必陪着曲线一起等。
+    const qs = winQS.value
+    await Promise.all(
+      tasks.value.map((t) => {
+        const sla = fetchTaskSla(t.id, qs).catch(() => null)
+        const series = fetchTaskSeries(t.id, qs).catch(() => null)
+        return Promise.all([
+          sla.then((v) => { if (!stale()) slaMap.value = { ...slaMap.value, [t.id]: v } }),
+          series.then((v) => { if (!stale()) seriesMap.value = { ...seriesMap.value, [t.id]: v } }),
         ])
-        return [t.id, { sla, series }]
       }),
     )
-    const sm = {}
-    const sem = {}
-    res.forEach(([id, v]) => {
-      sm[id] = v.sla
-      sem[id] = v.series
-    })
-    slaMap.value = sm
-    seriesMap.value = sem
   } catch (e) {
-    error.value = e?.message || '加载失败'
+    if (!stale()) error.value = e?.message || '加载失败'
   } finally {
-    loading.value = false
+    if (!stale()) loading.value = false
   }
 }
 
 // 拉取单个任务时序（WS 推送后刷新该卡片的失败段红标）
 async function refreshTaskSeries(taskId) {
   try {
-    const series = await fetchTaskSeries(taskId, hours.value)
+    const series = await fetchTaskSeries(taskId, winQS.value)
     seriesMap.value = { ...seriesMap.value, [taskId]: series }
   } catch {
     /* 静默 */
@@ -524,27 +578,27 @@ function errTone(v) {
   return v <= 1 ? 'ok' : v <= 10 ? 'warn' : 'bad'
 }
 
-// ===== SLA 延迟曲线（复用 app.css --chart-* 语义色，与大盘一致）=====
-function readVar(name) {
-  try { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || null } catch { return null }
-}
-const CH = {
-  cyan: readVar('--chart-cyan') || '#2a9df4',
-  yellow: readVar('--chart-yellow') || '#ffd802',
-  green: readVar('--chart-green') || '#46c47c',
-  red: readVar('--chart-red') || '#e33b3b',
-  grid: readVar('--chart-grid') || '#1f2a33',
-  axis: readVar('--chart-axis') || 'rgba(240,240,235,.45)',
-  label: readVar('--chart-label') || 'rgba(248,248,245,.72)',
-}
+// ===== SLA 延迟曲线（复用 theme.css --chart-* 语义色，与大盘一致）=====
+const { theme } = useTheme()
+// 图表配色全部来自 readChartTheme()（信号色 + 网格/轴/label/提示框）：
+// echarts 画在 canvas 上吃不到 CSS 变量，且亮色卡片是深灰底，
+// 信号色在两种主题下取值不同，所以读一次存 reactive、切主题时整体重读。
+const CH = reactive({ ...readChartTheme() })
 const chartAxis = {
   axisLine: { lineStyle: { color: CH.axis } },
   axisLabel: { color: CH.label },
   splitLine: { lineStyle: { color: CH.grid } },
 }
-const chartTooltip = {
-  backgroundColor: '#101316', borderColor: 'rgba(255,255,255,.2)', textStyle: { color: '#f8f8f5' },
-}
+// 提示框底色/边框/文字同为中性色：亮色下白底深字，暗色下深底浅字
+const chartTooltip = reactive({
+  backgroundColor: CH.tipBg, borderColor: CH.tipBorder, textStyle: { color: CH.tipText },
+})
+watch(theme, () => {
+  Object.assign(CH, readChartTheme())
+  chartTooltip.backgroundColor = CH.tipBg
+  chartTooltip.borderColor = CH.tipBorder
+  chartTooltip.textStyle.color = CH.tipText
+})
 // RFC3339 桶时间 → 毫秒时间戳（value x 轴用）
 function bucketMs(iso) {
   const d = iso ? new Date(iso) : null
@@ -629,6 +683,19 @@ async function copyText(txt) {
   try { await navigator.clipboard.writeText(txt) } catch { /* 剪贴板不可用时用户可手动选中 */ }
 }
 
+// ---- 曲线导出 CSV（当前统计窗口，服务端按同参数生成）----
+async function exportSeries(t) {
+  exportingId.value = t.id
+  error.value = ''
+  try {
+    await exportTaskSeries(t.id, winQS.value)
+  } catch (e) {
+    error.value = e?.message || '导出失败'
+  } finally {
+    exportingId.value = 0
+  }
+}
+
 // ---- C2 节点对比 ----
 async function toggleCompare(t) {
   if (compareMap.value[t.id]) {
@@ -641,7 +708,7 @@ async function toggleCompare(t) {
   const card = taskCards.value.find((c) => c.task.id === t.id)
   const nodeList = (card?.sla?.byNode || []).slice(0, 8).map((n) => n.nodeId)
   const nodes = (await Promise.all(
-    nodeList.map((n) => fetchTaskSeries(t.id, hours.value, n).catch(() => null)),
+    nodeList.map((n) => fetchTaskSeries(t.id, winQS.value, n).catch(() => null)),
   ))
     .map((s, i) => (s ? { nodeId: nodeList[i], series: s.series || [] } : null))
     .filter(Boolean)
@@ -650,6 +717,7 @@ async function toggleCompare(t) {
 // 节点对比图 option：每节点一条 avgMs 折线（同窗口同分桶，线上断点=该节点当轮无有效延迟）
 function nodeCompareOption(taskId) {
   const nodes = compareMap.value[taskId]?.nodes || []
+  // 前三位跟 --chart-cyan/yellow/green（提亮饱和）同值，后五位沿用最初的原版装饰色
   const colors = [CH.cyan, CH.yellow, CH.green, '#c678dd', '#ff9f43', '#4ec9b0', '#e06c75', '#569cd6']
   return {
     color: colors,
@@ -753,11 +821,11 @@ function slaTrendOption(series) {
       { type: 'inside', zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false, filterMode: 'none' },
       {
         type: 'slider', height: 14, bottom: 6, filterMode: 'none',
-        borderColor: 'transparent', backgroundColor: 'rgba(255,255,255,.04)',
-        fillerColor: 'rgba(42,157,244,.16)', dataBackgroundColor: 'rgba(255,255,255,.05)',
+        borderColor: 'transparent', backgroundColor: CH.tint,
+        fillerColor: 'rgba(42,157,244,.16)', dataBackgroundColor: CH.tint,
         textStyle: { color: CH.label, fontSize: 10 },
         handleStyle: { color: CH.cyan, borderColor: CH.cyan },
-        moveHandleStyle: { color: 'rgba(255,255,255,.18)' },
+        moveHandleStyle: { color: CH.tintStrong },
       },
     ],
     xAxis: { type: 'time', ...chartAxis, axisLabel: { ...chartAxis.axisLabel, formatter: (ms) => bucketLabel(ms), hideOverlap: true } },
@@ -879,6 +947,11 @@ async function remove(t) {
 .sla-ops .ak-button.sm { width: auto; height: auto; padding: 3px 9px; font-size: .72rem; font-weight: 400; }
 .sla-ops .ak-button.off { opacity: .5; }
 .sla-ops .ak-button.danger { color: var(--ak-signal-danger); border-color: var(--ak-signal-danger); }
+/* 窄屏：卡片头改上下堆叠、按钮组允许换行 —— 7 个按钮 + 标题一行必然撑破视口（实测 320 下溢出到 371px） */
+@media (max-width: 767px) {
+  .sla-head { flex-direction: column; align-items: stretch; gap: 8px; }
+  .sla-ops { flex-wrap: wrap; }
+}
 .sla-sub { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: .72rem; }
 .sla-sub .owner { color: var(--ak-signal-accent); font-family: var(--ak-font-mono); }
 /* 分享链接行（模板里的 .link-btn 若无样式会渲染成浏览器原生按钮） */
@@ -905,7 +978,7 @@ async function remove(t) {
 .dlg-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .dlg-foot .danger { color: var(--ak-signal-danger); border-color: var(--ak-signal-danger); }
 .sla-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 14px 0; }
-.sla-kpis .kpi { background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06); padding: 10px 12px; }
+.sla-kpis .kpi { background: var(--ui-tint); border: 1px solid var(--ui-line-soft); padding: 10px 12px; }
 .sla-kpis .kpi .l { font-size: .7rem; color: var(--ak-text-secondary); }
 .sla-kpis .kpi .v { font-family: var(--ak-font-mono); font-size: 1.25rem; font-weight: 600; margin-top: 2px; }
 .sla-kpis .kpi.ok .v { color: var(--ak-signal-success); }
@@ -921,7 +994,7 @@ async function remove(t) {
 .ok { color: var(--ak-signal-success); }
 .warn { color: var(--ak-signal-action); }
 .bad { color: var(--ak-signal-danger); }
-.sla-trend { margin: 6px 0 4px; border: 1px solid rgba(255,255,255,.05); background: rgba(255,255,255,.015); padding: 8px 10px 2px; }
+.sla-trend { margin: 6px 0 4px; border: 1px solid var(--ui-line-faint); background: var(--ui-tint-ghost); padding: 8px 10px 2px; }
 .sla-trend-cap { display: flex; justify-content: space-between; align-items: baseline; font-size: .72rem; color: var(--ak-text-secondary); margin-bottom: 4px; }
 .sla-trend-cap .dim { font-size: .7rem; }
 .sla-trend-cap .dim:last-child { color: var(--chart-red); }

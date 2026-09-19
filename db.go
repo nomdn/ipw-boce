@@ -111,6 +111,16 @@ type NodeDef struct {
 	SortOrder int       `json:"sortOrder"` // 控制台展示与池内排序
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+
+	// 凭据（库托管：原只在 env / setting.json 的 api-keys / ws-keys 里，改一次要重启进程）。
+	// 控制台在节点表单里填写，保存即生效、无需重启。明文永不经接口回显（json:"-"），
+	// 列表只返回 HasAPIKey / HasWSKey 两个布尔标记。
+	APIKey string `gorm:"column:api_key;size:256" json:"-"` // 中心 → 该节点 HTTP 接口的访问令牌（对应 api-keys）
+	WSKey  string `gorm:"column:ws_key;size:256" json:"-"`  // 该节点 → 中心的 WS 注册校验密钥（对应 ws-keys）
+
+	// HasAPIKey / HasWSKey 仅用于出参展示“是否已设置”，不落库
+	HasAPIKey bool `gorm:"-" json:"hasApiKey"`
+	HasWSKey  bool `gorm:"-" json:"hasWsKey"`
 }
 
 // OTATask 控制台下发的节点 OTA 升级任务（见 ota.go）
@@ -147,8 +157,27 @@ type OTATask struct {
 	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
 }
 
+// MaintenanceWindow 计划维护窗口（见 maintenance.go）：窗口内该范围内节点的上下线**不推送告警**。
+//
+// 只影响通知、不影响事实：offline/online 事件照写、nodes.online 快照照改，
+// 因此节点状态页、事件历史与可用率统计都不受影响，事后仍能看出"这段时间确实断过"。
+type MaintenanceWindow struct {
+	ID uint `gorm:"primaryKey" json:"id"`
+	// Scope 作用范围：global = 全部节点；其余取值 = 该 nodeId
+	Scope string `gorm:"size:128;index" json:"scope"`
+	// StartAt / EndAt 起止时刻：
+	//   - RepeatDaily=false：绝对时间段（割接 / 发布，一次性）
+	//   - RepeatDaily=true：只比这两个时刻的**时钟**（服务器本地时区），支持跨零点（如 23:30-00:30）
+	StartAt     time.Time `json:"startAt"`
+	EndAt       time.Time `json:"endAt"`
+	RepeatDaily bool      `json:"repeatDaily"`
+	Reason      string    `gorm:"size:256" json:"reason"`
+	CreatedBy   string    `gorm:"size:64" json:"createdBy,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
 // allModels AutoMigrate 的全部模型
-var allModels = []any{&Node{}, &NodeEvent{}, &ProbeResult{}, &RequestStat{}, &NodeConfig{}, &NodeDef{}, &ProbeTask{}, &User{}, &AppNotice{}, &OTATask{}}
+var allModels = []any{&Node{}, &NodeEvent{}, &ProbeResult{}, &RequestStat{}, &NodeConfig{}, &NodeDef{}, &ProbeTask{}, &User{}, &AppNotice{}, &OTATask{}, &MaintenanceWindow{}}
 
 // ==================== 数据库初始化 ====================
 

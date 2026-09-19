@@ -154,6 +154,36 @@ func mustJSON(v any) []byte {
 	return b
 }
 
+// statsNodes 解析统计大盘的节点过滤参数 ?nodes=a,b,c（缺省或空 = 全部节点，nil 表示不过滤）。
+// 节点 ID 由节点池定义（不含逗号），此处仍做去空、去重、长度与条数截断，
+// 避免脏参数拼进 IN 子句（超长占位符 / 重复项拖慢查询）。
+func statsNodes(c *gin.Context) []string {
+	raw := strings.TrimSpace(c.Query("nodes"))
+	if raw == "" {
+		return nil
+	}
+	seen := make(map[string]struct{}, 8)
+	out := make([]string, 0, 8)
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if len(id) > 64 {
+			id = id[:64]
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		if len(out) >= 200 {
+			break
+		}
+	}
+	return out
+}
+
 // ==================== 管理 API ====================
 
 // registerAdminRoutes 注册 /admin/* 路由；配置 admin-token 或 jwt-secret 时校验 Authorization: Bearer
@@ -173,6 +203,16 @@ func registerAdminRoutes(router *gin.Engine) {
 	// 运维/管理类接口（节点拓扑、节点配置托管、全站流量大盘）仅 admin 可见；
 	// 其余登录接口（拨测工具 / 自己任务 / 站内信 / 个人资料）user 亦可用。
 	restricted := admin.Group("", adminOnly())
+
+	// 节点可用率报表（由 node_events 还原离线区间）与计划维护窗口（告警免打扰）
+	registerUptimeRoutes(restricted)
+	registerMaintenanceRoutes(restricted)
+	// 节点上下线事件导出 CSV
+	restricted.GET("/nodes/:nodeId/events/export", exportNodeEventsHandler)
+
+	// 数据可用范围（数据最早时间 / 生效保留期上限）—— 时间范围选择器据此裁剪预设清单。
+	// 挂在登录组而非 admin 组：普通用户的大盘页也要用，且内容只是元信息（不含业务数据）。
+	registerTimeRangeRoutes(admin)
 
 	// 上游节点池 CRUD：数据库托管，取代 setting.json 的 api-base-url / ip-location-api（见 node_defs.go）
 	registerNodeDefRoutes(restricted)
@@ -246,50 +286,14 @@ func registerAdminRoutes(router *gin.Engine) {
 	// 拨测记录（probe_results）；cat=类别过滤：sched=定时拨测(source=sched)，biz=业务拨测(source!=sched)
 	// user 只能看"自己任务"的定时拨测明细（source=sched 且 task_id 归自己）+ 自己发起的一键拨测
 	// （source=biz 且 owner_id=自己，见 persistManualProbes）；他人的 sched/biz 一律不可见。
+	// 查询条件由 probeListQuery 统一构造（见 export.go），与 /probes/export 共用一份口径。
 	admin.GET("/probes", func(c *gin.Context) {
 		limit := clampLimit(c.Query("limit"), 100)
 		ctx, cancel := dbCtx()
 		defer cancel()
-		uid, role, _ := currentUserFromCtx(c)
-		q := db.WithContext(ctx).Model(&ProbeResult{})
-		if role == RoleUser {
-			ownIDs, err := ownTaskIDs(db.WithContext(ctx), uid)
-			if err != nil {
-				apiError(c, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if len(ownIDs) > 0 {
-				q = q.Where("(source = ? AND task_id IN ?) OR (source = ? AND owner_id = ?)", sourceSched, ownIDs, sourceBiz, uid)
-			} else {
-				q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
-			}
-		}
-		if v := c.Query("node"); v != "" {
-			q = q.Where("node_id = ?", v)
-		}
-		if v := c.Query("type"); v != "" {
-			q = q.Where("api_type = ?", v)
-		}
-		if v := c.Query("cat"); v != "" {
-			switch v {
-			case "sched":
-				q = q.Where("source = ?", sourceSched)
-			case "biz":
-				if role != RoleUser {
-					q = q.Where("source <> ?", sourceSched)
-				} else {
-					// user：自己的 biz 拨测（基线已含自己 sched，需收紧回 biz）
-					q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
-				}
-			default:
-				apiError(c, http.StatusBadRequest, "invalid cat (sched|biz)")
-				return
-			}
-		}
-		if v := c.Query("since"); v != "" {
-			if t, err := time.Parse(time.RFC3339, v); err == nil {
-				q = q.Where("created_at >= ?", t.UTC())
-			}
+		q, ok := probeListQuery(c, ctx)
+		if !ok {
+			return
 		}
 		var rows []ProbeResult
 		if err := q.Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
@@ -299,44 +303,90 @@ func registerAdminRoutes(router *gin.Engine) {
 		c.JSON(http.StatusOK, rows)
 	})
 
+	// 拨测明细导出 CSV：参数与权限范围同 /admin/probes（见 export.go）
+	admin.GET("/probes/export", exportProbesHandler)
+
 	// 统计汇总：按 API 类型 / 节点维度聚合（request_stats）—— admin only（user 大盘走自己的任务报告）
+	// 可选 ?nodes=a,b,c 只看部分节点（缺省 = 全部）；byApiType / byNode 均按选中节点过滤，
+	// allNodes 恒为窗口内有统计的全部节点（不过滤），前端用它渲染节点选择器。
 	restricted.GET("/stats/summary", func(c *gin.Context) {
-		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
-		since := time.Now().UTC().Add(-time.Duration(hours*float64(time.Hour))).Unix() / 60
+		tr := parseTimeRange(c, 24)
+		since, until := tr.From.Unix()/60, tr.To.Unix()/60
+		nodes := statsNodes(c)
 		ctx, cancel := dbCtx()
 		defer cancel()
 
-		var byAPI []struct {
+		type apiAgg struct {
 			APIType      string `json:"apiType"`
 			Total        int64  `json:"total"`
 			Errors       int64  `json:"errors"`
 			LatencySumMs int64  `json:"latencySumMs"`
 		}
-		if err := db.WithContext(ctx).Model(&RequestStat{}).
-			Select("api_type, SUM(total) as total, SUM(errors) as errors, SUM(latency_sum_ms) as latency_sum_ms").
-			Where("minute >= ?", since).Group("api_type").Find(&byAPI).Error; err != nil {
-			apiError(c, http.StatusInternalServerError, err.Error())
-			return
-		}
-		var byNode []struct {
+		type nodeAgg struct {
 			NodeID       string `json:"nodeId"`
 			Total        int64  `json:"total"`
 			Errors       int64  `json:"errors"`
 			LatencySumMs int64  `json:"latencySumMs"`
 		}
-		if err := db.WithContext(ctx).Model(&RequestStat{}).
-			Select("node_id, SUM(total) as total, SUM(errors) as errors, SUM(latency_sum_ms) as latency_sum_ms").
-			Where("minute >= ?", since).Group("node_id").Find(&byNode).Error; err != nil {
+		byAPI := []apiAgg{}
+		qAPI := db.WithContext(ctx).Model(&RequestStat{}).
+			Select("api_type, SUM(total) as total, SUM(errors) as errors, SUM(latency_sum_ms) as latency_sum_ms").
+			Where("minute >= ? AND minute <= ?", since, until)
+		if len(nodes) > 0 {
+			qAPI = qAPI.Where("node_id IN ?", nodes)
+		}
+		if err := qAPI.Group("api_type").Find(&byAPI).Error; err != nil {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"hours": hours, "byApiType": byAPI, "byNode": byNode})
+
+		qNode := db.WithContext(ctx).Model(&RequestStat{}).
+			Select("node_id, SUM(total) as total, SUM(errors) as errors, SUM(latency_sum_ms) as latency_sum_ms").
+			Where("minute >= ? AND minute <= ?", since, until)
+		if len(nodes) > 0 {
+			qNode = qNode.Where("node_id IN ?", nodes)
+		}
+		byNode := []nodeAgg{}
+		if err := qNode.Group("node_id").Find(&byNode).Error; err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// allNodes：窗口内有统计的全部节点（不受过滤影响），供前端渲染节点选择器与计数
+		allNodes := []nodeAgg{}
+		if err := db.WithContext(ctx).Model(&RequestStat{}).
+			Select("node_id, SUM(total) as total, SUM(errors) as errors, SUM(latency_sum_ms) as latency_sum_ms").
+			Where("minute >= ? AND minute <= ?", since, until).Group("node_id").Find(&allNodes).Error; err != nil {
+			apiError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		selected := nodes
+		if selected == nil {
+			selected = []string{}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"hours":         tr.Hours,
+			"from":          tr.From,
+			"to":            tr.To,
+			"selectedNodes": selected,
+			"allNodes":      allNodes,
+			"byApiType":     byAPI,
+			"byNode":        byNode,
+		})
 	})
 
-	// 统计时间序列（按分钟桶）—— admin only
+	// 统计时间序列（按分钟桶聚合，桶粒度随窗口放大）—— admin only；可选 ?nodes=a,b,c 只看部分节点
 	restricted.GET("/stats/timeseries", func(c *gin.Context) {
-		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
-		since := time.Now().UTC().Add(-time.Duration(hours*float64(time.Hour))).Unix() / 60
+		tr := parseTimeRange(c, 24)
+		since, until := tr.From.Unix()/60, tr.To.Unix()/60
+		// request_stats 落库是分钟粒度：窗口放宽到 30/90 天后原样返回是几万个点，
+		// 曲线画不动、JSON 也大。复用 stepForWindow（与 SLA 曲线同一套档位）做等宽分桶。
+		// 桶表达式直接写进 SQL：step 只由 stepForWindow 产生（1/5/30/120/360），不含外部输入。
+		// GROUP BY 必须用同一个表达式而不是别名 —— 别名会被当作表列引用，分桶静默失效。
+		step := stepForWindow(tr.Hours)
+		bucket := fmt.Sprintf("(minute / %d) * %d", step, step)
+		nodes := statsNodes(c)
 		ctx, cancel := dbCtx()
 		defer cancel()
 		var rows []struct {
@@ -344,9 +394,13 @@ func registerAdminRoutes(router *gin.Engine) {
 			Total  int64 `json:"total"`
 			Errors int64 `json:"errors"`
 		}
-		if err := db.WithContext(ctx).Model(&RequestStat{}).
-			Select("minute, SUM(total) as total, SUM(errors) as errors").
-			Where("minute >= ?", since).Group("minute").Order("minute asc").Find(&rows).Error; err != nil {
+		q := db.WithContext(ctx).Model(&RequestStat{}).
+			Select(bucket + " as minute, SUM(total) as total, SUM(errors) as errors").
+			Where("minute >= ? AND minute <= ?", since, until)
+		if len(nodes) > 0 {
+			q = q.Where("node_id IN ?", nodes)
+		}
+		if err := q.Group(bucket).Order("minute asc").Find(&rows).Error; err != nil {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}

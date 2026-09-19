@@ -265,7 +265,7 @@ async function confirmDelete(u) {
   font-size: 0.6rem;
   padding: 1px 5px;
   border-radius: 3px;
-  background: var(--ak-signal-info);
+  background: var(--ui-solid-info);
   color: #fff;
   vertical-align: 1px;
 }

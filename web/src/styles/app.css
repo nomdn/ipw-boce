@@ -2,18 +2,28 @@
    ipw-boce 控制台 · 项目级样式（基于 ak-ui tokens）
    ============================================================ */
 
-/* ---- 品牌/语义微调：石墨基调 + 高对比数据文本 ---- */
+/* ---- 品牌/语义微调：信号色板 ----
+   随主题变化的中性色（分隔线/填充/图表网格等）统一在 theme.css 定义 */
 :root {
-  /* 图表信号色板（供 echarts 引用，避免硬编码漂移） */
-  --chart-grid: #1f2a33;
-  --chart-axis: rgba(240, 240, 235, 0.45);
-  --chart-label: rgba(248, 248, 245, 0.72);
+  /* 图表信号色板（供 echarts 引用，避免硬编码漂移）
+     grid / axis / label 三项随主题走，见 theme.css */
   --chart-cyan: #2a9df4;
   --chart-yellow: #ffd802;
   --chart-green: #46c47c;
   --chart-red: #e33b3b;
   --chart-orange: #f6540e;
   --chart-gray: #7a8a96;
+
+  /* ---- 字体：全站无衬线 ----
+     ak-ui 的 --ak-font-command 默认 = --ak-font-serif（衬线），被品牌名/面板标题/
+     弹窗标题等 20 余处引用。这里把 serif 与 command 一并指回 --ak-font-sans，
+     既有用法就地变无衬线，不必逐处替换。
+     不引入网络字体（Noto Serif SC 本机未装，外链 CDN 在国内也不稳），
+     正文靠系统已装的 Noto Sans SC，缺字时回落各平台常见中文字体。
+     等宽 --ak-font-mono 保持 ak-ui 默认，只用于 IP/端口/时间戳等对齐场景。 */
+  --ak-font-sans: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', Roboto, Arial, sans-serif;
+  --ak-font-serif: var(--ak-font-sans);
+  --ak-font-command: var(--ak-font-sans);
 }
 
 * {
@@ -45,7 +55,7 @@ body {
   width: 220px;
   flex: 0 0 220px;
   background: var(--ak-surface-inverse);
-  border-right: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
+  border-right: var(--ak-line-hairline) solid var(--ui-line);
   display: flex;
   flex-direction: column;
   position: sticky;
@@ -55,7 +65,7 @@ body {
 
 .console-brand {
   padding: 20px 18px 14px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line);
 }
 .console-brand .brand-title {
   font-family: var(--ak-font-command);
@@ -109,12 +119,12 @@ body {
   height: 15px;
 }
 .console-nav .nav-item:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--ui-tint-hover);
   color: var(--ak-text-primary);
 }
 .console-nav .nav-item.router-link-exact-active {
   color: var(--ak-text-primary);
-  background: rgba(74, 171, 234, 0.14);
+  background: var(--ui-nav-active);
 }
 .console-nav .nav-item.router-link-exact-active::before {
   content: '';
@@ -128,7 +138,7 @@ body {
 
 .console-aside .console-foot {
   padding: 14px 16px;
-  border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
+  border-top: var(--ak-line-hairline) solid var(--ui-line);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -151,8 +161,8 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 14px 24px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
-  background: rgba(17, 19, 21, 0.6);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line);
+  background: var(--ui-scrim);
   position: sticky;
   top: 0;
   z-index: 20;
@@ -171,24 +181,28 @@ body {
 
 /* ============ 站内信铃铛 ============ */
 .notice-wrap { position: relative; }
-.bell-btn {
+.bell-btn,
+.theme-btn {
   position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 32px;
   height: 32px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--ui-line-ctl);
   border-radius: 3px;
   background: transparent;
   color: var(--ak-text-secondary);
   cursor: pointer;
   transition: color var(--ak-motion-fast), border-color var(--ak-motion-fast), background var(--ak-motion-fast);
 }
-.bell-btn:hover { color: var(--ak-text-primary); border-color: rgba(255, 255, 255, 0.34); background: rgba(255, 255, 255, 0.05); }
-.bell-btn.has { color: var(--ak-signal-accent); border-color: rgba(246, 84, 14, 0.4); }
-.bell-ico { display: inline-flex; }
-.bell-ico svg { width: 17px; height: 17px; }
+.bell-btn:hover,
+.theme-btn:hover { color: var(--ak-text-primary); border-color: var(--ui-line-hover); background: var(--ui-tint-hover); }
+.bell-btn.has { color: var(--ak-signal-accent); border-color: color-mix(in srgb, var(--ak-signal-accent) 45%, transparent); }
+.bell-ico,
+.theme-ico { display: inline-flex; }
+.bell-ico svg,
+.theme-ico svg { width: 17px; height: 17px; }
 .bell-badge {
   position: absolute;
   top: -7px;
@@ -197,7 +211,7 @@ body {
   height: 16px;
   padding: 0 4px;
   border-radius: 9px;
-  background: var(--ak-signal-danger);
+  background: var(--ui-solid-danger);
   color: #fff;
   font-size: 0.62rem;
   font-family: var(--ak-font-mono);
@@ -212,8 +226,8 @@ body {
   width: 360px;
   max-width: calc(100vw - 48px);
   background: var(--ak-surface-inverse);
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+  border: var(--ak-line-hairline) solid var(--ui-line-strong);
+  box-shadow: var(--ui-shadow-panel);
   z-index: 60;
   display: flex;
   flex-direction: column;
@@ -224,7 +238,7 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 10px 14px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.1);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line);
   font-family: var(--ak-font-command);
   font-size: 0.85rem;
   font-weight: 600;
@@ -243,11 +257,11 @@ body {
 .notice-body .empty { padding: 26px 14px; text-align: center; color: var(--ak-text-secondary); font-size: 0.8rem; }
 .notice-item {
   padding: 10px 14px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.06);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line-soft);
   cursor: pointer;
 }
-.notice-item:hover { background: rgba(255, 255, 255, 0.04); }
-.notice-item.unread { background: rgba(246, 84, 14, 0.06); }
+.notice-item:hover { background: var(--ui-tint); }
+.notice-item.unread { background: var(--ui-accent-tint); }
 .notice-item .ni-title {
   display: flex;
   align-items: center;
@@ -268,7 +282,7 @@ body {
   border: 1px solid currentColor;
 }
 .notice-item .ni-body { margin-top: 6px; font-size: 0.72rem; line-height: 1.5; color: var(--ak-text-secondary); white-space: pre-wrap; word-break: break-all; }
-.notice-foot { padding: 8px 14px; border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08); font-size: 0.66rem; }
+.notice-foot { padding: 8px 14px; border-top: var(--ak-line-hairline) solid var(--ui-line); font-size: 0.66rem; }
 
 .console-body {
   padding: 22px 24px 40px;
@@ -276,12 +290,12 @@ body {
 }
 
 /* ============ 通用面板 ============ */
+/* 形态（圆角 / 去剪角 / 描边粗细 / 饰线 / 投影）统一由 theme.css 的「形态层」给出，
+   本文件只描述结构与配色 —— 面板左边那条 3px 实色竖条已收成标题前 3×14px 短竖条。 */
 .panel {
   background: var(--ak-surface-inverse);
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
-  border-left: 3px solid var(--ak-signal-info);
+  border: var(--ak-line-hairline) solid var(--ui-line);
   padding: var(--ak-density-panel-padding, 18px);
-  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
 }
 .panel h2.panel-title {
   margin: 0 0 14px;
@@ -304,8 +318,8 @@ body {
 }
 .kpi-card {
   background: var(--ak-surface-inverse);
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
-  border-top: 3px solid var(--ak-signal-info);
+  border: var(--ak-line-hairline) solid var(--ui-line);
+  border-top-color: var(--ui-rail);
   padding: 14px 16px;
 }
 .kpi-card.kpi--action { border-top-color: var(--ak-signal-action); }
@@ -332,13 +346,22 @@ body {
   margin-top: 2px;
 }
 
-/* 网格布局 */
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-.chart-box { height: 320px; width: 100%; }
+/* 网格布局
+   ⚠️ 列必须写 minmax(0, 1fr)，不能写 1fr：1fr 等价于 minmax(auto, 1fr)，而 min 侧的 auto 取
+   子项 min-content —— ECharts 会在容器内层塞一个「固定像素宽」的 div（如 width:450px），
+   于是网格列被顶到 450px 后再也缩不回容器宽，窄屏（含"曾以宽视口渲染过 / 旋转屏幕"）即整页横向溢出。
+   minmax(0, 1fr) 把 min 钉成 0，列宽严格等于可用宽，图表再由 ECharts 的 ResizeObserver 自适应。 */
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.chart-box { height: 320px; width: 100%; min-width: 0; }
+
+/* 同理：grid 子项默认 min-width:auto 会被「固定像素宽内容」撑破，统一放开收缩 */
+.grid-2 > *, .grid-3 > *, .kpi-strip > *, .node-wall > *,
+.panel, .kpi-card, .chart-box { min-width: 0; }
 
 @media (max-width: 1100px) {
-  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  /* !important：ConfigView 的「340px 1fr」是行内样式，样式表覆盖不了行内，必须提权 */
+  .grid-2, .grid-3 { grid-template-columns: minmax(0, 1fr) !important; }
 }
 
 /* ============ ak-ui 组件深色主题适配（窄作用域覆写） ============
@@ -356,19 +379,17 @@ body {
 .ak-select {
   background: var(--ak-surface-raised);
   color: var(--ak-text-primary);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-left: 4px solid var(--ak-signal-info);
-  border-radius: 0;
+  border: 1px solid var(--ui-line-ctl);
 }
 .ak-input::placeholder,
 .ak-textarea::placeholder,
 .ak-select::placeholder {
-  color: rgba(248, 248, 245, 0.35);
+  color: var(--ui-text-placeholder);
 }
 .ak-input:hover,
 .ak-textarea:hover,
 .ak-select:hover {
-  border-color: rgba(255, 255, 255, 0.3);
+  border-color: var(--ui-line-hover);
 }
 .ak-input:focus,
 .ak-textarea:focus,
@@ -391,12 +412,12 @@ body {
 /* ak-button 已含 color:white + 灰底，深色下 --outline 需透出深底 */
 .ak-button.ak-button--outline {
   background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--ui-line-stronger);
   color: var(--ak-text-primary);
   box-shadow: none;
 }
 .ak-button.ak-button--outline:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--ui-tint-hover);
 }
 .ak-button.ak-button--action {
   /* 修复 ak-ui 上游 .ak-button--action 默认 text-align:right 的 bug：
@@ -406,8 +427,27 @@ body {
   background-color: var(--ak-signal-info);
   color: #fff;
 }
+/* ak-ui 的 .ak-button 硬编码 width:150px/height:50px，表格行内、卡片里的小按钮全靠 .sm 收回自适应尺寸。
+   以前只有 SlaView 在自己作用域里覆盖，其它页面的 .sm 形同虚设 → 这里补一份全局的。 */
+.ak-button.sm {
+  width: auto;
+  height: auto;
+  padding: 4px 10px;
+  font-size: 0.76rem;
+  font-weight: 400;
+}
+/* 危险动作（删除/关闭分享）：描边与文字走 danger 信号色。
+   亮色段的 `html[data-theme='light'] .ak-button.ak-button--outline` 是 (0,3,1)，会把颜色抢回近黑、
+   描边抢回灰，所以这里必须挂上 `html[data-theme]` 前缀凑到 (0,4,1) 才压得住。 */
+html[data-theme] .ak-button.ak-button--outline.danger {
+  color: var(--ak-signal-danger);
+  border-color: currentColor;
+}
+html[data-theme] .ak-button.ak-button--outline.danger:hover {
+  background: var(--ui-tint-hover);
+}
 .ak-divider {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--ui-tint-strong);
   height: 1px;
 }
 
@@ -433,15 +473,15 @@ table.ak-table {
   font-size: 0.74rem;
   letter-spacing: 0.05em;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  border-bottom: 1px solid var(--ui-line-strong);
   white-space: nowrap;
 }
 .ak-table td {
   padding: 9px 12px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.06);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line-soft);
   vertical-align: top;
 }
-.ak-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
+.ak-table tbody tr:hover { background: var(--ui-tint); }
 .mono { font-family: var(--ak-font-mono); font-size: 0.82em; }
 .dim { color: var(--ak-text-secondary); }
 
@@ -501,6 +541,59 @@ table.ak-table {
   margin-bottom: 16px;
 }
 
+/* 工具条内的分组：同类型控件排在一起，不要下拉、按钮、输入框互相穿插。
+   .tb-group            = 控件组（下拉框 / 输入框，彼此相邻）
+   .tb-group--actions   = 操作组（按钮全部集中在末尾）
+   组内 8px 紧凑、组间靠 .toolbar 的 14px 留白自然分开；窄屏各自换行、不会拆散。 */
+.tb-group {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tb-group--actions {
+  align-items: flex-end;
+}
+/* 开关/勾选项成组：彼此相邻、换行时也整组保持在一起，不插进输入框之间 */
+.tb-group--checks {
+  align-items: center;
+  gap: 6px 16px;
+}
+
+/* 时间窗口快捷切换（分段按钮，见 components/RangeTabs.vue）：
+   把"展开下拉再选一项"压成一次点选，可直接放在折线图上方。
+   类名刻意避开 .seg —— RecordsView 的类别页签用的是 .seg/.seg-item，撞名会互相污染。 */
+.timerange {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: var(--ak-line-hairline) solid var(--ui-line-ctl);
+  border-radius: 10px;
+}
+.timerange-btn {
+  border: 0;
+  background: transparent;
+  color: var(--ak-text-secondary);
+  font-family: inherit;
+  font-size: 0.72rem;
+  line-height: 1.25;
+  padding: 4px 9px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.timerange-btn:hover:not(:disabled) { color: var(--ak-text-primary); background: var(--ui-icon-btn-bg); }
+/* 当前项：info 色淡底 + 同色字（亮色下 --ak-signal-info 已压深，双主题都可读） */
+.timerange-btn.on {
+  background: color-mix(in srgb, var(--ak-signal-info) 18%, transparent);
+  color: var(--ak-signal-info);
+  font-weight: 600;
+}
+.timerange-btn:disabled { opacity: 0.5; cursor: default; }
+/* 紧凑形态：卡片内 / 抽屉内用，避免抢主标题的视觉重量 */
+.timerange.sm .timerange-btn { font-size: 0.68rem; padding: 3px 7px; }
+
 /* ============ 节点卡片墙 ============ */
 .node-wall {
   display: grid;
@@ -509,8 +602,8 @@ table.ak-table {
 }
 .node-card {
   background: var(--ak-surface-inverse);
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.1);
-  border-top: 3px solid var(--ak-signal-disabled);
+  border: var(--ak-line-hairline) solid var(--ui-line);
+  border-top-color: var(--ak-signal-disabled);
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
@@ -520,12 +613,13 @@ table.ak-table {
 .node-card .node-id { font-family: var(--ak-font-mono); font-size: 0.98rem; font-weight: 600; word-break: break-all; }
 .node-card .node-label { color: var(--ak-text-secondary); font-size: 0.82rem; }
 .node-card .node-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 0.78rem; color: var(--ak-text-secondary); }
-.node-card .node-actions { margin-top: auto; display: flex; gap: 8px; }
-.node-card .node-actions .ak-button { padding: 5px 10px; font-size: 0.78rem; }
+.node-card .node-actions { margin-top: auto; display: flex; flex-wrap: wrap; gap: 8px; }
+/* ak-ui 的 .ak-button 硬编码 width:150px/height:50px，卡片里三个按钮会各占一行 → 收回自适应尺寸 */
+.node-card .node-actions .ak-button { width: auto; height: auto; padding: 5px 10px; font-size: 0.78rem; white-space: nowrap; }
 
 /* 拨测结果面板 */
 .probe-card {
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.1);
+  border: var(--ak-line-hairline) solid var(--ui-line);
   background: var(--ak-surface-inverse);
   overflow: hidden;
 }
@@ -534,8 +628,8 @@ table.ak-table {
   flex-direction: column;
   gap: 3px;
   padding: 9px 12px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.02);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line);
+  background: var(--ui-tint-ghost);
 }
 .probe-card .pc-title {
   display: flex;
@@ -570,7 +664,7 @@ table.ak-table {
   max-height: 340px;
   overflow: auto;
 }
-pre.raw-json { color: rgba(248, 248, 245, 0.88); }
+pre.raw-json { color: var(--ui-text-body); }
 
 /* DNS 解析结果可视化 */
 .dns-head {
@@ -578,8 +672,8 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   align-items: center;
   gap: 10px;
   padding: 10px 14px 8px;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.02);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line);
+  background: var(--ui-tint-ghost);
   font-size: 0.85rem;
   word-break: break-all;
 }
@@ -598,7 +692,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   font-family: var(--ak-font-mono);
   word-break: break-all;
 }
-.dns-record + .dns-record { border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.05); }
+.dns-record + .dns-record { border-top: var(--ak-line-hairline) solid var(--ui-line-faint); }
 .dns-idx {
   flex: none;
   width: 20px;
@@ -612,7 +706,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
 /* 表格 */
 .fv-tbl { width: 100%; border-collapse: collapse; }
 .fv-tbl td { padding: 5px 14px; vertical-align: top; }
-.fv-row { border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.05); }
+.fv-row { border-top: var(--ak-line-hairline) solid var(--ui-line-faint); }
 .fv-row:first-child { border-top: none; }
 .fv-key {
   width: 128px;
@@ -633,7 +727,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  border-bottom: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
+  border-bottom: var(--ak-line-hairline) solid var(--ui-line);
 }
 .fv-grouptr + .fv-grouptr td, .fv-nested { border-top: none; }
 /* 嵌套递归区 */
@@ -662,11 +756,11 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   font-size: 0.78rem;
   word-break: break-all;
   color: var(--ak-text-primary);
-  background: rgba(255, 255, 255, 0.05);
-  border: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08);
+  background: var(--ui-tint-hover);
+  border: var(--ak-line-hairline) solid var(--ui-line);
 }
 /* 对象数组逐条 */
-.fv-objrow + .fv-objrow { border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.05); }
+.fv-objrow + .fv-objrow { border-top: var(--ak-line-hairline) solid var(--ui-line-faint); }
 .fv-objrow .fv-subhead {
   padding: 7px 14px 2px;
   color: var(--ak-text-secondary);
@@ -676,7 +770,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
 /* 双栈分栏：父容器足够宽时并排，否则自动堆叠；最小栈宽 280px */
 .fv-stack { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
 .fv-stack-col { min-width: 0; }
-.fv-stack-col + .fv-stack-col { border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08); border-left: none; }
+.fv-stack-col + .fv-stack-col { border-top: var(--ak-line-hairline) solid var(--ui-line); border-left: none; }
 .fv-stack:not(:has(.fv-stack-col + .fv-stack-col)) > .fv-stack-col,
 .fv-stack-col:not(:nth-child(2)) + .fv-stack-col { border-top: 0; }
 /* 并排态：第二个栈左侧加分隔 */
@@ -709,14 +803,14 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
-  color: rgba(248, 248, 245, 0.85);
-  background: rgba(0, 0, 0, 0.25);
+  color: var(--ui-text-body);
+  background: var(--ui-code-bg);
   border-radius: 4px;
 }
 /* 窄卡片/窄屏：双栈改为上下堆叠，避免 IPv6 列被压缩到看不见 */
 @media (max-width: 900px) {
-  .fv-stack { grid-template-columns: 1fr; }
-  .fv-stack-col + .fv-stack-col { border-left: none; border-top: var(--ak-line-hairline) solid rgba(255, 255, 255, 0.08); }
+  .fv-stack { grid-template-columns: minmax(0, 1fr); }
+  .fv-stack-col + .fv-stack-col { border-left: none; border-top: var(--ak-line-hairline) solid var(--ui-line); }
 }
 
 /* 标签 */
@@ -740,7 +834,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
     z-index: 40;
     transform: translateX(-100%);
     transition: transform 0.22s var(--ak-ease-standard, ease);
-    box-shadow: 0 0 28px rgba(0, 0, 0, 0.55);
+    box-shadow: 0 0 28px var(--ui-shadow-drawer);
   }
   .console-aside.open { transform: none; }
 
@@ -768,7 +862,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
     height: 28px;
     flex: none;
     background: transparent;
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    border: 1px solid var(--ui-line-ctl);
     border-radius: 3px;
     color: var(--ak-text-secondary);
     font-size: 0.8rem;
@@ -793,7 +887,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
     flex: none;
     padding: 0;
     background: transparent;
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    border: 1px solid var(--ui-line-ctl);
     border-radius: 3px;
     color: var(--ak-text-primary);
     cursor: pointer;
@@ -809,9 +903,10 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   .panel { padding: 14px; }
   .toolbar { gap: 10px; margin-bottom: 12px; }
 
-  /* 卡片墙 / 网格：单列优先（ConfigView 的 340px 侧栏是行内样式，需 !important 覆盖） */
-  .node-wall { grid-template-columns: 1fr; }
-  .grid-2, .grid-3 { grid-template-columns: 1fr !important; }
+  /* 卡片墙 / 网格：单列优先（ConfigView 的 340px 侧栏是行内样式，需 !important 覆盖）
+     ⚠️ 单列也得写 minmax(0, 1fr)：写 1fr 时 min 侧为 auto，会被 ECharts 内层固定像素宽撑破 */
+  .node-wall { grid-template-columns: minmax(0, 1fr); }
+  .grid-2, .grid-3 { grid-template-columns: minmax(0, 1fr) !important; }
   .kpi-strip { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
   .kpi-card { padding: 12px 13px; }
   .kpi-card .kpi-value { font-size: 1.5rem; }
@@ -838,7 +933,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
   .form-field { width: 100%; }
 
   /* 页面内 minmax(≥360px) 的多列布局在窄屏会撑出横向滚动，统一改单列 */
-  .profile-cols, .acc-grid { grid-template-columns: 1fr !important; }
+  .profile-cols, .acc-grid { grid-template-columns: minmax(0, 1fr) !important; }
 
   /* 登录卡片：宽度已自适应，仅收紧内边距 */
   .login-card { padding: 26px 18px 22px !important; }
@@ -846,7 +941,7 @@ pre.raw-json { color: rgba(248, 248, 245, 0.88); }
 
 /* 滚动条 */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 5px; }
+::-webkit-scrollbar-thumb { background: var(--ui-tint-deep); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* 聚焦可见性兜底 */

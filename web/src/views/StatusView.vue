@@ -11,12 +11,8 @@
           <div class="st-badge">LEMON / IPW</div>
           <h1 class="st-title">服务可用性状态</h1>
         </div>
-        <select class="ak-select" v-model.number="hours" @change="load" style="width:140px">
-          <option :value="24">近 24 小时</option>
-          <option :value="72">近 72 小时</option>
-          <option :value="168">近 7 天</option>
-          <option :value="720">近 30 天</option>
-        </select>
+        <RangeTabs :model-value="hours" :options="PUBLIC_STATUS_WINDOWS" :disabled="winBusy"
+          aria-label="统计窗口" @change="setHours" />
       </header>
 
       <p v-if="!tasks.length" class="dim">该分享链接下暂无任务数据。</p>
@@ -68,13 +64,16 @@
 // 公开状态页（B3）：免登录只读。数据来自收集中心公开 JSON
 // GET {API_BASE}/api/public/status/:token —— 无 Token、无 Cookie，仅暴露该分享组的窗口聚合。
 // 结构（后端 public_status.go）：{ hours, tasks:[{ name/apiType/target?, KPI..., byNode, series }] }
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { http } from '../api/http.js'
 import { API_BASE } from '../config.js'
 import { fmtTime } from '../utils/format.js'
 import { apiLabel } from '../utils/probeMeta.js'
 import EChart from '../components/EChart.vue'
+import RangeTabs from '../components/RangeTabs.vue'
+import { useTheme, readChartTheme } from '../composables/useTheme.js'
+import { PUBLIC_STATUS_WINDOWS } from '../utils/timeWindow.js'
 
 const route = useRoute()
 // 必须响应式：vue-router 会复用同一组件实例，从 /s/aaa 切到 /s/bbb 时
@@ -101,11 +100,13 @@ function upTone(v) {
 
 // 延迟曲线（按任务）：多节点叠加（每节点一条、图例=节点 id）；单节点/无按节点数据时退化为平均线。
 // 红菱形 = 失败轮次（顶部固定条带，缩放全览可见）
-const CH = {
-  line: '#2a9df4', red: '#e33b3b',
-  grid: '#1f2a33', axis: 'rgba(240,240,235,.45)', label: 'rgba(248,248,245,.72)',
-}
-const NODE_COLORS = ['#2a9df4', '#ffd802', '#46c47c', '#c678dd', '#ff9f43', '#4ec9b0', '#e06c75', '#569cd6']
+// 网格/轴/label/提示框属中立色，随主题走（echarts 吃不到 CSS 变量，切主题时重读一次）
+const { theme } = useTheme()
+const CH = reactive({ ...readChartTheme() })
+watch(theme, () => Object.assign(CH, readChartTheme()))
+// 多节点叠加的配色：前三位跟 --chart-cyan/yellow/green 同值（数组是模块级常量，没法响应主题，只能写死），
+// 后五位沿用最初的原版装饰色（#c678dd/#ff9f43/#4ec9b0/#e06c75/#569cd6），不再做浅色处理
+const NODE_COLORS = ['#3aaeff', '#ffc61a', '#25d07c', '#c678dd', '#ff9f43', '#4ec9b0', '#e06c75', '#569cd6']
 const toPts = (series) => (series || [])
   .map((s) => {
     const t = new Date(s.time).getTime()
@@ -130,7 +131,7 @@ function curveOption(t) {
   // 平均线恒显示（加粗、置于最上层作参考线），与按节点细线同图
   series.push({
     name: '平均延迟', type: 'line', showSymbol: false, connectNulls: false,
-    color: CH.line, lineStyle: { width: 2.5 }, areaStyle: { opacity: 0.08 },
+    color: CH.cyan, lineStyle: { width: 2.5 }, areaStyle: { opacity: 0.08 },
     data: toPts(t.series),
   })
   const dots = (t.series || [])
@@ -140,11 +141,11 @@ function curveOption(t) {
     })
     .filter(Boolean)
   return {
-    color: useNodes ? [CH.line, ...NODE_COLORS] : [CH.line],
+    color: useNodes ? [CH.cyan, ...NODE_COLORS] : [CH.cyan],
     legend: useNodes ? { top: 0, textStyle: { color: CH.label, fontSize: 10 }, itemWidth: 14 } : undefined,
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'line' },
-      backgroundColor: '#101316', borderColor: 'rgba(255,255,255,.2)', textStyle: { color: '#f8f8f5' },
+      backgroundColor: CH.tipBg, borderColor: CH.tipBorder, textStyle: { color: CH.tipText },
       valueFormatter: (v) => (typeof v === 'number' ? v + ' ms' : '无'),
     },
     grid: { left: 56, right: 16, top: useNodes ? 30 : 18, bottom: 28 },
@@ -182,6 +183,19 @@ onMounted(() => {
 })
 onBeforeUnmount(() => timer && clearInterval(timer))
 
+// 快捷换统计窗口：winBusy 期间禁用按钮，避免连点堆一串请求（30s 自动刷新不受影响）
+const winBusy = ref(false)
+async function setHours(v) {
+  if (winBusy.value || v === hours.value) return
+  hours.value = v
+  winBusy.value = true
+  try {
+    await load()
+  } finally {
+    winBusy.value = false
+  }
+}
+
 // 分享码变化（同一组件实例内切换 /s/:token）→ 清掉旧的错误态并重新拉取
 watch(token, () => {
   notFound.value = false
@@ -195,7 +209,7 @@ watch(token, () => {
 .st-brand {
   display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
   flex-wrap: wrap; margin-bottom: 22px;
-  padding-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,.08);
+  padding-bottom: 14px; border-bottom: 1px solid var(--ui-line);
 }
 .st-badge {
   font-family: var(--ak-font-mono); font-size: .68rem;
@@ -206,14 +220,14 @@ watch(token, () => {
 .name { font-size: 1.3rem; margin: 0 0 6px; font-family: var(--ak-font-command); }
 .meta { color: var(--ak-text-secondary); font-size: .85rem; margin-bottom: 18px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .kpis { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
-.kpi { border: var(--ak-line-hairline) solid rgba(255,255,255,.08); padding: 10px 16px; min-width: 110px; }
+.kpi { border: var(--ak-line-hairline) solid var(--ui-line); padding: 10px 16px; min-width: 110px; }
 .kpi .k { font-size: .68rem; color: var(--ak-text-secondary); margin-bottom: 3px; }
 .kpi .v { font-size: 1.15rem; font-weight: 600; }
 .kpi.ok .v { color: var(--ak-signal-success); }
 .kpi.warn .v { color: var(--ak-signal-action); }
 .kpi.bad .v { color: var(--ak-signal-danger); }
 .curve-cap { font-size: .75rem; color: var(--ak-text-secondary); margin: 0 0 6px; }
-.curve-box { border: var(--ak-line-hairline) solid rgba(255,255,255,.08); border-radius: 4px; padding: 6px; margin-bottom: 20px; }
+.curve-box { border: var(--ak-line-hairline) solid var(--ui-line); border-radius: 4px; padding: 6px; margin-bottom: 20px; }
 .foot { margin-top: 18px; font-size: .72rem; }
 .nf { max-width: 480px; margin: 60px auto; text-align: center; padding: 24px; }
 </style>
