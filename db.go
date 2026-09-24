@@ -28,7 +28,7 @@ type Node struct {
 	Label       string    `gorm:"size:256" json:"label"`
 	Online      bool      `gorm:"index" json:"online"`
 	RemoteAddr  string    `gorm:"size:128" json:"remoteAddr"`
-	Version     string    `gorm:"size:64" json:"version"` // 节点上报的版本号（WS register / HTTP 健康检查）
+	Version     string    `gorm:"size:64" json:"version"` // 节点上报的版本号（WS register / HTTP GET /info）
 	// Capabilities 节点上报的能力清单（逗号分隔，如 "probe,report,config"）。
 	// 空 = 老版本节点未上报（无法据此判定"不支持"，只能作为"程序可能过旧"的线索）。
 	Capabilities string    `gorm:"size:128" json:"capabilities"`

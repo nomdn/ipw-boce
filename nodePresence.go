@@ -16,7 +16,7 @@ import (
 // 这里在探活 up/down 翻转时同步写 nodes 表 + node_events，使 NodeView/节点事件与 WS 节点一致。
 
 // markNodeUp 某节点判 up：upsert 在线快照 + 追加 online 事件（HTTP 看门狗探活成功时）。
-// version / capabilities 取自节点健康检查返回；为空（老版本节点）时不覆盖库里已有值。
+// version / capabilities 取自节点信息接口（HTTP `GET /info`）；为空（老版本节点、边缘函数版）时不覆盖库里已有值。
 func markNodeUp(n monitorNode, reason, version string, capabilities []string) {
 	if db == nil {
 		return

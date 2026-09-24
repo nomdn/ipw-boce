@@ -31,7 +31,7 @@ type envelope struct {
 	Data   json.RawMessage `json:"data,omitempty"`
 }
 
-// mockVersion 当前对外展示的版本号：-version 初值，OTA 模拟成功后变化（健康检查与 WS 注册共用）
+// mockVersion 当前对外展示的版本号：-version 初值，OTA 模拟成功后变化（节点信息接口 /info 与 WS 注册共用）
 var mockVersion = "v0.0.1-mock"
 
 func currentVersion() string { return mockVersion }
@@ -187,13 +187,19 @@ func runWS(url, nodeID, key, reportFile string, version *string) error {
 }
 
 // runHTTPUpstream 模拟 HTTP 上游节点：/v1/* 原样回显路径与 query；
-// / 为健康检查（看门狗探活打 url 根路径，回 2xx + version/capabilities，对齐真实节点）
+// / 为健康检查（看门狗探活打 url 根路径，只回 2xx + {"status":"ok"}，对齐真实节点）；
+// /info 为节点信息（版本 + 能力清单，看门狗探活通过后单独取回）。
 func runHTTPUpstream(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":       "ok",
+			"status": "ok",
+		})
+	})
+	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"version":      currentVersion(),
 			"capabilities": []string{"probe", "report", "config", "ota"},
 		})

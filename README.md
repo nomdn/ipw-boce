@@ -316,6 +316,7 @@ curl -H "Authorization: Bearer ipt_xxxx" https://<collector>/api/v1/tasks
 - **任务标签**：任务可打逗号分隔标签（`tags`），列表 `?tag=` 子串过滤（/admin/tasks 与 /api/v1/tasks 皆可）。
 - **服务节点掉线监控**（见 nodeHealth.go）：监控配置池（api-base-url 三栈 + ip-location-api）里全部节点。
   - HTTP 版节点（非 ws）：每 1 小时 GET 该节点 `url`（health 接口就在根路径、无追加路径）探活；连续 2 次失败判 down（约 2h）。
+    探活通过后再取一次该节点 `GET {url}info` 拿版本号与能力清单（健康检查只回 `{"status":"ok"}`，不回版本）。
   - WS 版节点（ws:true）：靠心跳判活（middleware 每 20s ping+status、空闲 >75s 剔除）。断连/剔除那一刻即置离线并写事件
     （节点状态页与事件历史**即时**变红），但**告警要过 20s 宽限窗口**：窗口内节点恢复注册就整条不报（含随后的「恢复上线」），
     避免秒级闪断、节点重启刷屏；窗口过后仍离线才发 `node_down`。判定与通报只有一处入口：`store.go recordNodeOffline`

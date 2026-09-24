@@ -20,6 +20,7 @@ import (
 //     recordNodeOnline 单点——断连即置离线，通报则先过 nodeDownGraceDelay 宽限窗口再确认发送。
 //   - HTTP 版节点（缺省，非 ws）：middleware 每 1 小时 GET 该节点 url（health 接口就在 url 根路径，
 //     无任何追加路径）探活；返回 2xx/3xx 视为 up，网络错或 >=4xx 视为 down；连续失败才判 down。
+//     版本号与能力清单**不在健康检查里**，探活通过后再单独取 `GET {url}info`（见 httpUp/nodeInfo）。
 //
 // 掉线判定原则（与用户确认）：
 //   - 仅对"曾经在线"的节点告警：新启动即未连上/从未探活成功的节点(如停用、池中占位)不上报，
@@ -203,30 +204,59 @@ func (w *nodeWatcher) tick(first bool) {
 }
 
 // httpUp 单次探活是否成功（health 接口 = 节点 url 根路径，GET url，2xx/3xx = up）。
-// 顺带回读响应体里的 version 与 capabilities（节点 / 的 JSON：
-// {"status":"ok","version":"...","capabilities":["probe",...]}），
-// 供节点状态页显示 HTTP 版节点的版本，以及判定其是否支持 config 指令；
-// 老版本节点不返回这些字段时为空。
+//
+// 判活只看根路径；版本号与能力清单已从健康检查里分出去（节点 `GET /info`），
+// 探活通过后再由 nodeInfo 单独取回 —— 健康检查是免鉴权的对外端点，不该回报版本。
 func (w *nodeWatcher) httpUp(st *nodeWatchState) (bool, string, string, []string) {
-	if strings.TrimSpace(st.node.url) == "" {
+	base := strings.TrimSpace(st.node.url)
+	if base == "" {
 		return false, "empty url", "", nil
 	}
-	resp, err := w.client.Get(st.node.url)
+	resp, err := w.client.Get(base)
 	if err != nil {
 		return false, err.Error(), "", nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		var probe struct {
-			Version      string   `json:"version"`
-			Capabilities []string `json:"capabilities"`
-		}
-		// 限制读取体积：探活只需要一个小 JSON，防止对端返回超大响应体把内存吃掉
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		_ = json.Unmarshal(body, &probe)
-		return true, "", probe.Version, probe.Capabilities
+	drain(resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return false, fmt.Sprintf("http %d", resp.StatusCode), "", nil
 	}
-	return false, fmt.Sprintf("http %d", resp.StatusCode), "", nil
+	version, caps := w.nodeInfo(base)
+	return true, "", version, caps
+}
+
+// nodeInfo 取节点的版本号与能力清单（GET {url}info，节点信息接口：
+// {"version":"...","capabilities":["probe",...]}）。
+//
+// 只用于状态页展示与"能否理解某类管理指令"的判定，**失败不影响判活**：
+// 老版本节点没有这个接口（404），边缘函数版节点也不回报版本，
+// 取不到就留空 —— markNodeUp 对空值不覆盖库里已有值，不会把已知信息抹掉。
+func (w *nodeWatcher) nodeInfo(base string) (string, []string) {
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	resp, err := w.client.Get(base + "info")
+	if err != nil {
+		return "", nil
+	}
+	defer drain(resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return "", nil
+	}
+	var info struct {
+		Version      string   `json:"version"`
+		Capabilities []string `json:"capabilities"`
+	}
+	// 限制读取体积：只需要一个小 JSON，防止对端返回超大响应体把内存吃掉
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	_ = json.Unmarshal(body, &info)
+	return info.Version, info.Capabilities
+}
+
+// drain 读完并关闭响应体（复用连接），探活/取信息都不需要正文以外的内容时用。
+// 读取同样限长，避免对端返回超大响应体把内存吃掉。
+func drain(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	_ = resp.Body.Close()
 }
 
 // checkHTTP 探活并更新状态。探活仅当到达周期（或 first 强制立即一次）。
