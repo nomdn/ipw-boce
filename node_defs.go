@@ -176,7 +176,41 @@ func applyNodeDefs(rows []NodeDef) {
 	// 凭据索引与节点池同源重建：控制台保存后即刻生效，无需重启
 	applyNodeCredentials(rows)
 
+	// 显示名同步到 nodes 快照表：改池里的名字后，节点列表/事件/可用率页立即跟着变（见 syncNodeLabelsToNodes）
+	syncNodeLabelsToNodes(rows)
+
 	refreshWatchedNodes()
+}
+
+// syncNodeLabelsToNodes 把节点定义（node_defs.label）里的显示名同步写进 nodes 快照表。
+//
+// 背景：nodes 表的 label 除了这里**没有任何写入者** —— WS 注册报文里不带名字
+// （见 ws.go 的 register 结构体），HTTP 版节点由 markNodeUp 写入池 label。
+// 而名字的权威来源是控制台「配置分发 → 上游节点池」里的 label。
+// 两表不同步时，直接读 nodes.label 的地方（GET /admin/nodes 节点列表、节点事件导出、
+// 可用率页、OTA 掉线兜底告警文案）会显示空名或改名前的旧名 —— 大盘那种展示层
+// 自己兜 poolLabelMap() 的接口反而是对的，口径不一致。
+//
+// 只同步「池里配了名字」的行：label 留空表示管理员不指定显示名，保留 nodes 里既有值不动
+// （可能是上一轮同步结果，也可能是节点自报）。已一致的行走 WHERE 过滤掉，不产生无意义 UPDATE。
+func syncNodeLabelsToNodes(rows []NodeDef) {
+	if db == nil || len(rows) == 0 {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	for _, row := range rows {
+		id := strings.TrimSpace(row.NodeID)
+		label := strings.TrimSpace(row.Label)
+		if id == "" || label == "" {
+			continue
+		}
+		if err := db.WithContext(ctx).Model(&Node{}).
+			Where("node_id = ? AND label <> ?", id, label).
+			Update("label", label).Error; err != nil {
+			log.Printf("[node-defs] WARN sync label to nodes table (%s): %v", id, err)
+		}
+	}
 }
 
 // ==================== 库托管凭据（api-keys / ws-keys） ====================

@@ -105,10 +105,18 @@ func recordNodeOnline(nodeID, remoteAddr, version string, capabilities []string)
 	if caps != "" {
 		updates["capabilities"] = caps
 	}
+	// 节点名以控制台的节点定义（node_defs.label）为准：注册报文里不带名字，这里主动从池里取，
+	// 否则新节点首次注册时 nodes 表会留空名（展示层 monitorNode.display() / 大盘早就 label 优先，
+	// 把落库这一侧也对齐，节点列表与事件导出才不会出现空名或改名前的旧名）。
+	// 池里没配名字时不动原值（可能已有历史同步结果）。
+	label := poolLabelFor(nodeID)
+	if label != "" {
+		updates["label"] = label
+	}
 	err := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "node_id"}},
 		DoUpdates: clause.Assignments(updates),
-	}).Create(&Node{NodeID: nodeID, Online: true, RemoteAddr: remoteAddr, Version: strings.TrimSpace(version), Capabilities: caps, FirstSeenAt: now, LastSeenAt: now}).Error
+	}).Create(&Node{NodeID: nodeID, Label: label, Online: true, RemoteAddr: remoteAddr, Version: strings.TrimSpace(version), Capabilities: caps, FirstSeenAt: now, LastSeenAt: now}).Error
 	if err != nil {
 		log.Printf("[store] ERROR upsert node online: %v", err)
 		return
