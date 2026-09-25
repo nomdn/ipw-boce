@@ -123,6 +123,7 @@ function syncViewport() {
 
 const allNavs = [
   { to: '/', label: '统计大盘', ico: '◫', tip: '汇总 / 按类型 / 按节点趋势', admin: false },
+  { to: '/available-nodes', label: '可用节点', ico: '◈', tip: '有哪些节点可以调 / 节点标识与在线状态', admin: false },
   { to: '/nodes', label: '节点状态', ico: '❖', tip: '在线节点 / 事件历史', admin: true },
   { to: '/probe', label: '一键拨测', svg: boltSvg, tip: '对全部或指定节点批量拨测', admin: false },
   { to: '/records', label: '拨测明细', ico: '≣', tip: '最近拨测记录', admin: false },

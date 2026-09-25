@@ -12,6 +12,8 @@ const routes = [
     redirect: { name: 'dashboard' },
     children: [
       { path: '', name: 'dashboard', component: () => import('../views/DashboardView.vue'), meta: { title: '统计大盘' } },
+      // 可用节点：登录即可（普通用户看"能调哪些节点"，只读、脱敏，见 AvailableNodesView.vue）
+      { path: 'available-nodes', name: 'available-nodes', component: () => import('../views/AvailableNodesView.vue'), meta: { title: '可用节点' } },
       { path: 'nodes', name: 'nodes', component: () => import('../views/NodesView.vue'), meta: { title: '节点状态', role: 'admin' } },
       { path: 'probe', name: 'probe', component: () => import('../views/ProbeView.vue'), meta: { title: '一键拨测' } },
       { path: 'records', name: 'records', component: () => import('../views/RecordsView.vue'), meta: { title: '拨测明细' } },
