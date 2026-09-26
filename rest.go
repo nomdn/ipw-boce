@@ -272,6 +272,8 @@ func restProbes(c *gin.Context) {
 
 // restProbeCreate POST /api/v1/probes —— 一键拨测（同步聚合；结构已与需求确认：全量含 body）。
 // 拨测类结果落库 source=biz 并归属 Token 主人（与内部一键拨测同一归属口径）。
+// nodes 缺省 = 全池，此时跳过当前确证离线的节点（被跳过的在响应 skipped 里返回）；
+// 显式给出 nodes 则点名照拨、不跳过（与内部一键拨测同一口径，见 offlineNodeSet）。
 func restProbeCreate(c *gin.Context) {
 	uid, _, _ := currentUserFromCtx(c)
 	var body struct {
@@ -296,7 +298,7 @@ func restProbeCreate(c *gin.Context) {
 			query.Set(k, v)
 		}
 	}
-	results, unknown, err := batchProbeCore(body.APIType, body.Raw, body.Nodes, query)
+	results, unknown, skipped, err := batchProbeCore(body.APIType, body.Raw, body.Nodes, query)
 	if err != nil {
 		restError(c, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -317,6 +319,7 @@ func restProbeCreate(c *gin.Context) {
 		"ok":        okCnt,
 		"failed":    failedCnt,
 		"unknown":   unknown,
+		"skipped":   skipped,
 		"persisted": persisted,
 		"results":   results,
 	})

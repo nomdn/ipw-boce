@@ -45,6 +45,8 @@ const ERROR_TEXT = {
   'cannot delete your own account': '不能删除自己的账号',
   'must keep at least one enabled admin': '必须保留至少一个启用中的管理员',
   'issue token': '登录凭证签发失败',
+  // 一键拨测：全池模式下所有节点都判离线（区别于"池里没配节点"）
+  'All nodes are offline': '全部节点当前均处于离线状态，已跳过拨测',
 }
 
 function localizeError(msg) {

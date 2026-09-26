@@ -76,6 +76,12 @@
           <span v-if="lastMeta.unknown?.length" class="err"> · 未响应 {{ lastMeta.unknown.join('、') }}</span>
         </span>
       </div>
+
+      <!-- 全池模式跳过离线节点：说明"为什么这次目标节点比池里少"，点名指定节点时不会跳过 -->
+      <div v-if="skipped.length" class="dim" style="margin-top:10px;font-size:.82rem">
+        已跳过 {{ skipped.length }} 个离线节点：<span class="mono">{{ skipped.join('、') }}</span>
+        <span style="opacity:.7">（需要强制拨测某个离线节点时，用「指定节点」点名）</span>
+      </div>
     </section>
 
     <!-- 结果 -->
@@ -178,6 +184,8 @@ const busy = ref(false)
 const error = ref('')
 const results = ref([])
 const lastMeta = ref(null)
+// 上次全池拨测被跳过的离线节点 id（后端判定的"确证离线"；指定节点模式恒为空）
+const skipped = ref([])
 // 上次实际参与的节点数（全部模式时为 targeted 的实际值）
 const lastNameCount = computed(() => lastMeta.value?.targeted ?? 0)
 
@@ -234,6 +242,7 @@ async function run() {
   error.value = ''
   busy.value = true
   results.value = []
+  skipped.value = []
   // speed 测速：raw 为纯 URL，需拼上协议前缀（v4/ 或 v6/）；若用户已手动带前缀则不重复拼
   if (form.apiType === 'speed' && !/^(v4|v6)\//.test(raw)) raw = `${form.proto}/${raw}`
   // 指定节点模式 → 转数组；全部模式 → 空（后端默认全部节点）
@@ -251,10 +260,12 @@ async function run() {
     // 此时 http 层给到 null，这里必须显式拦截，否则会抛出难懂的 null 相关 TypeError。
     if (!data) throw new Error('服务端未返回结果，请稍后重试')
     results.value = data.results || []
+    skipped.value = data.skipped || []
     lastMeta.value = data
   } catch (e) {
     error.value = e?.message || '拨测失败'
     results.value = []
+    skipped.value = []
   } finally {
     busy.value = false
   }
