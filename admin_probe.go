@@ -43,6 +43,46 @@ type nodeResult struct {
 // HTTP 节点 GET 上游 v1/{apiType}/{raw}，WS 节点经 WS 通道 RequestProbe。
 // 单个节点失败不影响其余节点，全部完成后汇总返回。
 
+// ==================== 上游响应体的安全序列化 ====================
+//
+// 上游节点的响应体**未必是 JSON**：CDN / nginx 的 502、520 错误页（HTML）、空体、
+// 被截断的 JSON 都会原样出现在这里。而 nodeResult.Body 是 any、值直接取 json.RawMessage，
+// 一旦不是合法 JSON，json.Marshal 会报 "invalid character '<' looking for beginning of value"，
+// gin 的 c.JSON 序列化失败时只 Abort、**不改已写入的状态码**，客户端于是收到
+// HTTP 200 + Content-Type: application/json + Content-Length: 0 的空响应
+// （前端表现为点了「执行拨测」毫无反应 / 报 null 相关错误）。
+// 所以聚合前必须统一做一次判定：合法 JSON 原样内联透出，其余退化为字符串。
+
+// probeBodyValue 把上游响应体包装成可安全序列化的值（用于接口响应）。
+// 空体 → nil（JSON 里省略该字段）；合法 JSON → 原样内联；其余（HTML 错误页等）→ 截断字符串。
+func probeBodyValue(body []byte) any {
+	if len(body) == 0 {
+		return nil
+	}
+	if json.Valid(body) {
+		return json.RawMessage(body)
+	}
+	return truncateStr(string(body), 4096)
+}
+
+// probeBodyText 取响应体的文本形态（用于落库/展示）。
+// 注意 json.RawMessage 虽是 []byte 别名，但 fmt 对它有特殊处理、Sprint 得到的是 JSON 原文；
+// 这里仍显式分支（而非 fmt.Sprint）以免依赖该隐式行为，并与 report.go 的上报语义保持一致。
+func probeBodyText(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case json.RawMessage:
+		return normalizeReportBody(t)
+	case []byte:
+		return string(t)
+	default:
+		return fmt.Sprint(t)
+	}
+}
+
 // nodePoolForType 按 apiType 返回对应节点池（与 middlewareHandler 的池路由规则一致）
 func nodePoolForType(apiType string) []apiInfo {
 	if apiType == "location" || apiType == "asn" {
@@ -167,7 +207,7 @@ func batchProbeCore(apiType, raw string, wantNodes []string, query url.Values) (
 				if perr != nil {
 					r.Error = perr.Error()
 				} else {
-					r.Body = json.RawMessage(body)
+					r.Body = probeBodyValue(body)
 				}
 				results[i] = r
 				return
@@ -178,7 +218,7 @@ func batchProbeCore(apiType, raw string, wantNodes []string, query url.Values) (
 			if perr != nil {
 				r.Error = perr.Error()
 			} else {
-				r.Body = json.RawMessage(body)
+				r.Body = probeBodyValue(body)
 			}
 			results[i] = r
 		}(i, n)
@@ -206,8 +246,8 @@ func persistManualProbes(apiType, raw string, results []nodeResult, ownerID uint
 		}
 		if r.Error != "" {
 			row.Error = truncateStr(r.Error, 512)
-		} else if r.Body != nil {
-			row.Body = truncateStr(fmt.Sprint(r.Body), 64*1024)
+		} else if s := probeBodyText(r.Body); s != "" {
+			row.Body = truncateStr(s, 64*1024)
 		}
 		rows = append(rows, row)
 	}

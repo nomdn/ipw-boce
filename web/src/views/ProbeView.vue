@@ -247,6 +247,9 @@ async function run() {
   }
   try {
     const data = await runBatchProbe(form.apiType, raw, nodes, query)
+    // 服务端异常时可能返回空响应体（历史上：某节点返回 HTML 错误页导致整包序列化失败），
+    // 此时 http 层给到 null，这里必须显式拦截，否则会抛出难懂的 null 相关 TypeError。
+    if (!data) throw new Error('服务端未返回结果，请稍后重试')
     results.value = data.results || []
     lastMeta.value = data
   } catch (e) {
