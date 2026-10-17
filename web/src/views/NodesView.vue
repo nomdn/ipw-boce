@@ -4,8 +4,8 @@
       <div class="tb-group">
         <div class="form-field">
           <label>可用率窗口</label>
-          <RangeTabs :model-value="uptimeDays" :options="DAYS_WINDOWS" :disabled="uptBusy"
-            aria-label="可用率统计窗口" @change="setUptimeDays" />
+          <TimeRangePicker :model-value="uptimeRange" :max-days="90" :disabled="uptBusy"
+            aria-label="可用率统计窗口" @update:model-value="setUptimeRange" />
         </div>
       </div>
       <div class="tb-group tb-group--actions">
@@ -150,7 +150,7 @@
           <tbody>
             <tr v-for="t in otaTasks" :key="t.id">
               <td class="mono dim">{{ t.id }}</td>
-              <td class="mono">{{ t.nodeId }}</td>
+              <td class="mono" :title="t.nodeId">{{ t.label || labelOf[t.nodeId] || t.nodeId }}</td>
               <td class="mono">{{ t.fromVersion || '—' }} → {{ t.targetVersion || (t.url ? '按下载地址' : '—') }}</td>
               <td>{{ t.channel === 'ws' ? 'WS' : 'HTTP' }}</td>
               <td>
@@ -176,7 +176,7 @@
     <div v-if="ota.show" class="ev-mask" @click.self="ota.show = false">
       <div class="ev-panel">
         <header class="ev-head">
-          <span class="mono">{{ ota.nodeId }}</span>
+          <span class="mono" :title="ota.nodeId">{{ ota.nodeLabel || ota.nodeId }}</span>
           <span class="dim">OTA 升级</span>
           <button class="ak-button ak-button--outline" style="margin-left:auto;padding:3px 10px" @click="ota.show = false">关闭</button>
         </header>
@@ -218,15 +218,15 @@
     <div v-if="uptPanel" class="ev-mask" @click.self="uptPanel = null">
       <div class="ev-panel">
         <header class="ev-head">
-          <span class="mono">{{ uptPanel.nodeId }}</span>
+          <span class="mono" :title="uptPanel.nodeId">{{ uptPanel.nodeLabel || uptPanel.nodeId }}</span>
           <span class="dim">可用率趋势</span>
           <button class="ak-button ak-button--outline" style="margin-left:auto;padding:3px 10px" @click="uptPanel = null">关闭</button>
         </header>
         <!-- 图上直接换窗口：与顶部「可用率窗口」同一状态，节点卡片上的可用率一并跟着变 -->
         <div class="upt-bar">
           <span class="dim">统计窗口</span>
-          <RangeTabs small :model-value="uptimeDays" :options="DAYS_WINDOWS" :disabled="uptBusy"
-            aria-label="可用率统计窗口" @change="setUptimeDays" />
+          <TimeRangePicker :model-value="uptimeRange" :max-days="90" :disabled="uptBusy"
+            aria-label="可用率统计窗口" @update:model-value="setUptimeRange" />
           <span v-if="uptBusy" class="dim">切换中…</span>
         </div>
         <div v-if="uptPanel.loading" class="loading-center"><span class="ak-loading"></span></div>
@@ -253,7 +253,7 @@
     <div v-if="drawer" class="ev-mask" @click.self="drawer = null">
       <div class="ev-panel">
         <header class="ev-head">
-          <span class="mono">{{ drawer.nodeId }}</span>
+          <span class="mono" :title="drawer.nodeId">{{ drawer.label || drawer.nodeId }}</span>
           <span class="dim">在线/离线事件</span>
           <button class="ak-button ak-button--outline" style="margin-left:auto;padding:3px 10px"
             :disabled="exportingEvents" @click="doExportEvents(drawer)">
@@ -290,9 +290,9 @@ import {
 import { timeAgo, fmtTime } from '../utils/format.js'
 import { useTheme, readChartTheme } from '../composables/useTheme.js'
 import EChart from '../components/EChart.vue'
-import RangeTabs from '../components/RangeTabs.vue'
+import TimeRangePicker from '../components/TimeRangePicker.vue'
+import { resolveRange } from '../utils/timeRange.js'
 import { useDialog } from '../composables/useDialog.js'
-import { DAYS_WINDOWS } from '../utils/timeWindow.js'
 
 const dialog = useDialog()
 
@@ -303,7 +303,9 @@ const loading = ref(false)
 const error = ref('')
 
 // ===== 可用率 =====
-const uptimeDays = ref(7)
+// 统计窗口用 Umami 式选择器（与 SLA/大盘/分享页同一套）：状态 { key, start?, end? }。
+// 后端 /admin/nodes/uptime 只认整数天（days，clamp 1~90），故取数时把窗口折算成天数。
+const uptimeRange = ref({ key: '7d' })
 const uptimeMap = ref({}) // nodeId -> 后端 nodeUptimeStats
 const uptPanel = ref(null) // { nodeId, loading, data }
 const uptBusy = ref(false) // 切换统计窗口中：禁用按钮，避免连点堆请求
@@ -316,12 +318,20 @@ const maint = reactive({ show: false, scope: 'global', repeatDaily: false, start
 // ===== OTA =====
 const otaTasks = ref([])
 const ota = reactive({
-  show: false, nodeId: '', mode: 'version', version: '', url: '', sha256: '',
+  show: false, nodeId: '', nodeLabel: '', mode: 'version', version: '', url: '', sha256: '',
   busy: false, err: '', msg: '',
 })
 let otaTimer = null
 
 const onlineCount = computed(() => nodes.value.filter((n) => n.online).length)
+
+// nodeId → 显示名。节点列表的 label 由后端走 nodeDisplayName 给全（池 label → nodes.label → nodeId），
+// OTA 任务列表只带 nodeId，靠这张表把 UUID 换成名字。池里已删/不在列表的节点回落原 id。
+const labelOf = computed(() => {
+  const m = {}
+  for (const n of nodes.value) m[n.nodeId] = n.label || n.nodeId
+  return m
+})
 
 // ==== 图表主题（echarts 读不到 CSS 变量，需随主题重算）====
 const { theme } = useTheme()
@@ -401,9 +411,17 @@ async function load() {
   }
 }
 
+// 统计窗口 → 后端 days 参数（/admin/nodes/uptime 只认整数天，服务端 clamp 1~90）。
+// Umami 选择器给的是任意区间（含自定义/平移），这里统一折算成"最近多少天"：
+// 相对与自然周期都能整除，自定义区间按跨度取整，零跨度兜底 1 天。
+function uptimeDays() {
+  const r = resolveRange(uptimeRange.value)
+  return Math.min(90, Math.max(1, Math.round(r.hours / 24)))
+}
+
 async function loadUptime() {
   try {
-    const resp = await fetchNodesUptime(uptimeDays.value)
+    const resp = await fetchNodesUptime(uptimeDays())
     const m = {}
     for (const s of resp?.nodes || []) m[s.nodeId] = s
     uptimeMap.value = m
@@ -438,7 +456,7 @@ async function doExportEvents(n) {
 
 // ===== 可用率趋势 =====
 async function openUptime(n) {
-  uptPanel.value = { nodeId: n.nodeId, loading: true, data: null }
+  uptPanel.value = { nodeId: n.nodeId, nodeLabel: n.label || n.nodeId, loading: true, data: null }
   await reloadUptimePanel(n.nodeId)
 }
 
@@ -446,8 +464,11 @@ async function openUptime(n) {
 // 不重置 loading，旧图留着直到新数据到达，避免"图表闪一下没了"）
 async function reloadUptimePanel(nodeId) {
   try {
-    const data = await fetchNodeUptime(nodeId, uptimeDays.value)
-    if (uptPanel.value?.nodeId === nodeId) uptPanel.value = { nodeId, loading: false, data }
+    const data = await fetchNodeUptime(nodeId, uptimeDays())
+    // 回填时保留原有 nodeLabel（重建对象会丢），否则换窗口后标题会退回 UUID
+    if (uptPanel.value?.nodeId === nodeId) {
+      uptPanel.value = { nodeId, nodeLabel: uptPanel.value.nodeLabel || nodeId, loading: false, data }
+    }
   } catch (e) {
     uptPanel.value = null
     error.value = e?.message || '可用率加载失败'
@@ -455,9 +476,9 @@ async function reloadUptimePanel(nodeId) {
 }
 
 // 快捷换统计窗口：节点卡片的可用率（loadUptime）与抽屉折线一起换成新窗口
-async function setUptimeDays(v) {
-  if (uptBusy.value || v === uptimeDays.value) return
-  uptimeDays.value = v
+async function setUptimeRange(v) {
+  if (uptBusy.value || v?.key === uptimeRange.value?.key) return
+  uptimeRange.value = v
   uptBusy.value = true
   try {
     await loadUptime()
@@ -602,6 +623,7 @@ async function loadOta() {
 function openOta(n) {
   ota.show = true
   ota.nodeId = n.nodeId
+  ota.nodeLabel = n.label || n.nodeId
   ota.mode = 'version'
   ota.version = ''
   ota.url = ''

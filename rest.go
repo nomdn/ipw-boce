@@ -146,7 +146,10 @@ func slaSugar(taskID uint, hours float64, resp *slaTaskResp) gin.H {
 			p95Ms = n.P95Ms
 		}
 		byNode = append(byNode, gin.H{
-			"nodeId":       n.NodeID,
+			"nodeId": n.NodeID,
+			// 节点显示名（池 label，见 slaNodeAgg.Label）；空串表示池内没配名字，
+			// 前端按 label || nodeId 兜底。缺了它分享页节点表只能显示 UUID。
+			"label":        n.Label,
 			"up":           n.Up,
 			"down":         n.Down,
 			"availability": n.Availability,

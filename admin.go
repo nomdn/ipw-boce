@@ -251,7 +251,20 @@ func registerAdminRoutes(router *gin.Engine) {
 			apiError(c, http.StatusInternalServerError, err.Error())
 			return
 		}
-		c.JSON(http.StatusOK, nodes)
+		// label 统一走 nodeDisplayName：nodes.label 只是 node_defs.label 的单向同步副本，
+		// 池里改过名但同步没跑过时会是旧值，池里没配名时为空。前端拿它当显示名。
+		labels := poolLabelMap()
+		out := make([]gin.H, 0, len(nodes))
+		for i := range nodes {
+			n := &nodes[i]
+			out = append(out, gin.H{
+				"nodeId": n.NodeID, "label": nodeDisplayName(n.NodeID, labels[n.NodeID]),
+				"online": n.Online, "remoteAddr": n.RemoteAddr, "version": n.Version,
+				"capabilities": n.Capabilities,
+				"firstSeenAt":  n.FirstSeenAt, "lastSeenAt": n.LastSeenAt,
+			})
+		}
+		c.JSON(http.StatusOK, out)
 	})
 
 	// 节点在线/离线历史 —— admin only
@@ -425,7 +438,7 @@ func registerAdminRoutes(router *gin.Engine) {
 			Errors int64 `json:"errors"`
 		}
 		q := db.WithContext(ctx).Model(&RequestStat{}).
-			Select(bucket + " as minute, SUM(total) as total, SUM(errors) as errors").
+			Select(bucket+" as minute, SUM(total) as total, SUM(errors) as errors").
 			Where("minute >= ? AND minute <= ?", since, until)
 		if len(nodes) > 0 {
 			q = q.Where("node_id IN ?", nodes)
@@ -669,7 +682,7 @@ func registerAdminRoutes(router *gin.Engine) {
 			}
 		}
 		in.CreatedAt = t.CreatedAt
-		in.OwnerID = t.OwnerID  // 编辑不改所有者（保持创建者）
+		in.OwnerID = t.OwnerID // 编辑不改所有者（保持创建者）
 		in.Enabled = t.Enabled // 编辑不改运行状态：启停走专用 PATCH /tasks/:id/enabled。
 		// （否则前端编辑表单不带 enabled 字段时，全量 Save 会把任务静默停用）
 		in.ShareToken = t.ShareToken // 编辑不清空分享令牌（share 经 /tasks/:id/share 专门管理，否则全量 Save 会抹掉令牌）
@@ -781,7 +794,6 @@ func taskOwnedByUserButNot(c *gin.Context, t *ProbeTask) bool {
 	}
 	return t.OwnerID != uid
 }
-
 
 // ownerUsernames 批量查一组 users.id → username（用于任务返回 owner 名；查询失败返回空 map）
 func ownerUsernames(ids []uint) map[uint]string {
