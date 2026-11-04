@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,573 +12,293 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/spf13/viper"
 )
 
-// ==================== 节点 OTA 升级（控制台下发，节点执行） ====================
+// ==================== 节点 OTA 升级（与原版协议一致） ====================
 //
-// 链路：控制台建任务 → WS type=ota 下发（HTTP 回退 POST 节点 /v1/ota，鉴权语义同运行时配置）
-//   → 节点下载/校验/替换/重启（见 ipw-cn/src/ota.go）→ 节点连接断开 → 重连注册上报新版本号
-//   → 控制台判定任务 success。
-//
-// 成败判定：节点重启期间 WS 必然断开，最终结果无法经原连接回传，因此以"观测到节点的
-// 版本号变化"为准（OTA_TASK_TERMINAL 注释与 db.go OTATask 一致）：
-//   - 节点经 WS 回 ok:false（下载/校验/替换失败）→ 立即 failed（进度阶段同步更新到任务）
-//   - 版本命中判定（见 otaVersionHit）→ success：
-//     WS 节点走重连注册钩子（otaOnNodeRegistered）即时触发；
-//     HTTP-only 节点走兜底轮询里的**现场探测**（见 otaLiveVersion）—— 它的 nodes.version
-//     快照常态滞后，读快照永远判不出结果。
-//   - 超过 otaTaskTimeout 未观测到版本变化 → failed（超时：节点离线/升级失败/回滚）
+// 控制台建任务 → WS type=ota 下发 {requestId, url | version+assetBase, sha256?}（HTTP 回退 POST {url}v1/ota）
+// → 节点下载/校验/替换/重启，逐阶段回 ota_result → 重连注册上报新版本 → 判定 success。
+//   - 节点回 ok:false → 立即 failed
+//   - 按版本下发：重连版本 == 目标版本；直发 url：重连版本 != 下发时版本
+//   - HTTP-only 节点由轮询现场探测 GET {url}info 判定
+//   - 15 分钟未观测到版本变化 → failed（超时）
+// 在途任务期间的掉线/恢复不发管理员告警（计划内重启）。
+
+type OTATask struct {
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	NodeID        string     `gorm:"index;size:128" json:"nodeId"`
+	RequestID     string     `gorm:"size:64;index" json:"requestId"`
+	FromVersion   string     `gorm:"size:64" json:"fromVersion"`
+	TargetVersion string     `gorm:"size:64" json:"targetVersion"`
+	URL           string     `gorm:"size:512" json:"url,omitempty"`
+	SHA256        string     `gorm:"size:64" json:"sha256,omitempty"`
+	Channel       string     `gorm:"size:8" json:"channel"`
+	Status        string     `gorm:"index;size:16" json:"status"`
+	Stage         string     `gorm:"size:32" json:"stage"`
+	Error         string     `gorm:"size:512" json:"error,omitempty"`
+	DispatchedBy  string     `gorm:"size:64" json:"dispatchedBy,omitempty"`
+	DispatchedAt  time.Time  `json:"dispatchedAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+	FinishedAt    *time.Time `json:"finishedAt,omitempty"`
+}
 
 const (
-	otaAckTimeout  = 15 * time.Second // 等节点首个 ota_result（accepted；老版本节点静默忽略会打满）
-	otaTaskTimeout = 15 * time.Minute // 等节点重连上报新版本的总窗口
-	otaSweepEvery  = 10 * time.Second // 任务追踪轮询间隔
-	otaListLimit   = 100              // 任务列表单页上限
-	// otaVersionProbeTimeout 现场探测节点版本（GET {url}info）的超时。
-	// 只在"有在途任务"时触发，且节点正常时几十毫秒即回，这里取 3s 兼顾快回收与弱网。
-	otaVersionProbeTimeout = 3 * time.Second
+	otaDispatched  = "dispatched"
+	otaSuccess     = "success"
+	otaFailed      = "failed"
+	otaAckTimeout  = 15 * time.Second
+	otaTaskTimeout = 15 * time.Minute
 )
 
-// otaStatusDispatched / otaStatusSuccess / otaStatusFailed 任务状态取值
-const (
-	otaStatusDispatched = "dispatched"
-	otaStatusSuccess    = "success"
-	otaStatusFailed     = "failed"
-)
+var OTA_ASSET_BASE string
 
-// otaStageObserved 阶段取值：success 由"现场探测真实版本"判定（而非节点重连上报）。
-// 用于在任务记录里区分两种判定来源，便于事后核对。
-const otaStageObserved = "observed"
-
-// otaDispatchHint 下发成功后给管理员的说明（成败判定口径，UI 原样展示）
-const otaDispatchHint = "已下发。最终结果以控制台观测到的节点版本号为准（任务列表可见进度）：" +
-	"WS 版节点在重启重连时上报；HTTP 版节点由控制台定时现场探测（无阶段进度）。" +
-	"WS 通道下节点侧下载/校验失败会立即回传失败原因。"
-
-// registerOTARoutes 注册 OTA 管理路由（admin only）：
-//
-//	POST /nodes/:nodeId/ota  下发升级任务（body: {version?, url?, sha256?}，version 与 url 二选一）
-//	GET  /ota-tasks          最近任务列表（倒序）
-func registerOTARoutes(group *gin.RouterGroup) {
-	group.POST("/nodes/:nodeId/ota", otaDispatchHandler)
-	group.GET("/ota-tasks", otaListHandler)
-}
-
-// otaDispatchHandler POST /nodes/:nodeId/ota
-func otaDispatchHandler(c *gin.Context) {
-	nodeID := strings.TrimSpace(c.Param("nodeId"))
-	if nodeID == "" {
-		apiError(c, http.StatusBadRequest, "nodeId 不能为空")
-		return
-	}
-	var in struct {
-		Version string `json:"version"` // 目标版本（release tag，v1.2.3 / 1.2.3 均可）
-		URL     string `json:"url"`     // 直发下载地址（与 version 二选一，url 优先）
-		SHA256  string `json:"sha256"`  // 可选内容校验（hex64，兼容 sha256: 前缀）
-	}
-	if err := c.ShouldBindJSON(&in); err != nil && err != io.EOF {
-		apiError(c, http.StatusBadRequest, "请求体不是合法 JSON："+err.Error())
-		return
-	}
-	in.Version = strings.TrimSpace(in.Version)
-	in.URL = strings.TrimSpace(in.URL)
-	in.SHA256 = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(in.SHA256), "sha256:")))
-	if in.Version == "" && in.URL == "" {
-		apiError(c, http.StatusBadRequest, "version 与 url 至少填一项")
-		return
-	}
-	if in.SHA256 != "" {
-		if len(in.SHA256) != 64 {
-			apiError(c, http.StatusBadRequest, "sha256 必须是 64 位 hex")
-			return
-		}
-		if _, err := hex.DecodeString(in.SHA256); err != nil {
-			apiError(c, http.StatusBadRequest, "sha256 必须是合法 hex")
-			return
-		}
-	}
-	if in.URL != "" && !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://") {
-		apiError(c, http.StatusBadRequest, "url 必须是 http(s) 地址")
-		return
-	}
-
-	// 能力门：节点明确上报过清单且不含 ota → 直接拒绝（老节点静默忽略指令只能白等超时）
-	if deny, _ := nodeCapabilityGate(nodeID, capabilityOTA, "OTA 升级"); deny != nil {
-		apiError(c, http.StatusConflict, deny.Error())
-		return
-	}
-
-	// 下发时的节点版本快照（成败判定基准）
-	fromVersion, _, _ := nodeReportedInfo(nodeID)
-	// HTTP-only 节点的快照常态滞后（普通探活不写库，见"HTTP-only 节点的版本观测"），
-	// 而 url 直发模式正是靠"版本 != fromVersion"来判定 —— 陈旧的基准会把"本来就是这个版本"
-	// 误判成升级成功。这里对该类节点现场探一次覆盖基准；探不到就保留快照值，
-	// 最坏退回原有的超时兜底。（按版本下发走 TargetVersion 判定，不受基准影响。）
-	if otaNodeIsHTTPOnly(nodeID) {
-		if live, ok := otaLiveVersion(nodeID); ok {
-			fromVersion = live
-		}
-	}
-
-	task := OTATask{
-		NodeID:        nodeID,
-		RequestID:     "o" + genRequestID(),
-		FromVersion:   fromVersion,
-		TargetVersion: in.Version,
-		URL:           in.URL,
-		SHA256:        in.SHA256,
-		Status:        otaStatusDispatched,
-		DispatchedAt:  time.Now().UTC(),
-	}
-	if _, role, username := currentUserFromCtx(c); username != "" {
-		task.DispatchedBy = username
-	} else if role != "" {
-		task.DispatchedBy = "static-token"
-	}
-
-	// 组装下发报文：url 直发原样；按版本下发时附带资产基址（节点按自身平台计算资产名）
-	payload := map[string]any{"requestId": task.RequestID}
-	if in.URL != "" {
-		payload["url"] = in.URL
-	} else {
-		payload["version"] = in.Version
-		payload["assetBase"] = otaAssetBase()
-	}
-	if in.SHA256 != "" {
-		payload["sha256"] = in.SHA256
-	}
-
-	channel, stage, dispatchErr := otaSend(nodeID, payload)
-	task.Channel = channel
-	task.Stage = stage
-	if dispatchErr != nil {
-		task.Status = otaStatusFailed
-		now := time.Now().UTC()
-		task.FinishedAt = &now
-		task.Error = truncateStr(dispatchErr.Error(), 512)
-		if err := saveOTATask(&task); err != nil {
-			apiError(c, http.StatusInternalServerError, err.Error())
-			return
-		}
-		apiError(c, http.StatusBadGateway, dispatchErr.Error())
-		return
-	}
-	if err := saveOTATask(&task); err != nil {
-		apiError(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	log.Printf("[ota] task#%d dispatched to %s via %s (from=%q target=%q)",
-		task.ID, nodeID, channel, task.FromVersion, task.TargetVersion)
-	c.JSON(http.StatusOK, gin.H{"task": task, "hint": otaDispatchHint})
-}
-
-// otaListHandler GET /ota-tasks?limit=
-func otaListHandler(c *gin.Context) {
-	limit := clampLimit(c.Query("limit"), 50)
-	ctx, cancel := dbCtx()
-	defer cancel()
-	var rows []OTATask
-	if err := db.WithContext(ctx).Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
-		apiError(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// 补节点显示名：任务表只存 nodeId，前端就只能渲染 UUID。走全站统一口径
-	// nodeDisplayName（池 label → nodes.label → nodeId），与节点列表/可用率页一致。
-	labels := poolLabelMap()
-	out := make([]gin.H, 0, len(rows))
-	for _, t := range rows {
-		out = append(out, gin.H{
-			"id": t.ID, "nodeId": t.NodeID, "label": nodeDisplayName(t.NodeID, labels[t.NodeID]),
-			"requestId": t.RequestID, "fromVersion": t.FromVersion, "targetVersion": t.TargetVersion,
-			"url": t.URL, "sha256": t.SHA256, "channel": t.Channel,
-			"status": t.Status, "stage": t.Stage, "error": t.Error,
-			"dispatchedBy": t.DispatchedBy, "dispatchedAt": t.DispatchedAt, "updatedAt": t.UpdatedAt,
-		})
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// otaSend 下发 OTA 指令：WS 优先，HTTP 回退（节点 /v1/ota，凭据语义同运行时配置管理）。
-// 返回实际使用的通道、节点回报的最新阶段、错误。
-func otaSend(nodeID string, payload map[string]any) (channel, stage string, err error) {
-	// WS 通道：在线即走，无需节点暴露端口/access-token
-	var wsErr error
-	switch {
-	case wsSrv == nil:
-		wsErr = fmt.Errorf("WS 服务未启用")
-	case !wsSrv.NodeConnected(nodeID):
-		wsErr = fmt.Errorf("节点 WS 离线")
-	default:
-		raw, rerr := wsSrv.RequestOTA(nodeID, payload, otaAckTimeout)
-		if rerr == nil {
-			head := struct {
-				OK    bool   `json:"ok"`
-				Stage string `json:"stage"`
-				Error string `json:"error"`
-			}{}
-			_ = json.Unmarshal(raw, &head)
-			if !head.OK {
-				return "ws", head.Stage, fmt.Errorf("节点拒绝 OTA（%s）：%s", head.Stage, head.Error)
-			}
-			return "ws", head.Stage, nil
-		}
-		var te *wsTimeoutError
-		if errors.As(rerr, &te) {
-			wsErr = wsTimeoutDiagnosis(nodeID, rerr)
-		} else {
-			wsErr = fmt.Errorf("WS 指令失败（%w）", rerr)
-		}
-	}
-
-	// HTTP 回退：需要节点配了 access-token（api-keys[nodeId]），否则节点 HTTP OTA 管理面是关闭的
-	token := nodeAdminToken(nodeID)
-	if token == "" {
-		return "", "", fmt.Errorf("节点 %s 无法下发 OTA：%v；且未配置 access-token（api-keys），"+
-			"节点侧 HTTP 接口已关闭，无可回退通道", nodeID, wsErr)
-	}
-	base := nodeHTTPBase(nodeID)
-	if base == "" {
-		return "", "", fmt.Errorf("节点 %s 无法下发 OTA：%v；且节点池里没有该节点的 HTTP 上游地址", nodeID, wsErr)
-	}
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
-	}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, base+"v1/ota", strings.NewReader(string(body)))
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("节点 %s 无法下发 OTA：%v；HTTP 回退也失败：%v", nodeID, wsErr, err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	if resp.StatusCode >= http.StatusBadRequest {
-		return "", "", fmt.Errorf("节点 %s HTTP 回退返回 %d：%s", nodeID, resp.StatusCode,
-			strings.TrimSpace(string(respBody)))
-	}
-	return "http", "accepted", nil
-}
-
-// otaAssetBase 按版本下发时使用的发布资产基址（ota-asset-base 配置，缺省 GitHub Releases）
 func otaAssetBase() string {
-	base := strings.TrimSpace(viper.GetString("ota-asset-base"))
-	if base == "" {
-		return "https://github.com/nomdn/ipw-cn/releases/download"
+	if b := strings.TrimSuffix(strings.TrimSpace(OTA_ASSET_BASE), "/"); b != "" {
+		return b
 	}
-	return strings.TrimSuffix(base, "/")
+	return "https://github.com/nomdn/ipw-cn/releases/download"
 }
 
-// ==================== HTTP-only 节点的版本观测 ====================
-//
-// 背景：nodes.version 快照只有两个写入点 —— WS 注册（store.go recordNodeOnline）与
-// 看门狗探活（nodePresence.go markNodeUp），而 markNodeUp 在 checkHTTP 里**只在**
-// "进程内首探"与"down→up 翻转"两个分支被调用；普通在线轮次虽然每次都把 /info 的版本取了回来，
-// 却直接丢弃（见 nodeHealth.go httpUp）。探活周期 1h 又远大于 otaTaskTimeout(15m)。
-//
-// 结果：ws:false 的 HTTP-only 节点，成败判定只依赖快照的那条路永远读不到新版本，
-// 任务必然收敛为 failed(超时)，**与实际是成功还是失败无关**。
-//
-// 因此对这类节点改为"现场观测"：判定时不读快照，直接 GET {url}info 拿实时版本。
-// 只在有在途任务时触发，不改变看门狗的探活节奏，也不会给常态运行增加任何流量。
-
-// otaNodeIsHTTPOnly 该节点是否为 HTTP 通道节点（节点池里 ws 标记为 false）。
-// WS 节点有重连注册钩子（otaOnNodeRegistered）即时判定，无需现场探测。
-// 池里查不到（刚被移除等）时返回 false，保持原有行为。
-func otaNodeIsHTTPOnly(nodeID string) bool {
-	for _, item := range apiPoolSnapshot() {
-		if item.ID == nodeID {
-			return !item.UseWS()
-		}
-	}
-	for _, item := range locationPoolSnapshot() {
-		if item.ID == nodeID {
-			return !item.UseWS()
-		}
-	}
-	return false
+func otaTaskInFlight(nodeID string) bool {
+	ctx, cancel := dbCtx()
+	defer cancel()
+	var n int64
+	db.WithContext(ctx).Model(&OTATask{}).Where("node_id = ? AND status = ?", nodeID, otaDispatched).Count(&n)
+	return n > 0
 }
 
-// otaLiveVersion 现场探测节点实时版本号（GET {url}info，免鉴权）。
-// ok=false 表示探测不可用（池里无地址 / 网络错 / 响应异常 / 版本为空），调用方应退回快照判定。
-func otaLiveVersion(nodeID string) (version string, ok bool) {
-	base := strings.TrimSpace(nodeHTTPBase(nodeID))
-	if base == "" {
-		return "", false
+// otaExempt 在途 OTA 期间发生的断连：对应的恢复也不报（一次性消费）
+var otaExempt sync.Map
+
+func otaVersionHit(t OTATask, v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
 	}
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
+	if t.TargetVersion != "" {
+		return strings.TrimPrefix(v, "v") == strings.TrimPrefix(t.TargetVersion, "v")
 	}
-	client := &http.Client{Timeout: otaVersionProbeTimeout}
-	resp, err := client.Get(base + "info")
-	if err != nil {
-		return "", false
-	}
-	defer drain(resp)
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return "", false
-	}
-	var info struct {
-		Version string `json:"version"`
-	}
-	// 与看门狗取信息同口径：限长读取，只要一个小 JSON
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	if err := json.Unmarshal(body, &info); err != nil {
-		return "", false
-	}
-	version = strings.TrimSpace(info.Version)
-	return version, version != ""
+	return t.FromVersion != "" && v != t.FromVersion
 }
 
-// otaRecordObservedVersion 把现场观测到的真实版本回填 nodes 快照。
-// 判定本身不依赖回填（已经用实时值判完了），这里只是让节点列表、能力门与任务状态看到一致的事实，
-// 否则会出现"任务成功但列表还显示旧版本"的自相矛盾。
-// **不动 online 状态** —— 在线与否是看门狗的职责，OTA 追踪不应越权改写。
-func otaRecordObservedVersion(nodeID, version string) {
-	if db == nil || strings.TrimSpace(version) == "" {
+func finishOTATask(id uint, status, stage, errMsg string) {
+	ctx, cancel := dbCtx()
+	defer cancel()
+	now := time.Now().UTC()
+	up := map[string]any{"status": status, "finished_at": &now, "updated_at": now}
+	if stage != "" {
+		up["stage"] = stage
+	}
+	if errMsg != "" {
+		up["error"] = truncateStr(errMsg, 512)
+	}
+	db.WithContext(ctx).Model(&OTATask{}).Where("id = ? AND status = ?", id, otaDispatched).Updates(up)
+}
+
+func otaOnNodeRegistered(nodeID, version string) {
+	if version == "" {
 		return
 	}
 	ctx, cancel := dbCtx()
 	defer cancel()
-	if err := db.WithContext(ctx).Model(&Node{}).Where("node_id = ?", nodeID).
-		Updates(map[string]any{"version": strings.TrimSpace(version), "last_seen_at": time.Now().UTC()}).Error; err != nil {
-		log.Printf("[ota] WARN backfill observed version for %s: %v", nodeID, err)
+	var t OTATask
+	db.WithContext(ctx).Where("node_id = ? AND status = ?", nodeID, otaDispatched).Order("id desc").Limit(1).Find(&t)
+	if t.ID != 0 && otaVersionHit(t, version) {
+		finishOTATask(t.ID, otaSuccess, "", "")
+		log.Printf("[ota] task#%d SUCCESS: %s re-registered with %s", t.ID, nodeID, version)
 	}
 }
 
-// ==================== 任务追踪 ====================
-
-// saveOTATask 新建任务（update 语义由追踪函数按字段更新，不走全量 Save 避免并发覆盖）
-func saveOTATask(t *OTATask) error {
-	ctx, cancel := dbCtx()
-	defer cancel()
-	return db.WithContext(ctx).Create(t).Error
-}
-
-// otaOnNodeResult 节点经 WS 回报 ota_result：更新任务阶段；ok=false 立即判 failed。
-// 首帧（accepted）已被下发方消费作为 ack，这里照常幂等更新。
 func otaOnNodeResult(nodeID string, data json.RawMessage) {
-	if db == nil {
-		return
-	}
-	var res struct {
+	var r struct {
 		RequestID string `json:"requestId"`
 		OK        bool   `json:"ok"`
 		Stage     string `json:"stage"`
 		Error     string `json:"error"`
 	}
-	if err := json.Unmarshal(data, &res); err != nil || res.RequestID == "" {
+	if json.Unmarshal(data, &r) != nil || r.RequestID == "" {
 		return
 	}
 	ctx, cancel := dbCtx()
 	defer cancel()
-	q := db.WithContext(ctx).Model(&OTATask{}).Where("request_id = ?", res.RequestID)
-	updates := map[string]any{"stage": res.Stage, "updated_at": time.Now().UTC()}
-	if !res.OK {
-		updates["status"] = otaStatusFailed
+	up := map[string]any{"stage": r.Stage, "updated_at": time.Now().UTC()}
+	if !r.OK {
 		now := time.Now().UTC()
-		updates["finished_at"] = &now
-		updates["error"] = truncateStr(res.Error, 512)
-		log.Printf("[ota] task for node %s FAILED at stage=%s: %s", nodeID, res.Stage, res.Error)
+		up["status"], up["finished_at"], up["error"] = otaFailed, &now, truncateStr(r.Error, 512)
+		log.Printf("[ota] node %s FAILED at stage=%s: %s", nodeID, r.Stage, r.Error)
 	}
-	if err := q.Updates(updates).Error; err != nil {
-		log.Printf("[ota] WARN update task stage: %v", err)
-		return
-	}
-	if !res.OK {
-		// 失败终结：节点若仍未恢复在线（在途掉线已被豁免），此时补报
-		var t OTATask
-		if err := db.WithContext(ctx).Where("request_id = ?", res.RequestID).Limit(1).Find(&t).Error; err == nil && t.ID != 0 {
-			otaNotifyIfStillDown(t, fmt.Sprintf("OTA 任务#%d 失败（%s：%s），节点未恢复上线", t.ID, res.Stage, res.Error))
-		}
-	}
+	db.WithContext(ctx).Model(&OTATask{}).Where("request_id = ? AND status = ?", r.RequestID, otaDispatched).Updates(up)
 }
 
-// otaOnNodeRegistered WS 注册钩子（ws.go register 后调用）：节点重连上报的版本号命中
-// 在途任务的判定条件 → 即时判 success。
-func otaOnNodeRegistered(nodeID, version string) {
-	if db == nil || version == "" {
-		return
+func otaLiveVersion(nodeID string) (string, bool) {
+	base := strings.TrimSuffix(nodeHTTPBase(nodeID), "/")
+	if base == "" {
+		return "", false
 	}
-	ctx, cancel := dbCtx()
-	defer cancel()
-	var t OTATask
-	// Find + ID 判空而非 First：无在途任务是常态，避免 GORM 把 record not found 当错误刷日志
-	if err := db.WithContext(ctx).
-		Where("node_id = ? AND status = ?", nodeID, otaStatusDispatched).
-		Order("id desc").Limit(1).Find(&t).Error; err != nil || t.ID == 0 {
-		return // 无在途任务
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get(base + "/info")
+	if err != nil {
+		return "", false
 	}
-	if !otaVersionHit(t, version) {
-		return
+	defer resp.Body.Close()
+	var info struct {
+		Version string `json:"version"`
 	}
-	finishOTATask(t.ID, otaStatusSuccess, "", "")
-	log.Printf("[ota] task#%d SUCCESS: node %s re-registered with version %s", t.ID, nodeID, version)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode >= 400 || json.Unmarshal(b, &info) != nil || info.Version == "" {
+		return "", false
+	}
+	return strings.TrimSpace(info.Version), true
 }
 
-// otaTaskInFlight 该节点是否存在在途 OTA 任务（status=dispatched）。
-// 供掉线告警豁免：OTA 计划内重启必然伴随一次真实断连，不应按意外掉线告警。
-func otaTaskInFlight(nodeID string) bool {
-	if db == nil {
-		return false
-	}
-	ctx, cancel := dbCtx()
-	defer cancel()
-	var t OTATask
-	// Find+ID 判空：无在途任务是常态，避免 GORM 把 record not found 当错误刷日志
-	if err := db.WithContext(ctx).
-		Where("node_id = ? AND status = ?", nodeID, otaStatusDispatched).
-		Limit(1).Find(&t).Error; err != nil || t.ID == 0 {
-		return false
-	}
-	return true
+func otaNodeIsHTTPOnly(nodeID string) bool {
+	n := findNode(allPoolNodes(), nodeID)
+	return n != nil && !n.UseWS()
 }
 
-// otaNotifyIfStillDown OTA 任务失败终结后，若节点仍未恢复在线则补发掉线告警。
-// 背景：在途任务期间的掉线被豁免了（计划内重启不 page）；任务失败且节点没回来，
-// 说明"升级没成、节点也没回来"，这时才该报。节点已在线（含 url 模式装了同版本）则不报。
-func otaNotifyIfStillDown(t OTATask, reason string) {
-	ctx, cancel := dbCtx()
-	defer cancel()
-	var n Node
-	if err := db.WithContext(ctx).Where("node_id = ?", t.NodeID).Limit(1).Find(&n).Error; err != nil || n.ID == 0 || n.Online {
-		return
-	}
-	// 撤销在途期间打下的"上线豁免"：这次是任务终结仍离线的**真掉线**，已按掉线通报，
-	// 节点日后复联就该正常补一条"恢复上线"，与这条掉线配对。
-	takeOtaExempt(t.NodeID)
-	go notifyNodeDown(monitorNode{id: t.NodeID, label: n.Label, ws: true}, "WS 版", reason, 1)
-}
-
-// ==================== OTA 计划内重启的"上线"豁免 ====================
-//
-// OTA 重启必然伴随一次真实断连：掉线告警已豁免（见 store.go recordNodeOffline），
-// 同理这次计划内的复联也不该单独报一条"节点恢复上线"——否则群里会出现一条没有对应掉线的孤立上线。
-// 断连时打标记（markOtaExempt），节点下次注册时一次性消费（takeOtaExempt）。
-// 纯内存、与 down 通知锁存同生命周期：进程重启即清空，最坏情况是多收到一次上线通知。
-var (
-	otaExemptMu sync.Mutex
-	otaExemptS  = map[string]bool{}
-)
-
-// markOtaExempt 记下"这次断连是 OTA 计划内重启"，供下次注册时抑制上线通知
-func markOtaExempt(nodeID string) {
-	otaExemptMu.Lock()
-	otaExemptS[nodeID] = true
-	otaExemptMu.Unlock()
-}
-
-// takeOtaExempt 取出并清除豁免标记，返回此前是否存在（一次性消费）
-func takeOtaExempt(nodeID string) bool {
-	otaExemptMu.Lock()
-	defer otaExemptMu.Unlock()
-	found := otaExemptS[nodeID]
-	delete(otaExemptS, nodeID)
-	return found
-}
-
-// otaVersionHit 重连版本是否命中任务判定：
-//   - 按版本下发：重连版本 == 目标版本
-//   - 直发 url：重连版本 != 下发时版本（未知原版本时无法判定，交超时兜底）
-func otaVersionHit(t OTATask, version string) bool {
-	version = strings.TrimSpace(version)
-	if version == "" {
-		return false
-	}
-	if t.TargetVersion != "" {
-		return version == t.TargetVersion ||
-			"v"+version == t.TargetVersion || version == "v"+t.TargetVersion
-	}
-	return t.FromVersion != "" && version != t.FromVersion
-}
-
-// finishOTATask 任务终结（success/failed），幂等：仅 dispatched 状态可被终结。
-// stage 非空时才覆盖任务阶段（留空 = 保留节点最后回报的阶段，避免把有用进度抹掉）。
-func finishOTATask(id uint, status, stage, errMsg string) {
-	ctx, cancel := dbCtx()
-	defer cancel()
-	now := time.Now().UTC()
-	updates := map[string]any{
-		"status":      status,
-		"finished_at": &now,
-		"updated_at":  now,
-	}
-	if s := strings.TrimSpace(stage); s != "" {
-		updates["stage"] = s
-	}
-	if errMsg != "" {
-		updates["error"] = truncateStr(errMsg, 512)
-	}
-	db.WithContext(ctx).Model(&OTATask{}).
-		Where("id = ? AND status = ?", id, otaStatusDispatched).
-		Updates(updates)
-}
-
-// otaReconcilerLoop 任务追踪兜底轮询：WS 注册钩子覆盖 WS 节点的即时判定，
-// 这里补两类场景——HTTP-only 节点（快照滞后，改现场探测版本，见 otaLiveVersion）与超时收敛。
+// otaReconcilerLoop 每 10s：HTTP-only 节点现场探版本；超时收敛
 func otaReconcilerLoop() {
-	if db == nil {
-		return
-	}
-	for {
-		time.Sleep(otaSweepEvery)
-		otaSweep()
-	}
-}
-
-func otaSweep() {
-	ctx, cancel := dbCtx()
-	defer cancel()
-	var tasks []OTATask
-	if err := db.WithContext(ctx).
-		Where("status = ?", otaStatusDispatched).
-		Order("id asc").Limit(otaListLimit).Find(&tasks).Error; err != nil {
-		return
-	}
-	for _, t := range tasks {
-		// 判定用的版本号来源（整个判定的核心）：
-		//   WS 节点 → nodes 表快照：注册钩子在重连瞬间写入，可信。
-		//   HTTP-only 节点 → **一律现场探测**，不读快照。快照对这类节点两个方向都不可信：
-		//     既可能读不到新版本（普通探活不写库），也可能残留一个与真实值不同的旧值
-		//     —— 后者在 url 直发模式下会被"版本 != 基准"当成升级成功（误判）。
-		//     探测失败（节点不可达等）才退回快照，与改动前行为一致。
-		var n Node
-		snapVersion := ""
-		if err := db.WithContext(ctx).Where("node_id = ?", t.NodeID).Limit(1).Find(&n).Error; err == nil && n.ID != 0 {
-			snapVersion = strings.TrimSpace(n.Version)
-		}
-		version := snapVersion
-		liveProbed := false
-		if otaNodeIsHTTPOnly(t.NodeID) {
-			if live, ok := otaLiveVersion(t.NodeID); ok {
-				version, liveProbed = live, true
-				// 顺手回填观测到的真实版本，避免节点列表长期显示旧值（不参与本次判定）
-				if live != snapVersion {
-					otaRecordObservedVersion(t.NodeID, live)
+	for range time.Tick(10 * time.Second) {
+		ctx, cancel := dbCtx()
+		var tasks []OTATask
+		db.WithContext(ctx).Where("status = ?", otaDispatched).Order("id asc").Limit(100).Find(&tasks)
+		cancel()
+		for _, t := range tasks {
+			version := ""
+			if n, ok := nodeSnapshot(t.NodeID); ok {
+				version = n.Version
+			}
+			if otaNodeIsHTTPOnly(t.NodeID) {
+				if live, ok := otaLiveVersion(t.NodeID); ok {
+					version = live
+					ctx, cancel := dbCtx()
+					db.WithContext(ctx).Model(&Node{}).Where("node_id = ?", t.NodeID).Update("version", live)
+					cancel()
+				}
+			}
+			if otaVersionHit(t, version) {
+				finishOTATask(t.ID, otaSuccess, "observed", "")
+				continue
+			}
+			if time.Since(t.DispatchedAt) > otaTaskTimeout {
+				finishOTATask(t.ID, otaFailed, "", fmt.Sprintf("超时（%s）未观测到节点版本变化：节点可能离线、升级失败或已回滚", otaTaskTimeout))
+				if n, ok := nodeSnapshot(t.NodeID); ok && !n.Online {
+					otaExempt.Delete(t.NodeID)
+					notifyAdmins("node_down", "[1IPW-BOCE] 节点 OTA 后未恢复："+nodeDisplayName(t.NodeID, n.Label),
+						fmt.Sprintf("OTA 任务#%d 超时，节点 %s 仍未恢复上线。", t.ID, t.NodeID))
 				}
 			}
 		}
-		// ① 命中即 success：WS 走重连注册钩子，HTTP-only 走上面的现场探测
-		if otaVersionHit(t, version) {
-			stage, source := "", "sweep"
-			if liveProbed {
-				stage, source = otaStageObserved, "live probe"
-			}
-			finishOTATask(t.ID, otaStatusSuccess, stage, "")
-			log.Printf("[ota] task#%d SUCCESS (%s): node %s version %s", t.ID, source, t.NodeID, version)
-			continue
-		}
-		// ② 超时：等不到新版本（节点离线 / 升级失败回滚 / 下载卡死）
-		if time.Since(t.DispatchedAt) > otaTaskTimeout {
-			finishOTATask(t.ID, otaStatusFailed, "",
-				fmt.Sprintf("超时（%s）未观测到节点版本变化：节点可能离线、升级失败或已回滚，请到节点日志确认", otaTaskTimeout))
-			log.Printf("[ota] task#%d TIMEOUT: node %s", t.ID, t.NodeID)
-			otaNotifyIfStillDown(t, fmt.Sprintf("OTA 任务#%d 超时（%s）未观测到版本变化，且节点仍未恢复上线", t.ID, otaTaskTimeout))
-		}
 	}
+}
+
+func registerOTARoutes(g *gin.RouterGroup) {
+	g.POST("/nodes/:nodeId/ota", func(c *gin.Context) {
+		nodeID := strings.TrimSpace(c.Param("nodeId"))
+		var in struct {
+			Version string `json:"version"`
+			URL     string `json:"url"`
+			SHA256  string `json:"sha256"`
+		}
+		if err := c.ShouldBindJSON(&in); err != nil && err != io.EOF {
+			apiError(c, http.StatusBadRequest, "请求体不是合法 JSON："+err.Error())
+			return
+		}
+		in.Version, in.URL = strings.TrimSpace(in.Version), strings.TrimSpace(in.URL)
+		in.SHA256 = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(in.SHA256), "sha256:"))
+		switch {
+		case in.Version == "" && in.URL == "":
+			apiError(c, http.StatusBadRequest, "version 与 url 至少填一项")
+			return
+		case in.URL != "" && !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://"):
+			apiError(c, http.StatusBadRequest, "url 必须是 http(s) 地址")
+			return
+		case in.SHA256 != "":
+			if _, err := hex.DecodeString(in.SHA256); err != nil || len(in.SHA256) != 64 {
+				apiError(c, http.StatusBadRequest, "sha256 必须是 64 位 hex")
+				return
+			}
+		}
+		if err := nodeCapabilityGate(nodeID, capabilityOTA, "OTA 升级"); err != nil {
+			apiError(c, http.StatusConflict, err.Error())
+			return
+		}
+		if otaTaskInFlight(nodeID) {
+			apiError(c, http.StatusConflict, "该节点已有进行中的 OTA 任务")
+			return
+		}
+		from, _, _ := nodeReportedInfo(nodeID)
+		if otaNodeIsHTTPOnly(nodeID) {
+			if live, ok := otaLiveVersion(nodeID); ok {
+				from = live
+			}
+		}
+		task := OTATask{NodeID: nodeID, RequestID: "o" + genRequestID(), FromVersion: from, TargetVersion: in.Version,
+			URL: in.URL, SHA256: in.SHA256, Status: otaDispatched, DispatchedAt: time.Now().UTC(), DispatchedBy: currentUsername(c)}
+		payload := map[string]any{"requestId": task.RequestID}
+		if in.URL != "" {
+			payload["url"] = in.URL
+		} else {
+			payload["version"], payload["assetBase"] = in.Version, otaAssetBase()
+		}
+		if in.SHA256 != "" {
+			payload["sha256"] = in.SHA256
+		}
+		raw, ch, err := sendNodeCommand(nodeID, "ota", payload, otaAckTimeout, func(base, token string) (json.RawMessage, error) {
+			return httpJSON(http.MethodPost, base+"v1/ota", token, payload, 15*time.Second)
+		})
+		task.Channel = ch
+		var head struct {
+			Stage string `json:"stage"`
+		}
+		_ = json.Unmarshal(raw, &head)
+		task.Stage = head.Stage
+		if task.Stage == "" && err == nil {
+			task.Stage = "accepted"
+		}
+		if err != nil {
+			now := time.Now().UTC()
+			task.Status, task.FinishedAt, task.Error = otaFailed, &now, truncateStr(err.Error(), 512)
+		}
+		ctx, cancel := dbCtx()
+		defer cancel()
+		if e := db.WithContext(ctx).Create(&task).Error; e != nil {
+			apiError(c, http.StatusInternalServerError, e.Error())
+			return
+		}
+		if err != nil {
+			apiError(c, http.StatusBadGateway, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"task": task, "hint": "已下发。最终结果以观测到的节点版本号为准：WS 节点重连时上报，HTTP 节点由控制台定时现场探测。"})
+	})
+
+	g.GET("/ota-tasks", func(c *gin.Context) {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var rows []OTATask
+		q := db.WithContext(ctx).Order("id desc").Limit(clampLimit(c.Query("limit"), 50))
+		if v := c.Query("nodeId"); v != "" {
+			q = q.Where("node_id = ?", v)
+		}
+		q.Find(&rows)
+		labels := poolLabelMap()
+		out := make([]gin.H, 0, len(rows))
+		for _, t := range rows {
+			h := gin.H{}
+			_ = json.Unmarshal(mustRaw(t), &h)
+			h["label"] = nodeDisplayName(t.NodeID, labels[t.NodeID])
+			out = append(out, h)
+		}
+		c.JSON(http.StatusOK, out)
+	})
+}
+
+func nodeDisplayName(nodeID, label string) string {
+	if s := poolLabelFor(nodeID); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(label); s != "" {
+		return s
+	}
+	return nodeID
 }

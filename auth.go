@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -14,29 +13,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ==================== JWT 登录鉴权 ====================
+// ==================== 鉴权三轨（与原版一致） ====================
 //
-// 管理控制台登录：POST /admin/login 校验 admin-user/admin-password 后签发 HMAC-SHA256 JWT，
-// 前端持 JWT 以 Authorization: Bearer <jwt> 访问 /admin/*。
+//   - 静态 admin-token（Bearer <admin-token>）：uid=0、role=admin
+//   - JWT（POST /admin/login 签发，HS256 纯标准库）：claims {sub,uid,username,role,iat,exp}
+//   - 个人 API Token（Bearer ipt_<40hex>）：等价账号身份，库里只存 bcrypt 哈希
 //
-// 鉴权三轨（向后兼容，不破坏既有脚本）：
-//   - 静态 admin-token（Bearer <admin-token>）原样放行；
-//   - 合法且未过期的 JWT 放行；
-//   - 个人 API Token（Bearer ipt_…，profile.go 生成）：等价其账号登录身份（权限随角色），
-//     不受 JWT 过期限制，吊销立即失效；库里只存 bcrypt 哈希（见 userByAPIToken）。
-//
-// 未配置 jwt-secret（同时无 admin-password）时 JWT 登录禁用，仅静态 admin-token 可用。
-// JWT 使用纯标准库实现（HMAC-SHA256 + exp），零第三方依赖。
+// 未配置 jwt-secret 时 JWT 登录禁用，仅静态 admin-token 可用。
 
-// jwtConfig 运行时 JWT 配置（由 readConfig 填充全局变量）
-var (
-	JWT_SECRET     string // HMAC 密钥；空 = 不启用 JWT 登录
-	JWT_EXPIRY     int    // token 有效期秒，缺省 86400
-	ADMIN_USER     string // 登录用户名，缺省 admin
-	ADMIN_PASSWORD string // 登录口令；与 jwt-secret 都空则登录接口禁用
-)
-
-// jwtClaims JWT 负载
 type jwtClaims struct {
 	Sub      string `json:"sub"`
 	UID      uint   `json:"uid"`
@@ -46,70 +30,55 @@ type jwtClaims struct {
 	Exp      int64  `json:"exp"`
 }
 
-// jwtEnabled JWT 登录是否启用（密钥齐备即可；口令经 users 表或 admin-password 校验）
 func jwtEnabled() bool { return JWT_SECRET != "" }
 
-// base64urlEncode / base64urlDecode：JWT 使用无填充的 base64url
-func base64urlEncode(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
-// signJWT 用密钥对 header.payload 计算 HMAC-SHA256 签名
-func signJWT(secret string, signingInput []byte) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(signingInput)
-	return base64urlEncode(mac.Sum(nil))
+func signJWT(input []byte) string {
+	mac := hmac.New(sha256.New, []byte(JWT_SECRET))
+	mac.Write(input)
+	return b64url(mac.Sum(nil))
 }
 
-// issueToken 为用户签发 JWT（HS256），返回 token 与有效秒数
+// issueToken 签发 JWT，返回 token 与有效秒数
 func issueToken(uid uint, username, role string) (string, int64, error) {
 	now := time.Now().Unix()
 	ttl := int64(JWT_EXPIRY)
 	if ttl <= 0 {
 		ttl = 86400
 	}
-	claims := jwtClaims{Sub: username, UID: uid, Username: username, Role: role, IAT: now, Exp: now + ttl}
-	header, err := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
+	header, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
+	payload, err := json.Marshal(jwtClaims{Sub: username, UID: uid, Username: username, Role: role, IAT: now, Exp: now + ttl})
 	if err != nil {
 		return "", 0, err
 	}
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		return "", 0, err
-	}
-	signingInput := base64urlEncode(header) + "." + base64urlEncode(payload)
-	return signingInput + "." + signJWT(JWT_SECRET, []byte(signingInput)), ttl, nil
+	input := b64url(header) + "." + b64url(payload)
+	return input + "." + signJWT([]byte(input)), ttl, nil
 }
 
-// parseJWT 校验 token 签名与过期，返回 claims；失败返回 error
 func parseJWT(token string) (*jwtClaims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil, errors.New("malformed token")
 	}
-	// 重算签名比对（常量时间）
-	signingInput := parts[0] + "." + parts[1]
-	expected := signJWT(JWT_SECRET, []byte(signingInput))
-	if !hmac.Equal([]byte(parts[2]), []byte(expected)) {
+	if !hmac.Equal([]byte(parts[2]), []byte(signJWT([]byte(parts[0]+"."+parts[1])))) {
 		return nil, errors.New("invalid signature")
 	}
-	// 解出负载
-	payload, err := base64urlDecode(parts[1])
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return nil, errors.New("invalid payload")
 	}
-	var claims jwtClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
+	var cl jwtClaims
+	if err := json.Unmarshal(payload, &cl); err != nil {
 		return nil, errors.New("invalid payload json")
 	}
-	if claims.Exp <= time.Now().Unix() {
+	if cl.Exp <= time.Now().Unix() {
 		return nil, errors.New("token expired")
 	}
-	return &claims, nil
+	return &cl, nil
 }
 
-func base64urlDecode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
-
-// userByAPIToken 个人 API Token 校验：遍历持有 token 的用户做 bcrypt 比对（持有者数量少，可接受；
-// token 带 ipt_ 前缀，未命中前缀的请求不会走到这里）。命中且账号启用 → 返回用户。
+// userByAPIToken 个人 API Token 校验（bcrypt 比对持有者；命中且启用才返回）
 func userByAPIToken(token string) *User {
 	if db == nil {
 		return nil
@@ -131,140 +100,45 @@ func userByAPIToken(token string) *User {
 	return nil
 }
 
-// validAuth 判定请求是否通过鉴权：静态 admin-token、有效 JWT 或个人 API Token 皆可
-func validAuth(token string) bool {
-	// 静态 admin-token 兼容（向后不破坏既有调用）
+// identityOfAuthToken token → (uid, role, username)；无效 ok=false
+func identityOfAuthToken(token string) (ctxUser, bool) {
+	if token == "" {
+		return ctxUser{}, false
+	}
 	if ADMIN_TOKEN != "" && token == ADMIN_TOKEN {
-		return true
-	}
-	// 个人 API Token（ipt_ 前缀；JWT 永不以 ipt_ 开头，先查避免无效 JWT 报错噪音）
-	if strings.HasPrefix(token, "ipt_") {
-		return userByAPIToken(token) != nil
-	}
-	if jwtEnabled() {
-		if _, err := parseJWT(token); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-// identityOfAuthToken 解析 token → (uid, role)。静态 admin-token 视为 uid=0/role=admin；
-// 有效 JWT 取其 uid/role（旧 token 无 role 时保守给 user）；个人 API Token 等价其账号身份。
-// token 无效返回 ok=false。
-func identityOfAuthToken(token string) (uid uint, role string, ok bool) {
-	if ADMIN_TOKEN != "" && token == ADMIN_TOKEN {
-		return 0, RoleAdmin, true
+		return ctxUser{ID: 0, Role: RoleAdmin, Username: "admin-token"}, true
 	}
 	if strings.HasPrefix(token, "ipt_") {
 		if u := userByAPIToken(token); u != nil {
-			return u.ID, u.Role, true
+			return ctxUser{ID: u.ID, Role: u.Role, Username: u.Username}, true
 		}
-		return 0, "", false
+		return ctxUser{}, false
 	}
 	if jwtEnabled() {
 		if cl, err := parseJWT(token); err == nil {
-			r := cl.Role
-			if r == "" {
-				r = RoleUser // 旧 token 无 role：保守给普通权限
+			if cl.Role == "" {
+				cl.Role = RoleUser // 旧 token 无 role：保守给普通权限
 			}
-			return cl.UID, r, true
+			return ctxUser{ID: cl.UID, Role: cl.Role, Username: cl.Username}, true
 		}
 	}
-	return 0, "", false
+	return ctxUser{}, false
 }
 
-// ==================== 登录与鉴权中间件 ====================
-
-// loginHandler POST /admin/login（免鉴权）：body {username,password}，通过则签发 JWT
-//
-// 校验顺序：
-//  1. users 表按 username 查用户；命中且未禁用 → bcrypt 校验口令。
-//  2. 未命中（或 seed 前 / db 不可用）→ 回退到 admin-user/admin-password 配置比对
-//     （向后兼容，且保证 seed 失败仍可登录）；回退命中视为 role=admin。
-func loginHandler(c *gin.Context) {
-	if !jwtEnabled() {
-		apiError(c, http.StatusForbidden, "JWT login is not enabled (set jwt-secret)")
-		return
+func bearerToken(c *gin.Context) string {
+	h := c.GetHeader("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return ""
 	}
-	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiError(c, http.StatusBadRequest, "invalid login body: "+err.Error())
-		return
-	}
-	username := strings.TrimSpace(body.Username)
-
-	// 1) DB 用户优先
-	if db != nil {
-		if u, err := userByUsername(username); err != nil {
-			log.Printf("[auth] WARN query user: %v", err)
-		} else if u != nil {
-			if !u.Enabled {
-				apiError(c, http.StatusUnauthorized, "account disabled")
-				return
-			}
-			if !verifyPassword(u.PasswordHash, body.Password) {
-				apiError(c, http.StatusUnauthorized, "invalid username or password")
-				return
-			}
-			token, ttl, err := issueToken(u.ID, u.Username, u.Role)
-			if err != nil {
-				apiError(c, http.StatusInternalServerError, "issue token: "+err.Error())
-				return
-			}
-			c.JSON(http.StatusOK, gin.H{
-				"token":         token,
-				"tokenType":     "Bearer",
-				"userId":        u.ID,
-				"username":      u.Username,
-				"role":          u.Role,
-				"email":         u.Email,
-				"emailVerified": u.EmailVerified,
-				"expiresIn":     ttl,
-				"expiresAt":     time.Now().Add(time.Duration(ttl) * time.Second).Format(time.RFC3339),
-			})
-			return
-		}
-	}
-
-	// 2) 回退：admin-user/admin-password（seed 前的兼容路径；口令为空则禁用，防空口令放行）
-	if ADMIN_PASSWORD != "" && username == ADMIN_USER && body.Password == ADMIN_PASSWORD {
-		token, ttl, err := issueToken(0, ADMIN_USER, RoleAdmin)
-		if err != nil {
-			apiError(c, http.StatusInternalServerError, "issue token: "+err.Error())
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"token":     token,
-			"tokenType": "Bearer",
-			"userId":    0,
-			"username":  ADMIN_USER,
-			"role":      RoleAdmin,
-			"expiresIn": ttl,
-			"expiresAt": time.Now().Add(time.Duration(ttl) * time.Second).Format(time.RFC3339),
-		})
-		return
-	}
-	apiError(c, http.StatusUnauthorized, "invalid username or password")
+	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 }
 
-// restStyleError /api/v1 前缀的请求按 REST 语法糖层的错误体返回（{"error":{code,message}}），
-// 其余路径维持内部 apiError 形态（前端读 statusCode/statusMessage）。
-func restStyleError(c *gin.Context) bool {
-	return strings.HasPrefix(c.Request.URL.Path, "/api/v1/")
-}
-
-// adminAuthMiddleware /admin/* 鉴权（三轨：静态 admin-token / JWT / 个人 API Token）。
-// JWT 命中时将 {uid, role, username} 写入 gin 上下文，供 adminOnly/currentUser 使用；
-// 静态 admin-token 不携带角色，视为 role=admin（全权）。
+// adminAuthMiddleware /admin/* 与 /api/v1/* 鉴权；错误体按路径前缀区分
 func adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h := c.GetHeader("Authorization")
 		if !strings.HasPrefix(h, "Bearer ") {
-			if restStyleError(c) {
+			if isRestPath(c) {
 				restError(c, http.StatusUnauthorized, "unauthorized", "missing bearer token")
 			} else {
 				apiError(c, http.StatusUnauthorized, "Unauthorized")
@@ -272,40 +146,18 @@ func adminAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		token := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-		// 静态 admin-token：直接放行（视为 admin）
-		if ADMIN_TOKEN != "" && token == ADMIN_TOKEN {
-			c.Set(ctxUserKey, ctxUser{ID: 0, Role: RoleAdmin, Username: "admin-token"})
+		token := bearerToken(c)
+		if u, ok := identityOfAuthToken(token); ok {
+			c.Set(ctxUserKey, u)
 			c.Next()
 			return
 		}
-		// 个人 API Token（ipt_ 前缀）：等价其账号登录身份（权限随角色）；JWT 永不以 ipt_ 开头
-		if strings.HasPrefix(token, "ipt_") {
-			if u := userByAPIToken(token); u != nil {
-				c.Set(ctxUserKey, ctxUser{ID: u.ID, Role: u.Role, Username: u.Username})
-				c.Next()
-				return
+		if isRestPath(c) {
+			msg := "invalid credentials"
+			if strings.HasPrefix(token, "ipt_") {
+				msg = "invalid or revoked token"
 			}
-			if restStyleError(c) {
-				restError(c, http.StatusUnauthorized, "unauthorized", "invalid or revoked token")
-			} else {
-				apiError(c, http.StatusUnauthorized, "Unauthorized")
-			}
-			c.Abort()
-			return
-		}
-		if jwtEnabled() {
-			if cl, err := parseJWT(token); err == nil {
-				if cl.Role == "" {
-					cl.Role = RoleUser // 旧 token 无 role：保守给普通权限（若需管理走重新登录）
-				}
-				c.Set(ctxUserKey, ctxUser{ID: cl.UID, Role: cl.Role, Username: cl.Username})
-				c.Next()
-				return
-			}
-		}
-		if restStyleError(c) {
-			restError(c, http.StatusUnauthorized, "unauthorized", "invalid credentials")
+			restError(c, http.StatusUnauthorized, "unauthorized", msg)
 		} else {
 			apiError(c, http.StatusUnauthorized, "Unauthorized")
 		}
@@ -313,15 +165,11 @@ func adminAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// adminOnly 中间件：仅 role=admin 放行（用户管理等敏感操作）。
-// 无上下文（异常路径）默认拒绝。
+// adminOnly 仅 role=admin（含静态 token）放行
 func adminOnly() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		uid, role, _ := currentUserFromCtx(c)
-		if role != RoleAdmin {
-			// 静态 token(uid=0) 也视为 admin，已在 adminAuth 写入 role=admin
-			_ = uid
-			apiError(c, http.StatusForbidden, "admin role required")
+		if _, role, _ := currentUserFromCtx(c); role != RoleAdmin {
+			failBy(c, http.StatusForbidden, "forbidden", "admin role required")
 			c.Abort()
 			return
 		}
@@ -329,11 +177,66 @@ func adminOnly() gin.HandlerFunc {
 	}
 }
 
-// bearerToken 从 Authorization 头解析出裸 token（登录态判断用）
-func bearerToken(c *gin.Context) string {
-	h := c.GetHeader("Authorization")
-	if !strings.HasPrefix(h, "Bearer ") {
-		return ""
+// authLimiter 登录 / 注册验证码接口的单 IP 限流（10 次/分），防爆破
+var authLimiter = newRateLimiter(10)
+
+// loginHandler POST /admin/login：users 表优先，未命中回退 admin-user/admin-password
+func loginHandler(c *gin.Context) {
+	if !authLimiter.allow(c.ClientIP()) {
+		apiError(c, http.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
+		return
 	}
-	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	if !jwtEnabled() {
+		apiError(c, http.StatusForbidden, "JWT login is not enabled (set jwt-secret)")
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		captchaInput
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		apiError(c, http.StatusBadRequest, "invalid login body: "+err.Error())
+		return
+	}
+	if err := checkCaptcha(c, "login", body.captchaInput); err != nil {
+		apiError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	username := strings.TrimSpace(body.Username)
+	if u, err := userByUsername(username); err == nil && u != nil {
+		if !u.Enabled {
+			apiError(c, http.StatusUnauthorized, "account disabled")
+			return
+		}
+		if !verifyPassword(u.PasswordHash, body.Password) {
+			apiError(c, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		token, ttl, err := issueToken(u.ID, u.Username, u.Role)
+		if err != nil {
+			apiError(c, http.StatusInternalServerError, "issue token: "+err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"token": token, "tokenType": "Bearer", "userId": u.ID, "username": u.Username,
+			"role": u.Role, "email": u.Email, "emailVerified": u.EmailVerified, "expiresIn": ttl,
+			"expiresAt": time.Now().Add(time.Duration(ttl) * time.Second).Format(time.RFC3339),
+		})
+		return
+	}
+	if ADMIN_PASSWORD != "" && username == ADMIN_USER && body.Password == ADMIN_PASSWORD {
+		token, ttl, err := issueToken(0, ADMIN_USER, RoleAdmin)
+		if err != nil {
+			apiError(c, http.StatusInternalServerError, "issue token: "+err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"token": token, "tokenType": "Bearer", "userId": 0, "username": ADMIN_USER,
+			"role": RoleAdmin, "expiresIn": ttl,
+			"expiresAt": time.Now().Add(time.Duration(ttl) * time.Second).Format(time.RFC3339),
+		})
+		return
+	}
+	apiError(c, http.StatusUnauthorized, "invalid username or password")
 }

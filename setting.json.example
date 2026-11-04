@@ -1,72 +1,33 @@
 {
-    "port": "8091",
-    "http-timeout-seconds": 30,
-    "rate-limit": 120,
-    "ws-port": 8092,
-    "remote-config-url": "",
-    "remote-ignore-config": [],
-    "cors": "",
-    "trusted-proxies": "",
-    "api-base-url": {
-        "DualStack": [
-            {
-                "label": "中国 江苏 移动",
-                "id": "cn-jiangsu",
-                "url": "https://cn-jiangsu.api-ipw.wsmdn.top/",
-                "ws": false
-            }
-        ],
-        "IPv4": [],
-        "IPv6": []
-    },
-    "ip-location-api": [
-        {
-            "label": "中国 江苏 移动",
-            "id": "cn-jiangsu",
-            "url": "https://cn-jiangsu.api-ipw.wsmdn.top/"
-        }
-    ],
-    "api-keys": {},
-    "ws-keys": {},
+  "port": "8080",
+  "http-timeout-seconds": 30,
+  "rate-limit": 120,
+  "ws-port": 8092,
+  "cors": "",
+  "trusted-proxies": "",
 
-    "database": {
-        "driver": "sqlite",
-        "dsn": "boce.db",
-        "max-open-conns": 0,
-        "max-idle-conns": 0
-    },
-    "admin-token": "",
-    "jwt-secret": "",              // JWT HMAC 密钥；与 admin-password 齐备才启用 JWT 登录
-    "jwt-expiry-seconds": 86400,   // JWT 有效秒（缺省 86400）
-    "admin-user": "admin",         // 登录用户名（缺省 admin）
-    "admin-password": "",          // 登录口令；空 = 不启用 JWT 登录
-    "data-retention-days": 30,
-    "user-task-limit": 20,         // 普通用户可建任务数上限；0 = 不限
-    "user-min-interval": 0,        // 普通用户任务最小间隔秒；0 = 跟随全局最小值（10s）
+  "api-base-url": { "DualStack": [], "IPv4": [], "IPv6": [] },
+  "ip-location-api": [],
+  "api-keys": {},
+  "ws-keys": {},
 
-    "report-token": "",
-    "ota-asset-base": "",          // 节点 OTA 按版本下发时的资产基址；空 = GitHub Releases
+  "database": { "driver": "sqlite", "dsn": "boce.db" },
+  "admin-token": "",
+  "jwt-secret": "change-me-to-a-long-random-string",
+  "jwt-expiry-seconds": 86400,
+  "admin-user": "admin",
+  "admin-password": "",
+  "report-token": "",
+  "registration-enabled": true,
+  "ws-require-key": false,
+  "data-retention-days": 30,
+  "user-task-limit": 20,
+  "user-min-interval": 0,
 
-    // SMTP 掉线告警（见 alert.go）：收件人按任务 owner 动态解析（所有者有邮箱才走邮件）
-    "smtp": {
-        "host": "",              // SMTP 服务器地址；空 = 邮件路径禁用
-        "port": 465,             // 端口；465 = SSL/TLS
-        "user": "",              // 发信账号
-        "password": "",          // 授权码/口令
-        "from": "",              // 发件人地址（缺省用 user）
-        "fromName": "",          // 发件人显示名（可选）
-        "ssl": true,             // true = 直接 TLS（典型 465）
-        "startTLS": false,       // true = 先明文再 STARTTLS（典型 587）
-        "insecure": false,       // true = 跳过证书校验（仅内网/测试）
-        "timeoutSec": 10         // 单次发信超时秒
-    },
-    // 掉线告警策略：任务连续 downThreshold 轮整组 down → 通知其「所有者」：
-    //   所有者有邮箱→发邮件；无邮箱→站内信(铃铛)；任务无归属(静态token建的旧任务)→不通知。
-    // 收件人不再用 to 字段兜底（保留仅为兼容旧配置，实际不读取）。
-    "alert": {
-        "enabled": true,          // 总开关
-        "to": "",                 // 已弃用：告警按任务 owner 送达，本字段不再作为收件人
-        "downThreshold": 3,       // 连续 N 轮任务全 down 才告警（缺省 3）
-        "batchSeconds": 10        // 节点告警批次汇总窗口秒；同一窗口内多个节点掉线/恢复合并成一条（缺省 10，0 = 关闭逐条发）
-    }
+  "web-dir": "web/dist",
+  "public-ws-url": "",
+  "ota-asset-base": "",
+
+  "smtp": { "host": "", "port": 465, "user": "", "password": "", "from": "", "fromName": "", "ssl": true, "startTLS": false, "insecure": false, "timeoutSec": 10 },
+  "alert": { "enabled": true, "downThreshold": 3 }
 }

@@ -1,351 +1,360 @@
 package main
 
 import (
+	"context"
+	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 )
 
-// ==================== REST 语法糖层（/api/v1，供个人 Token 等程序化访问） ====================
-//
-// 与内部 /admin/* 的关系：同一套可见性规则（user 只见自己的任务/明细，admin 全量），
-// 但对外形态遵循 REST 规范：资源名词复数、裸资源 + HTTP 状态码（无信封）、
-// 错误统一 {"error":{"code","message"}}。
-//
-// 端点（全部只读）：
-//   GET /api/v1/tasks?page=&pageSize=        任务列表 {items,total}（全字段，id 倒序）
-//   GET /api/v1/tasks/:id                    任务详情（非本人任务 403，不存在 404）
-//   GET /api/v1/tasks/:id/sla?hours=24       顶层汇总 + byNode
-//   GET /api/v1/probes?node=&type=&source=&since=&limit=&offset=   拨测明细（精简无 body）
-//   GET /api/v1/nodes                        节点简表（enabled，脱敏）
-//   GET /api/v1/usage?hours=24               我的用量
-//
-// 鉴权同 /admin（adminAuthMiddleware）：个人 API Token（ipt_）/ JWT / 静态 admin-token。
-// 限流不挂（限流只在 /v1、/middleware 转发口）。错误码：unauthorized/forbidden/not_found/bad_request/internal。
+// ==================== REST 语法糖层 /api/v1（错误体 {"error":{code,message}}） ====================
 
-// restError 语法糖层统一错误体：HTTP 状态码 + {"error":{"code","message"}}
-func restError(c *gin.Context, status int, code, message string) {
-	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
-}
-
-func registerRestRoutes(router *gin.Engine) {
-	g := router.Group("/api/v1", adminAuthMiddleware())
-	g.GET("/tasks", restTasks)
-	g.GET("/tasks/:id", restTask)
-	g.GET("/tasks/:id/sla", restTaskSla)
-	g.GET("/probes", restProbes)
-	g.GET("/nodes", restNodes)
-	g.GET("/usage", restUsage)
-	g.POST("/probes", restProbeCreate)
-}
-
-// restPage 解析分页参数：?page（1 起）与 ?pageSize（别名 ?limit），上限 200
-func restPage(c *gin.Context) (page, pageSize int) {
-	page, _ = strconv.Atoi(c.DefaultQuery("page", "1"))
-	if page < 1 {
-		page = 1
-	}
-	pageSize, _ = strconv.Atoi(c.DefaultQuery("limit", c.DefaultQuery("pageSize", "50")))
-	if pageSize < 1 {
-		pageSize = 50
-	}
-	if pageSize > 200 {
-		pageSize = 200
-	}
-	return
-}
-
-// restTaskVisible 取任务并校验可见性：404 不存在 / 403 非本人（user）。通过后返回任务。
-func restTaskVisible(c *gin.Context) (*ProbeTask, bool) {
-	var t ProbeTask
-	ctx, cancel := dbCtx()
-	defer cancel()
-	if err := db.WithContext(ctx).First(&t, idParam(c)).Error; err != nil {
-		restError(c, http.StatusNotFound, "not_found", "task not found")
-		return nil, false
-	}
-	if taskOwnedByUserButNot(c, &t) {
-		restError(c, http.StatusForbidden, "forbidden", "not your task")
-		return nil, false
-	}
-	return &t, true
-}
-
-// restTasks GET /api/v1/tasks
-func restTasks(c *gin.Context) {
-	page, pageSize := restPage(c)
-	uid, role, _ := currentUserFromCtx(c)
-	ctx, cancel := dbCtx()
-	defer cancel()
-	q := db.WithContext(ctx).Model(&ProbeTask{})
-	if role == RoleUser {
-		q = q.Where("owner_id = ?", uid)
-	}
-	if v := strings.TrimSpace(c.Query("tag")); v != "" {
-		q = q.Where("tags LIKE ?", "%"+v+"%") // 标签子串过滤（标签以逗号分隔存储）
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		restError(c, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	var rows []ProbeTask
-	if err := q.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&rows).Error; err != nil {
-		restError(c, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"items": tasksWithOwner(rows), "total": total, "page": page, "pageSize": pageSize})
-}
-
-// restTask GET /api/v1/tasks/:id
-func restTask(c *gin.Context) {
-	t, ok := restTaskVisible(c)
-	if !ok {
-		return
-	}
-	c.JSON(http.StatusOK, taskWithOwner(t))
-}
-
-// restTaskSla GET /api/v1/tasks/:id/sla?hours= | ?start=&end=
-// 结构（已与需求确认）：顶层汇总 + byNode，不含 special/judge 等内部渲染字段。
-// 窗口：?hours= 相对（缺省 24），或 ?start=/&end= 绝对区间（见 timerange.go）。
-func restTaskSla(c *gin.Context) {
-	t, ok := restTaskVisible(c)
-	if !ok {
-		return
-	}
-	tr := parseTimeRange(c, 24)
-	resp, err := computeTaskSlaRange(t.ID, tr.From, tr.To)
-	if err != nil {
-		restError(c, http.StatusNotFound, "not_found", err.Error())
-		return
-	}
-	c.JSON(http.StatusOK, slaSugar(t.ID, tr.Hours, resp))
-}
-
-// slaSugar 把内部 slaTaskResp 重排成语法糖层确认的结构（顶层汇总 + byNode 节点明细）。
-// restTaskSla 与公开状态页 JSON（public_status.go）共用。
-func slaSugar(taskID uint, hours float64, resp *slaTaskResp) gin.H {
-	var up, down, wsum, wlat, maxMs, p95Ms int64
-	byNode := make([]gin.H, 0, len(resp.ByNode))
-	for _, n := range resp.ByNode {
-		up += n.Up
-		down += n.Down
-		if n.Up > 0 { // 节点平均延迟按其 up 样本数加权出整体均值
-			wsum += n.Up
-			wlat += n.AvgMs * n.Up
+func registerRestRoutes(r *gin.Engine) {
+	g := r.Group("/api/v1", adminAuthMiddleware())
+	g.GET("/tasks", func(c *gin.Context) {
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		size, _ := strconv.Atoi(c.DefaultQuery("limit", c.DefaultQuery("pageSize", "50")))
+		if page < 1 {
+			page = 1
 		}
-		if n.MaxMs > maxMs {
-			maxMs = n.MaxMs
+		if size < 1 || size > 200 {
+			size = 50
 		}
-		if n.P95Ms > p95Ms {
-			p95Ms = n.P95Ms
+		uid, role, _ := currentUserFromCtx(c)
+		ctx, cancel := dbCtx()
+		defer cancel()
+		q := db.WithContext(ctx).Model(&ProbeTask{})
+		if role == RoleUser {
+			q = q.Where("owner_id = ?", uid)
 		}
-		byNode = append(byNode, gin.H{
-			"nodeId": n.NodeID,
-			// 节点显示名（池 label，见 slaNodeAgg.Label）；空串表示池内没配名字，
-			// 前端按 label || nodeId 兜底。缺了它分享页节点表只能显示 UUID。
-			"label":        n.Label,
-			"up":           n.Up,
-			"down":         n.Down,
-			"availability": n.Availability,
-			"avgMs":        n.AvgMs,
-			"p95Ms":        n.P95Ms,
-			"latestMs":     n.LatestMs,
-		})
-	}
-	availability := 0.0
-	if up+down > 0 {
-		availability = float64(up) / float64(up+down) * 100
-		availability = float64(int(availability*100)) / 100
-	}
-	avgMs := int64(0)
-	if wsum > 0 {
-		avgMs = wlat / wsum
-	}
-	return gin.H{
-		"taskId":       taskID,
-		"hours":        hours,
-		"window":       resp.Window,
-		"samples":      resp.Samples,
-		"up":           up,
-		"down":         down,
-		"availability": availability,
-		"avgMs":        avgMs,
-		"maxMs":        maxMs,
-		"p95Ms":        p95Ms,
-		"byNode":       byNode,
-	}
-}
-
-// restProbes GET /api/v1/probes?node=&type=&source=&since=&limit=&offset=
-// 结构（已确认）：{items,total}，items 精简无 body。可见性同内部接口。
-func restProbes(c *gin.Context) {
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	if limit < 1 {
-		limit = 50
-	}
-	if limit > 500 {
-		limit = 500
-	}
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	if offset < 0 {
-		offset = 0
-	}
-	source := strings.ToLower(strings.TrimSpace(c.Query("source")))
-	if source != "" && source != "sched" && source != "biz" {
-		restError(c, http.StatusBadRequest, "bad_request", "source 只能是 sched / biz")
-		return
-	}
-	var since time.Time
-	if v := c.Query("since"); v != "" {
-		var perr error
-		since, perr = time.Parse(time.RFC3339, v)
-		if perr != nil {
-			restError(c, http.StatusBadRequest, "bad_request", "since 须为 RFC3339 时间")
+		if v := strings.TrimSpace(c.Query("tag")); v != "" {
+			q = q.Where("tags LIKE ?", "%"+v+"%")
+		}
+		var total int64
+		q.Count(&total)
+		var rows []ProbeTask
+		if err := q.Order("id desc").Offset((page - 1) * size).Limit(size).Find(&rows).Error; err != nil {
+			restError(c, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
-	}
-
-	uid, role, _ := currentUserFromCtx(c)
-	ctx, cancel := dbCtx()
-	defer cancel()
-	q := db.WithContext(ctx).Model(&ProbeResult{})
-	if role == RoleUser {
-		ownIDs, err := ownTaskIDs(db.WithContext(ctx), uid)
+		c.JSON(http.StatusOK, gin.H{"items": tasksWithOwner(rows), "total": total, "page": page, "pageSize": size})
+	})
+	g.GET("/tasks/:id", func(c *gin.Context) {
+		if t, ok := loadVisibleTask(c); ok {
+			c.JSON(http.StatusOK, tasksWithOwner([]ProbeTask{*t})[0])
+		}
+	})
+	g.GET("/tasks/:id/sla", func(c *gin.Context) {
+		t, ok := loadVisibleTask(c)
+		if !ok {
+			return
+		}
+		tr := parseTimeRange(c, 24)
+		resp, err := computeTaskSlaRange(t.ID, tr.From, tr.To)
+		if err != nil {
+			restError(c, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, slaSugar(t.ID, tr.Hours, resp))
+	})
+	g.GET("/probes", func(c *gin.Context) {
+		limit := clampLimit(c.Query("limit"), 50)
+		if limit > 500 {
+			limit = 500
+		}
+		offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+		if offset < 0 {
+			offset = 0
+		}
+		src := c.Query("source")
+		if src != "" && src != "sched" && src != "biz" {
+			restError(c, http.StatusBadRequest, "bad_request", "source 只能是 sched / biz")
+			return
+		}
+		c.Request.URL.RawQuery = strings.ReplaceAll(c.Request.URL.RawQuery, "source=", "cat=")
+		ctx, cancel := dbCtx()
+		defer cancel()
+		q, ok := probeListQuery(c, db.WithContext(ctx))
+		if !ok {
+			return
+		}
+		var total int64
+		q.Count(&total)
+		var rows []ProbeResult
+		q.Order("id desc").Offset(offset).Limit(limit).Find(&rows)
+		items := make([]gin.H, 0, len(rows))
+		for _, r := range rows {
+			items = append(items, gin.H{"nodeId": r.NodeID, "apiType": r.APIType, "raw": r.Raw, "status": r.Status,
+				"latencyMs": r.LatencyMs, "source": r.Source, "error": r.Error, "createdAt": r.CreatedAt})
+		}
+		c.JSON(http.StatusOK, gin.H{"items": items, "total": total, "limit": limit, "offset": offset})
+	})
+	g.POST("/probes", func(c *gin.Context) {
+		var body struct {
+			APIType string            `json:"apiType"`
+			Raw     string            `json:"raw"`
+			Query   map[string]string `json:"query"`
+			Nodes   []string          `json:"nodes"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			restError(c, http.StatusBadRequest, "bad_request", "invalid body: "+err.Error())
+			return
+		}
+		body.Raw = strings.TrimPrefix(strings.TrimSpace(body.Raw), "/")
+		if strings.TrimSpace(body.APIType) == "" || body.Raw == "" {
+			restError(c, http.StatusBadRequest, "bad_request", "apiType 与 raw 必填")
+			return
+		}
+		uid, _, _ := currentUserFromCtx(c)
+		cost, msg := chargeProbeCost(uid)
+		if msg != "" {
+			restError(c, http.StatusPaymentRequired, "insufficient_points", msg)
+			return
+		}
+		q := url.Values{}
+		for k, v := range body.Query {
+			q.Set(k, v)
+		}
+		results, unknown, skipped, err := batchProbeCore(body.APIType, body.Raw, body.Nodes, q)
+		if err != nil {
+			refundProbeCost(uid, cost)
+			restError(c, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, batchSummary(body.APIType, body.Raw, results, unknown, skipped,
+			persistManualProbes(body.APIType, body.Raw, results, uid)))
+	})
+	g.GET("/nodes", func(c *gin.Context) {
+		items := nodeBriefItems()
+		c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+	})
+	g.GET("/usage", func(c *gin.Context) {
+		uid, role, _ := currentUserFromCtx(c)
+		u, err := usageForUser(role, uid, clampFloat(c.Query("hours"), 24, 1, 24*90))
 		if err != nil {
 			restError(c, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
-		if len(ownIDs) > 0 {
-			q = q.Where("(source = ? AND task_id IN ?) OR (source = ? AND owner_id = ?)", sourceSched, ownIDs, sourceBiz, uid)
-		} else {
-			q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
-		}
-	}
-	if v := c.Query("node"); v != "" {
-		q = q.Where("node_id = ?", v)
-	}
-	if v := c.Query("type"); v != "" {
-		q = q.Where("api_type = ?", v)
-	}
-	if !since.IsZero() {
-		q = q.Where("created_at >= ?", since.UTC())
-	}
-	switch source {
-	case "sched":
-		q = q.Where("source = ?", sourceSched)
-	case "biz":
-		if role != RoleUser {
-			q = q.Where("source <> ?", sourceSched)
-		} else {
-			q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
-		}
-	}
-
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		restError(c, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	var rows []ProbeResult
-	if err := q.Order("id desc").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
-		restError(c, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	items := make([]gin.H, 0, len(rows))
-	for _, r := range rows {
-		items = append(items, gin.H{
-			"nodeId":    r.NodeID,
-			"apiType":   r.APIType,
-			"raw":       r.Raw,
-			"status":    r.Status,
-			"latencyMs": r.LatencyMs,
-			"source":    r.Source,
-			"error":     r.Error,
-			"createdAt": r.CreatedAt,
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "total": total, "limit": limit, "offset": offset})
+		c.JSON(http.StatusOK, u)
+	})
+	registerPointsRestRoutes(g)
 }
 
-// restProbeCreate POST /api/v1/probes —— 一键拨测（同步聚合；结构已与需求确认：全量含 body）。
-// 拨测类结果落库 source=biz 并归属 Token 主人（与内部一键拨测同一归属口径）。
-// nodes 缺省 = 全池，此时跳过当前确证离线的节点（被跳过的在响应 skipped 里返回）；
-// 显式给出 nodes 则点名照拨、不跳过（与内部一键拨测同一口径，见 offlineNodeSet）。
-func restProbeCreate(c *gin.Context) {
-	uid, _, _ := currentUserFromCtx(c)
-	var body struct {
-		APIType string            `json:"apiType"`
-		Raw     string            `json:"raw"`
-		Query   map[string]string `json:"query"`
-		Nodes   []string          `json:"nodes"`
+// usageForUser admin 全站口径；user = 自己任务 sched + 自己发起的 biz
+func usageForUser(role string, uid uint, hours float64) (gin.H, error) {
+	since := time.Now().UTC().Add(-time.Duration(hours * float64(time.Hour)))
+	ctx, cancel := dbCtx()
+	defer cancel()
+	var tasks []ProbeTask
+	tq := db.WithContext(ctx).Model(&ProbeTask{})
+	if role != RoleAdmin {
+		tq = tq.Where("owner_id = ?", uid)
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		restError(c, http.StatusBadRequest, "bad_request", "invalid body: "+err.Error())
-		return
+	if err := tq.Find(&tasks).Error; err != nil {
+		return nil, err
 	}
-	body.APIType = strings.TrimSpace(body.APIType)
-	body.Raw = strings.TrimPrefix(strings.TrimSpace(body.Raw), "/")
-	if body.APIType == "" || body.Raw == "" {
-		restError(c, http.StatusBadRequest, "bad_request", "apiType 与 raw 必填")
-		return
+	cfg := map[uint]*ProbeTask{}
+	var ids []uint
+	for i := range tasks {
+		cfg[tasks[i].ID] = &tasks[i]
+		ids = append(ids, tasks[i].ID)
 	}
-	query := url.Values{}
-	for k, v := range body.Query {
-		if v != "" {
-			query.Set(k, v)
+	q := db.WithContext(ctx).Model(&ProbeResult{}).Where("created_at >= ?", since)
+	switch {
+	case role == RoleAdmin:
+		q = q.Where("source IN ?", []string{sourceSched, sourceBiz})
+	case len(ids) > 0:
+		q = q.Where("(source = ? AND task_id IN ?) OR (source = ? AND owner_id = ?)", sourceSched, ids, sourceBiz, uid)
+	default:
+		q = q.Where("source = ? AND owner_id = ?", sourceBiz, uid)
+	}
+	var rows []ProbeResult
+	if err := q.Select("task_id, api_type, status, body, latency_ms").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	type agg struct{ total, up, down, invalid, latSum, latCnt int64 }
+	byType := map[string]*agg{}
+	tot := &agg{}
+	for i := range rows {
+		r := &rows[i]
+		t := cfg[r.TaskID]
+		if t == nil {
+			t = &ProbeTask{APIType: r.APIType}
+		}
+		a := byType[r.APIType]
+		if a == nil {
+			a = &agg{}
+			byType[r.APIType] = a
+		}
+		ev := evalSample(t, r.Status, r.Body, r.LatencyMs)
+		for _, x := range []*agg{a, tot} {
+			x.total++
+			switch {
+			case ev.invalid:
+				x.invalid++
+			case ev.up:
+				x.up++
+			default:
+				x.down++
+			}
+			if r.LatencyMs > 0 {
+				x.latSum += r.LatencyMs
+				x.latCnt++
+			}
 		}
 	}
-	results, unknown, skipped, err := batchProbeCore(body.APIType, body.Raw, body.Nodes, query)
-	if err != nil {
-		restError(c, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	persisted := persistManualProbes(body.APIType, body.Raw, results, uid)
-	okCnt, failedCnt := 0, 0
-	for _, r := range results {
-		if r.Status >= 200 && r.Status < 300 {
-			okCnt++
-		} else {
-			failedCnt++
+	arr := make([]gin.H, 0, len(byType))
+	for k, a := range byType {
+		avg := int64(0)
+		if a.latCnt > 0 {
+			avg = a.latSum / a.latCnt
 		}
+		arr = append(arr, gin.H{"apiType": k, "total": a.total, "up": a.up, "down": a.down, "invalid": a.invalid, "avgMs": avg})
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"apiType":   body.APIType,
-		"raw":       body.Raw,
-		"targeted":  len(results),
-		"ok":        okCnt,
-		"failed":    failedCnt,
-		"unknown":   unknown,
-		"skipped":   skipped,
-		"persisted": persisted,
-		"results":   results,
+	sort.Slice(arr, func(i, j int) bool { return arr[i]["total"].(int64) > arr[j]["total"].(int64) })
+	return gin.H{"hours": hours, "total": tot.total, "up": tot.up, "down": tot.down, "invalid": tot.invalid, "byType": arr}, nil
+}
+
+// ==================== 公开状态页 JSON：GET /api/public/status/:token（每 IP 60 次/分） ====================
+
+var pubShareLimiter = newRateLimiter(60)
+
+func registerPublicStatusRoutes(r *gin.Engine) {
+	r.GET("/api/public/status/:token", func(c *gin.Context) {
+		if !pubShareLimiter.allow(c.ClientIP()) {
+			restError(c, http.StatusTooManyRequests, "rate_limited", "请求过于频繁，请稍后再试")
+			return
+		}
+		token := c.Param("token")
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var group []ProbeTask
+		if token == "" || db.WithContext(ctx).Where("share_token = ?", token).Order("id asc").Find(&group).Error != nil || len(group) == 0 {
+			restError(c, http.StatusNotFound, "not_found", "invalid share link")
+			return
+		}
+		hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
+		tasks := make([]gin.H, 0, len(group))
+		for i := range group {
+			t := &group[i]
+			resp, err := computeTaskSla(t.ID, time.Duration(hours*float64(time.Hour)))
+			if err != nil {
+				continue
+			}
+			e := slaSugar(t.ID, hours, resp)
+			e["name"], e["apiType"] = t.Name, t.APIType
+			if !t.HideTarget {
+				e["target"] = t.Target
+			}
+			var rows []ProbeResult
+			db.WithContext(ctx).Where("task_id = ? AND source = ? AND created_at >= ?", t.ID, sourceSched, resp.Window.From).
+				Order("created_at asc").Find(&rows)
+			e["series"] = rowsToRoundSeries(t, rows)
+			tasks = append(tasks, e)
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{"token": token, "hours": hours, "tasks": tasks})
 	})
 }
 
-// restNodes GET /api/v1/nodes — 节点池简表（enabled，脱敏），复用内部 brief 构建
-func restNodes(c *gin.Context) {
-	items, err := nodeBriefItems()
-	if err != nil {
-		restError(c, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+// ==================== 浏览器推送 /console/sla（?token= 兼容原生 WS 无法带头；?hours=N 缺省 24） ====================
+
+type consoleSub struct {
+	conn  *websocket.Conn
+	hours int
+	user  ctxUser
+	wmu   sync.Mutex
 }
 
-// restUsage GET /api/v1/usage?hours= — 用量（admin 全站口径；普通用户 = 自己任务 + 自己 biz）
-func restUsage(c *gin.Context) {
-	uid, role, _ := currentUserFromCtx(c)
-	hours := clampFloat(c.Query("hours"), 24, 1, 24*90)
-	usage, err := usageForUser(role, uid, hours)
-	if err != nil {
-		restError(c, http.StatusInternalServerError, "internal", err.Error())
+type consoleHub struct {
+	mu   sync.Mutex
+	subs map[*consoleSub]struct{}
+}
+
+var hub = &consoleHub{subs: map[*consoleSub]struct{}{}}
+
+func (h *consoleHub) pushSLA(taskID uint) {
+	h.mu.Lock()
+	subs := make([]*consoleSub, 0, len(h.subs))
+	for s := range h.subs {
+		subs = append(subs, s)
+	}
+	h.mu.Unlock()
+	if len(subs) == 0 {
 		return
 	}
-	c.JSON(http.StatusOK, usage)
+	var t ProbeTask
+	ctx, cancel := dbCtx()
+	err := db.WithContext(ctx).First(&t, taskID).Error
+	cancel()
+	if err != nil {
+		return
+	}
+	for _, s := range subs {
+		if s.user.Role == RoleUser && t.OwnerID != s.user.ID {
+			continue
+		}
+		go func(s *consoleSub) {
+			resp, err := computeTaskSla(taskID, time.Duration(s.hours)*time.Hour)
+			if err != nil {
+				return
+			}
+			msg := wsMessage{Type: "sla", TS: time.Now().Unix(), Data: mustRaw(gin.H{"taskId": taskID, "sla": resp})}
+			s.wmu.Lock()
+			defer s.wmu.Unlock()
+			wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer wcancel()
+			if s.conn.Write(wctx, websocket.MessageText, mustRaw(msg)) != nil {
+				h.mu.Lock()
+				delete(h.subs, s)
+				h.mu.Unlock()
+			}
+		}(s)
+	}
+}
+
+func registerConsoleSlaRoute(r *gin.Engine) {
+	r.GET("/console/sla", func(c *gin.Context) {
+		tok := bearerToken(c)
+		if tok == "" {
+			tok = c.Query("token")
+		}
+		u, ok := identityOfAuthToken(tok)
+		if !ok {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		hours := 24
+		if n, err := strconv.Atoi(c.Query("hours")); err == nil && n >= 1 && n <= 24*90 {
+			hours = n
+		}
+		conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
+		if err != nil {
+			log.Printf("[ws-sla] accept failed: %v", err)
+			return
+		}
+		sub := &consoleSub{conn: conn, hours: hours, user: u}
+		hub.mu.Lock()
+		hub.subs[sub] = struct{}{}
+		hub.mu.Unlock()
+		defer func() {
+			hub.mu.Lock()
+			delete(hub.subs, sub)
+			hub.mu.Unlock()
+			conn.Close(websocket.StatusNormalClosure, "bye")
+		}()
+		for {
+			if _, _, err := conn.Read(c.Request.Context()); err != nil {
+				return
+			}
+		}
+	})
 }
