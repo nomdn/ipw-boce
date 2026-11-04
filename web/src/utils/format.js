@@ -1,52 +1,80 @@
-// ==================== 展示格式化 ====================
-export function fmtNum(n) {
-  if (n == null || isNaN(n)) return '0'
-  n = Number(n)
-  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + 'B'
-  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M'
-  if (Math.abs(n) >= 1e4) return (n / 1e3).toFixed(1) + 'K'
-  return String(Math.round(n))
-}
-
-// 平均延迟（ms），由 延迟和 / 请求数 推得
-export function avgMs(sumMs, total) {
-  if (!total) return '—'
-  return (sumMs / total).toFixed(0) + ' ms'
-}
-
-// 错误率百分比
-export function pct(errors, total) {
-  if (!total) return '0.00%'
-  return ((errors / total) * 100).toFixed(2) + '%'
-}
-
-// 后端 minute 为 unix 分钟桶 → 可读时间
-export function fmtMinute(m) {
-  if (m == null) return '—'
-  const d = new Date(m * 60000)
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-function pad(n) { return String(n).padStart(2, '0') }
-
-// 距现在多久（全站统一中文口径，勿再另写英文缩写版）
-export function timeAgo(iso) {
-  if (!iso) return '—'
-  const t = new Date(iso).getTime()
-  if (isNaN(t)) return iso
-  const s = Math.floor((Date.now() - t) / 1000)
-  if (s < 60) return '刚刚'
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
-  return `${Math.floor(s / 86400)} 天前`
-}
-
-// 展示时间戳（ISO 或秒）
 export function fmtTime(v) {
   if (!v) return '—'
-  const d = typeof v === 'number' ? new Date(v * 1000) : new Date(v)
-  if (isNaN(d)) return String(v)
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime()) || d.getFullYear() < 2000) return '—'
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-export { fmtNum as num }
+export const fmtPct = (v) => (v == null ? '—' : `${Number(v).toFixed(2)}%`)
+export const fmtMs = (v) => (v == null || v === 0 ? '—' : `${Math.round(v)} ms`)
+export const fmtNum = (v) => (v == null ? '—' : Number(v).toLocaleString())
+
+export function prettyJSON(v) {
+  if (v == null) return ''
+  if (typeof v === 'string') {
+    try {
+      return JSON.stringify(JSON.parse(v), null, 2)
+    } catch {
+      return v
+    }
+  }
+  return JSON.stringify(v, null, 2)
+}
+
+export async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  }
+}
+
+export const LEDGER_KIND = {
+  checkin: '每日签到',
+  signup: '注册奖励',
+  redeem_code: '兑换码',
+  admin: '管理员调整',
+  api_grant: '接口发放',
+  api_deduct: '接口扣减',
+  order: '商城兑换',
+  refund: '订单退款',
+  probe: '拨测消耗',
+  probe_back: '拨测退还',
+  donate: '捐赠节点奖励',
+  donate_day: '节点在线奖励',
+}
+
+export const DONATE_STATUS = {
+  pending: ['待审核', 'warn'],
+  approved: ['已上线', 'ok'],
+  rejected: ['未通过', 'bad'],
+  disabled: ['已停用', 'bad'],
+  withdrawn: ['已撤回', ''],
+}
+export const NET_TYPE = { idc: '机房', home: '家庭宽带' }
+
+export function fmtDuration(sec) {
+  if (!sec) return '0'
+  const d = Math.floor(sec / 86400)
+  const h = Math.floor((sec % 86400) / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  return [d && `${d}天`, h && `${h}小时`, !d && m && `${m}分`].filter(Boolean).join('') || `${sec}秒`
+}
+
+export const ORDER_STATUS = {
+  pending: ['待发货', 'warn'],
+  processing: ['处理中', 'warn'],
+  delivered: ['已发货', 'ok'],
+  failed: ['失败已退款', 'bad'],
+  canceled: ['已取消退款', 'bad'],
+}
+
+export const DELIVERY = { cdk: '卡密自动发', webhook: '接口发放', manual: '人工发货' }

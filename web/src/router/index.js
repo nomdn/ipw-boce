@@ -1,51 +1,46 @@
-// ==================== 路由与登录守卫 ====================
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores/auth.js'
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('../views/LoginView.vue'), meta: { public: true } },
-  // 公开状态页（B3）：免登录只读，分享链接 /s/<token>（数据来自收集中心公开 JSON）
-  { path: '/s/:token', name: 'status', component: () => import('../views/StatusView.vue'), meta: { public: true, title: '状态页' } },
+  { path: '/s/:token', name: 'status', component: () => import('../views/StatusView.vue'), meta: { public: true } },
   {
     path: '/',
-    component: () => import('../components/ConsoleLayout.vue'),
-    redirect: { name: 'dashboard' },
+    component: () => import('../components/AppShell.vue'),
     children: [
-      { path: '', name: 'dashboard', component: () => import('../views/DashboardView.vue'), meta: { title: '统计大盘' } },
-      // 可用节点：登录即可（普通用户看"能调哪些节点"，只读、脱敏，见 AvailableNodesView.vue）
-      { path: 'available-nodes', name: 'available-nodes', component: () => import('../views/AvailableNodesView.vue'), meta: { title: '可用节点' } },
-      { path: 'nodes', name: 'nodes', component: () => import('../views/NodesView.vue'), meta: { title: '节点状态', role: 'admin' } },
-      { path: 'probe', name: 'probe', component: () => import('../views/ProbeView.vue'), meta: { title: '一键拨测' } },
-      { path: 'records', name: 'records', component: () => import('../views/RecordsView.vue'), meta: { title: '拨测明细' } },
+      { path: '', name: 'probe', component: () => import('../views/ProbeChatView.vue'), meta: { title: '新拨测' } },
+      { path: 'dashboard', name: 'dashboard', component: () => import('../views/DashboardView.vue'), meta: { title: '统计大盘' } },
       { path: 'sla', name: 'sla', component: () => import('../views/SlaView.vue'), meta: { title: 'SLA 监控' } },
-      { path: 'config', name: 'config', component: () => import('../views/ConfigView.vue'), meta: { title: '配置分发', role: 'admin' } },
-      { path: 'users', name: 'users', component: () => import('../views/UsersView.vue'), meta: { title: '用户管理', role: 'admin' } },
+      { path: 'records', name: 'records', component: () => import('../views/RecordsView.vue'), meta: { title: '拨测明细' } },
+      { path: 'points', name: 'points', component: () => import('../views/PointsView.vue'), meta: { title: '积分中心' } },
+      { path: 'shop', name: 'shop', component: () => import('../views/ShopView.vue'), meta: { title: '积分商城' } },
+      { path: 'donate', name: 'donate', component: () => import('../views/DonateView.vue'), meta: { title: '捐赠节点' } },
+      { path: 'donate-admin', name: 'donate-admin', component: () => import('../views/DonateAdminView.vue'), meta: { title: '捐赠审核', admin: true } },
       { path: 'profile', name: 'profile', component: () => import('../views/ProfileView.vue'), meta: { title: '个人资料' } },
+      { path: 'nodes', name: 'nodes', component: () => import('../views/NodesView.vue'), meta: { title: '节点管理', admin: true } },
+      { path: 'config', name: 'config', component: () => import('../views/ConfigView.vue'), meta: { title: '配置托管', admin: true } },
+      { path: 'users', name: 'users', component: () => import('../views/UsersView.vue'), meta: { title: '用户管理', admin: true } },
+      { path: 'points-admin', name: 'points-admin', component: () => import('../views/PointsAdminView.vue'), meta: { title: '积分管理', admin: true } },
+      { path: 'shop-admin', name: 'shop-admin', component: () => import('../views/ShopAdminView.vue'), meta: { title: '商品与订单', admin: true } },
+      { path: 'settings', name: 'settings', component: () => import('../views/SettingsView.vue'), meta: { title: '系统设置', admin: true } },
     ],
   },
-  { path: '/:pathMatch(.*)*', redirect: { name: 'dashboard' } },
+  { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
 const router = createRouter({ history: createWebHistory(), routes })
 
-// 全局守卫：未登录一律去登录页；已登录访问登录页则回首页
 router.beforeEach((to) => {
   const auth = useAuthStore()
-  if (!to.meta.public && !auth.isAuthed) {
-    return { name: 'login', query: { redirect: to.fullPath } }
-  }
-  if (to.name === 'login' && auth.isAuthed) {
-    return { name: 'dashboard' }
-  }
-  // 邮箱未验证的普通账号：拦截 SLA 监控，引导去个人资料验证邮箱
-  if (to.name === 'sla' && auth.emailPending) {
-    return { name: 'profile', query: { verify: '1' } }
-  }
-  // 受角色保护的页面：普通用户访问 → 回首页（后端另有 adminOnly 兜底）
-  if (to.meta.role === 'admin' && !auth.isAdmin) {
-    return { name: 'dashboard' }
-  }
+  if (!to.meta.public && !auth.isAuthed) return { name: 'login', query: { redirect: to.fullPath } }
+  if (to.name === 'login' && auth.isAuthed) return { name: 'probe' }
+  if (to.name === 'sla' && auth.emailPending) return { name: 'profile', query: { verify: '1' } }
+  if (to.meta.admin && !auth.isAdmin) return { name: 'probe' }
   return true
+})
+
+router.afterEach((to) => {
+  document.title = to.meta.title ? `${to.meta.title} · 1IPW-BOCE` : '1IPW-BOCE'
 })
 
 export default router

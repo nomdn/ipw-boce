@@ -1,728 +1,159 @@
 <template>
-  <div>
-    <div class="toolbar">
-      <div class="tb-group">
-        <div class="form-field">
-          <label>可用率窗口</label>
-          <TimeRangePicker :model-value="uptimeRange" :max-days="90" :disabled="uptBusy"
-            aria-label="可用率统计窗口" @update:model-value="setUptimeRange" />
-        </div>
+  <div class="page wide">
+    <div class="page-head">
+      <div>
+        <h1>节点管理</h1>
+        <div class="sub">节点池保存即生效；WS 节点连 {{ status?.wsEnabled ? '8092/ws' : '（WS 已关闭）' }}，当前在线 {{ status?.wsPeers ?? 0 }}</div>
       </div>
-      <div class="tb-group tb-group--actions">
-        <button class="ak-button ak-button--outline" @click="loadAll">刷新节点</button>
-      </div>
-      <span v-if="error" class="err">{{ error }}</span>
-      <span class="dim" style="font-size:.85rem">在线 {{ onlineCount }} / {{ nodes.length }}</span>
-    </div>
-    <div v-if="loading" class="loading-center"><span class="ak-loading"></span></div>
-
-    <div class="node-wall">
-      <div v-for="n in nodes" :key="n.nodeId" class="node-card" :class="{ online: n.online }">
-        <div class="node-head" style="display:flex;justify-content:space-between;align-items:center">
-          <span class="node-id" :title="n.nodeId">
-            <span class="dot" :class="n.online ? 'online' : 'offline'"></span>{{ n.label || n.nodeId }}
-          </span>
-          <span class="ak-tag ch" :class="n.online ? 'ak-tag--advanced' : 'ak-tag--neutral'">
-            {{ n.online ? '在线' : '离线' }}
-          </span>
+      <div class="row">
+        <div class="seg">
+          <button v-for="t in TABS" :key="t.v" :class="{ on: tab === t.v }" @click="tab = t.v">{{ t.label }}</button>
         </div>
-        <div class="node-label">{{ n.label || '（未命名）' }}</div>
-        <div class="node-meta">
-          <span :title="remoteHint(n.remoteAddr)">远端 {{ n.remoteAddr || '—' }}</span>
-          <span>版本 {{ n.version || '—' }}</span>
-        </div>
-        <div class="node-meta">
-          <span>最后活跃 {{ timeAgo(n.lastSeenAt) }}</span>
-          <span>首见 {{ timeAgo(n.firstSeenAt) }}</span>
-        </div>
-        <!-- 可用率（来自上下线事件流还原，见后端 node_uptime.go）：统计窗口见顶部下拉 -->
-        <div class="node-meta">
-          <span :class="upTone(upt(n).availability)">
-            可用率 {{ fmtAvail(upt(n).availability) }}
-          </span>
-          <span v-if="upt(n).seconds">
-            宕机 {{ upt(n).downCount || 0 }} 次<span
-              v-if="upt(n).offlineSeconds > 0" class="dim"> / 共 {{ humanDur(upt(n).offlineSeconds) }}</span>
-          </span>
-          <span v-else class="dim">统计窗口内无数据</span>
-        </div>
-        <div v-if="capsHint(n).hint" class="node-meta node-note" :class="capsHint(n).tone">
-          <span>{{ capsHint(n).hint }}</span>
-        </div>
-        <div class="node-actions">
-          <button class="ak-button ak-button--outline" @click="openEvents(n)">事件历史</button>
-          <button class="ak-button ak-button--outline" @click="openUptime(n)">可用率</button>
-          <button class="ak-button ak-button--outline" @click="openOta(n)">OTA 升级</button>
-        </div>
-      </div>
-      <div v-if="!nodes.length && !loading" class="panel" style="grid-column:1/-1">
-        <h2 class="panel-title">暂无节点</h2>
-        <p class="dim" style="margin:0">节点接入后会自动出现在这里。</p>
+        <button v-if="tab === 'pool'" class="btn primary" @click="edit()">+ 添加节点</button>
       </div>
     </div>
 
-    <!-- ===== 计划维护窗口 ===== -->
-    <div class="panel" style="margin-top:24px">
-      <div class="ota-head">
-        <h2 class="panel-title">计划维护窗口 <span class="dim" style="font-size:.78rem;font-weight:400">窗口内的节点掉线 / 恢复不推送告警，事件与统计照常记录</span></h2>
-        <div class="tb-group tb-group--actions">
-          <button class="ak-button ak-button--outline" @click="openMaint">＋ 新建窗口</button>
-          <button class="ak-button ak-button--outline" @click="loadMaint">刷新</button>
-        </div>
+    <template v-if="tab === 'pool'">
+      <div v-if="unconfigured.length" class="card soft">
+        <b>发现 {{ unconfigured.length }} 个已接入但未登记的节点：</b>
+        <span v-for="u in unconfigured" :key="u.nodeId" class="btn sm" style="margin: 4px" @click="edit(null, u)">{{ u.nodeId }} +</span>
       </div>
-
-      <!-- 新建表单 -->
-      <div v-if="maint.show" class="maint-form">
-        <div class="form-field">
-          <label>作用范围</label>
-          <select class="ak-select" v-model="maint.scope">
-            <option value="global">全部节点</option>
-            <option v-for="n in nodes" :key="n.nodeId" :value="n.nodeId">{{ n.label || n.nodeId }}</option>
-          </select>
-        </div>
-        <div class="form-field">
-          <label>形态</label>
-          <select class="ak-select" v-model="maint.repeatDaily" @change="onRepeatChange">
-            <option :value="false">一次性时间段</option>
-            <option :value="true">每日重复</option>
-          </select>
-        </div>
-        <div class="form-field">
-          <label>{{ maint.repeatDaily ? '每日开始' : '开始时间' }}</label>
-          <input class="ak-input" :type="maint.repeatDaily ? 'time' : 'datetime-local'" v-model="maint.startAt" />
-        </div>
-        <div class="form-field">
-          <label>{{ maint.repeatDaily ? '每日结束' : '结束时间' }}</label>
-          <input class="ak-input" :type="maint.repeatDaily ? 'time' : 'datetime-local'" v-model="maint.endAt" />
-        </div>
-        <div class="form-field">
-          <label>原因</label>
-          <input class="ak-input" v-model.trim="maint.reason" placeholder="如：机房割接 / 例行重启" style="width:200px" />
-        </div>
-        <div class="tb-group tb-group--actions">
-          <button class="ak-button ak-button--action" :disabled="maint.busy" @click="submitMaint">
-            {{ maint.busy ? '保存中…' : '保存' }}
-          </button>
-          <button class="ak-button ak-button--outline" @click="maint.show = false">取消</button>
-        </div>
-        <div v-if="maint.err" class="err" style="flex-basis:100%">{{ maint.err }}</div>
-      </div>
-      <p v-if="maint.show && maint.repeatDaily" class="dim maint-hint">
-        每日重复只取时刻（服务器所在时区），支持跨零点（如 23:30 → 00:30）。
-      </p>
-
-      <div class="ak-table-wrap">
-        <table class="ak-table">
-          <thead>
-            <tr><th>范围</th><th>时间</th><th>形态</th><th>原因</th><th>状态</th><th>创建人</th><th></th></tr>
-          </thead>
+      <div class="table-wrap">
+        <table class="tbl">
+          <thead><tr><th>节点 ID</th><th>名称</th><th>通道</th><th>池</th><th>栈</th><th>凭据</th><th>启用</th><th /></tr></thead>
           <tbody>
-            <tr v-for="w in maintList" :key="w.id">
-              <td class="mono">{{ w.scope === 'global' || !w.scope ? '全部节点' : w.scope }}</td>
-              <td class="mono nowrap">{{ maintRange(w) }}</td>
-              <td>{{ w.repeatDaily ? '每日重复' : '一次性' }}</td>
-              <td class="dim">{{ w.reason || '—' }}</td>
-              <td>
-                <span v-if="w.active" class="ota-status success">生效中</span>
-                <span v-else-if="w.expired" class="dim">已结束</span>
-                <span v-else class="dim">未开始</span>
-              </td>
-              <td class="dim">{{ w.createdBy || '—' }}</td>
-              <td><button class="ak-button ak-button--outline sm danger" @click="removeMaint(w)">删除</button></td>
+            <tr v-for="d in defs" :key="d.id">
+              <td class="mono">{{ d.nodeId }}</td>
+            <td>{{ d.label }}<span v-if="d.donationId" class="pill ok" style="margin-left: 4px">捐赠·{{ NET_TYPE[d.netType] }}</span></td>
+              <td>{{ d.ws ? 'WS' : 'HTTP' }}<div v-if="!d.ws" class="faint">{{ d.url }}</div></td>
+              <td>{{ d.pool }}</td><td>{{ d.stack || '—' }}</td>
+              <td class="faint">{{ d.hasApiKey ? 'APIKey' : '' }} {{ d.hasWsKey ? 'WSKey' : '' }}</td>
+              <td><Switch :model-value="d.enabled" @change="(v) => quick(d, v)" /></td>
+              <td><button class="btn sm" @click="edit(d)">编辑</button><button class="btn sm danger" @click="del(d)">删除</button></td>
             </tr>
-            <tr v-if="!maintList.length"><td colspan="7" class="dim">暂无维护窗口 —— 割接 / 发布前建一个，可避免计划内断连刷告警</td></tr>
+            <tr v-if="!defs.length"><td colspan="8" class="empty">节点池为空（未登记时回退 setting.json）</td></tr>
           </tbody>
         </table>
       </div>
+    </template>
+
+    <NodeOpsPanels v-if="['uptime', 'ota', 'runtime', 'maint'].includes(tab)" :tab="tab" :live="live" />
+
+    <div v-if="tab === 'live'" class="table-wrap">
+      <table class="tbl">
+        <thead><tr><th>节点</th><th>状态</th><th>来源地址</th><th>版本</th><th>能力</th><th>最后在线</th><th /></tr></thead>
+        <tbody>
+          <tr v-for="n in live" :key="n.nodeId">
+            <td>{{ n.label || n.nodeId }}<div class="faint mono">{{ n.nodeId }}</div></td>
+            <td><span class="pill" :class="n.online ? 'ok' : 'bad'">{{ n.online ? '在线' : '离线' }}</span></td>
+            <td class="mono">{{ n.remoteAddr || '—' }}</td><td>{{ n.version || '—' }}</td>
+            <td class="faint">{{ n.capabilities || '未知' }}</td><td class="faint">{{ fmtTime(n.lastSeenAt) }}</td>
+            <td><button class="btn sm" @click="showEvents(n)">事件</button><button class="btn sm danger" @click="delSnap(n)">移除</button></td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
-    <!-- ===== OTA 任务列表 ===== -->
-    <div class="panel" style="margin-top:24px">
-      <div class="ota-head">
-        <h2 class="panel-title">OTA 升级任务 <span class="dim" style="font-size:.78rem;font-weight:400">节点重连后版本号变化即判定成功</span></h2>
-        <button class="ak-button ak-button--outline" @click="loadOta">刷新</button>
+    <Modal v-model="formOpen" width="min(560px, 94vw)" :title="form?.id ? '编辑节点' : '添加节点'">
+      <div v-if="form">
+        <div class="grid c2">
+          <div class="field"><label>节点 ID（即转发路径 backendID）</label><input v-model.trim="form.nodeId" class="inp" /></div>
+          <div class="field"><label>显示名</label><input v-model="form.label" class="inp" placeholder="中国 江苏 移动" /></div>
+          <div class="field"><label>通道</label><select v-model="form.ws" class="inp"><option :value="false">HTTP</option><option :value="true">WS</option></select></div>
+          <div class="field" v-if="!form.ws"><label>HTTP 上游地址</label><input v-model.trim="form.url" class="inp" placeholder="https://node.example.com/" /></div>
+          <div class="field"><label>栈分组（api 池）</label><select v-model="form.stack" class="inp"><option>DualStack</option><option>IPv4</option><option>IPv6</option></select></div>
+          <div class="field"><label>排序</label><input v-model.number="form.sortOrder" type="number" class="inp" /></div>
+        </div>
+        <div class="field">
+          <label>归属池</label>
+          <div class="row"><label><input type="checkbox" value="api" v-model="form.pools" /> api（whois/dns/ssl/detail/tcping/speed）</label><label><input type="checkbox" value="location" v-model="form.pools" /> location（location/asn）</label></div>
+        </div>
+        <div class="grid c2">
+          <div class="field"><label>API Key（中心 → 节点，{{ form.hasApiKey ? '已设置，留空不改' : '可选' }}）</label><input v-model="form.apiKey" class="inp" type="password" /></div>
+          <div class="field"><label>WS Key（节点注册校验，{{ form.hasWsKey ? '已设置，留空不改' : '可选' }}）</label><input v-model="form.wsKey" class="inp" type="password" /></div>
+        </div>
+        <div class="row"><Switch v-model="form.enabled" /> 启用</div>
+        <div class="row" style="justify-content: flex-end; margin-top: 14px">
+          <button class="btn" @click="formOpen = false">取消</button><button class="btn primary" @click="save">保存</button>
+        </div>
       </div>
-      <div class="ak-table-wrap">
-        <table class="ak-table">
-          <thead>
-            <tr><th>#</th><th>节点</th><th>版本变化</th><th>通道</th><th>状态</th><th>阶段 / 原因</th><th>操作人</th><th>下发时间</th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="t in otaTasks" :key="t.id">
-              <td class="mono dim">{{ t.id }}</td>
-              <td class="mono" :title="t.nodeId">{{ t.label || labelOf[t.nodeId] || t.nodeId }}</td>
-              <td class="mono">{{ t.fromVersion || '—' }} → {{ t.targetVersion || (t.url ? '按下载地址' : '—') }}</td>
-              <td>{{ t.channel === 'ws' ? 'WS' : 'HTTP' }}</td>
-              <td>
-                <span class="ota-status" :class="t.status">
-                  {{ t.status === 'dispatched' ? '进行中' : t.status === 'success' ? '成功' : '失败' }}
-                </span>
-              </td>
-              <td style="word-break:break-all">
-                <span v-if="t.status === 'dispatched'" class="dim">{{ t.stage || '等待节点响应…' }}</span>
-                <span v-else-if="t.error" class="err">{{ t.error }}</span>
-                <span v-else class="dim">—</span>
-              </td>
-              <td class="dim">{{ t.dispatchedBy || '—' }}</td>
-              <td class="mono nowrap">{{ fmtTime(t.dispatchedAt) }}</td>
-            </tr>
-            <tr v-if="!otaTasks.length"><td colspan="8" class="dim">暂无 OTA 任务</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
+    </Modal>
 
-    <!-- OTA 下发对话框 -->
-    <div v-if="ota.show" class="ev-mask" @click.self="ota.show = false">
-      <div class="ev-panel">
-        <header class="ev-head">
-          <span class="mono" :title="ota.nodeId">{{ ota.nodeLabel || ota.nodeId }}</span>
-          <span class="dim">OTA 升级</span>
-          <button class="ak-button ak-button--outline" style="margin-left:auto;padding:3px 10px" @click="ota.show = false">关闭</button>
-        </header>
-        <div class="ak-form-stack" style="margin-top:12px">
-          <div class="switch-row">
-            <span class="ak-label">方式</span>
-            <button class="ak-toggle" :class="{ on: ota.mode === 'version' }" @click.prevent="ota.mode = 'version'">按版本（自动匹配发布资产）</button>
-            <button class="ak-toggle" :class="{ on: ota.mode === 'url' }" @click.prevent="ota.mode = 'url'">直发下载地址</button>
-          </div>
-          <label class="ak-field" v-if="ota.mode === 'version'">
-            <span class="ak-label">目标版本</span>
-            <input class="ak-input" v-model.trim="ota.version" placeholder="如 v1.2.3（发布标签）" />
-          </label>
-          <label class="ak-field" v-if="ota.mode === 'url'">
-            <span class="ak-label">下载地址</span>
-            <input class="ak-input" v-model.trim="ota.url" placeholder="https://…（对应节点平台的二进制）" />
-          </label>
-          <label class="ak-field">
-            <span class="ak-label">SHA256 <span class="dim">（可选校验）</span></span>
-            <input class="ak-input" v-model.trim="ota.sha256" placeholder="64 位 hex，兼容 sha256: 前缀" />
-          </label>
+    <Modal v-model="evOpen" width="min(520px, 92vw)" title="上下线事件">
+      <div>
+        <div v-for="(e, i) in events" :key="i" class="row between" style="border-bottom: 1px solid var(--border); padding: 6px 0">
+          <span :class="e.event === 'online' ? 'ok' : 'bad'">{{ e.event }}</span><span class="faint">{{ e.reason }}</span><span class="faint">{{ fmtTime(e.createdAt) }}</span>
         </div>
-        <p class="dim" style="font-size:.75rem;line-height:1.5;margin:10px 0 0">
-          节点将下载并替换自身二进制后重启，期间会短暂断开连接，属正常现象；成败以重连后的版本号为准。
-          老版本节点不认识该指令，会按任务超时处理。
-        </p>
-        <div v-if="ota.msg" class="ok-text" style="font-size:.8rem;margin-top:10px;word-break:break-all">{{ ota.msg }}</div>
-        <div v-if="ota.err" class="err" style="font-size:.8rem;margin-top:10px;word-break:break-all">{{ ota.err }}</div>
-        <div class="dlg-foot">
-          <button class="ak-button ak-button--outline" @click="ota.show = false">取消</button>
-          <button class="ak-button ak-button--action" :disabled="ota.busy" @click="submitOta">
-            {{ ota.busy ? '下发中…' : '下发 OTA' }}
-          </button>
-        </div>
+        <div v-if="!events.length" class="empty">无</div>
       </div>
-    </div>
-
-    <!-- 可用率趋势抽屉 -->
-    <div v-if="uptPanel" class="ev-mask" @click.self="uptPanel = null">
-      <div class="ev-panel">
-        <header class="ev-head">
-          <span class="mono" :title="uptPanel.nodeId">{{ uptPanel.nodeLabel || uptPanel.nodeId }}</span>
-          <span class="dim">可用率趋势</span>
-          <button class="ak-button ak-button--outline" style="margin-left:auto;padding:3px 10px" @click="uptPanel = null">关闭</button>
-        </header>
-        <!-- 图上直接换窗口：与顶部「可用率窗口」同一状态，节点卡片上的可用率一并跟着变 -->
-        <div class="upt-bar">
-          <span class="dim">统计窗口</span>
-          <TimeRangePicker :model-value="uptimeRange" :max-days="90" :disabled="uptBusy"
-            aria-label="可用率统计窗口" @update:model-value="setUptimeRange" />
-          <span v-if="uptBusy" class="dim">切换中…</span>
-        </div>
-        <div v-if="uptPanel.loading" class="loading-center"><span class="ak-loading"></span></div>
-        <template v-else-if="uptPanel.data">
-          <div class="upt-sum">
-            <span :class="upTone(uptPanel.data.availability)">
-              窗口可用率 {{ fmtAvail(uptPanel.data.availability) }}
-            </span>
-            <span class="dim">宕机 {{ uptPanel.data.downCount || 0 }} 次</span>
-            <span class="dim">累计 {{ humanDur(uptPanel.data.offlineSeconds) }}</span>
-            <span class="dim">统计起点 {{ fmtTime(uptPanel.data.from) }}</span>
-          </div>
-          <EChart v-if="(uptPanel.data.daily || []).length" :option="uptOption" height="240px" />
-          <p v-else class="dim" style="margin:14px 0 0">该窗口内没有可用日数据。</p>
-          <p class="dim" style="font-size:.72rem;line-height:1.5;margin:12px 0 0">
-            口径：按上下线事件还原离线区间，与告警的去抖无关（事件记录的是断连真实时刻）；
-            节点首见之前不算宕机，统计区间也不超出数据保留期。
-          </p>
-        </template>
-      </div>
-    </div>
-
-    <!-- 事件抽屉 -->
-    <div v-if="drawer" class="ev-mask" @click.self="drawer = null">
-      <div class="ev-panel">
-        <header class="ev-head">
-          <span class="mono" :title="drawer.nodeId">{{ drawer.label || drawer.nodeId }}</span>
-          <span class="dim">在线/离线事件</span>
-          <button class="ak-button ak-button--outline" style="margin-left:auto;padding:3px 10px"
-            :disabled="exportingEvents" @click="doExportEvents(drawer)">
-            {{ exportingEvents ? '导出中…' : '导出 CSV' }}
-          </button>
-          <button class="ak-button ak-button--outline" style="padding:3px 10px" @click="drawer=null">关闭</button>
-        </header>
-        <div class="ak-table-wrap" style="max-height:60vh;overflow:auto">
-          <table class="ak-table">
-            <thead><tr><th>时间</th><th>事件</th><th>原因</th></tr></thead>
-            <tbody>
-              <tr v-for="e in events" :key="e.id">
-                <td class="mono nowrap">{{ fmtTime(e.createdAt) }}</td>
-                <td><span class="dot" :class="e.event === 'online' ? 'online' : 'offline'"></span>
-                  <span :class="e.event === 'online' ? 'ok-200' : 'err'">{{ e.event === 'online' ? '上线' : '下线' }}</span></td>
-                <td class="dim" style="word-break:break-all">{{ e.reason || '—' }}</td>
-              </tr>
-              <tr v-if="!events.length"><td colspan="3" class="dim">暂无事件</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+    </Modal>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
-import {
-  fetchNodes, fetchNodeEvents, dispatchNodeOta, fetchOtaTasks,
-  fetchNodesUptime, fetchNodeUptime, exportNodeEvents,
-  fetchMaintenance, createMaintenance, deleteMaintenance,
-} from '../api/boce.js'
-import { timeAgo, fmtTime } from '../utils/format.js'
-import { useTheme, readChartTheme } from '../composables/useTheme.js'
-import EChart from '../components/EChart.vue'
-import TimeRangePicker from '../components/TimeRangePicker.vue'
-import { resolveRange } from '../utils/timeRange.js'
-import { useDialog } from '../composables/useDialog.js'
+import Modal from '../components/Modal.vue'
+import Switch from '../components/Switch.vue'
+import { onMounted, ref, watch } from 'vue'
+import * as api from '../api/boce.js'
+import NodeOpsPanels from '../components/NodeOpsPanels.vue'
+import { fmtTime, NET_TYPE } from '../utils/format.js'
+import { confirm, run } from '../utils/toast.js'
 
-const dialog = useDialog()
-
-const nodes = ref([])
+const TABS = [
+  { v: 'pool', label: '节点池' },
+  { v: 'live', label: '在线状态' },
+  { v: 'uptime', label: '可用率' },
+  { v: 'ota', label: 'OTA' },
+  { v: 'runtime', label: '运行时配置' },
+  { v: 'maint', label: '维护窗口' },
+]
+const tab = ref('pool')
+const defs = ref([])
+const live = ref([])
+const unconfigured = ref([])
+const status = ref(null)
+const formOpen = ref(false)
+const form = ref(null)
+const evOpen = ref(false)
 const events = ref([])
-const drawer = ref(null)
-const loading = ref(false)
-const error = ref('')
-
-// ===== 可用率 =====
-// 统计窗口用 Umami 式选择器（与 SLA/大盘/分享页同一套）：状态 { key, start?, end? }。
-// 后端 /admin/nodes/uptime 只认整数天（days，clamp 1~90），故取数时把窗口折算成天数。
-const uptimeRange = ref({ key: '7d' })
-const uptimeMap = ref({}) // nodeId -> 后端 nodeUptimeStats
-const uptPanel = ref(null) // { nodeId, loading, data }
-const uptBusy = ref(false) // 切换统计窗口中：禁用按钮，避免连点堆请求
-const exportingEvents = ref(false)
-
-// ===== 维护窗口 =====
-const maintList = ref([])
-const maint = reactive({ show: false, scope: 'global', repeatDaily: false, startAt: '', endAt: '', reason: '', busy: false, err: '' })
-
-// ===== OTA =====
-const otaTasks = ref([])
-const ota = reactive({
-  show: false, nodeId: '', nodeLabel: '', mode: 'version', version: '', url: '', sha256: '',
-  busy: false, err: '', msg: '',
-})
-let otaTimer = null
-
-const onlineCount = computed(() => nodes.value.filter((n) => n.online).length)
-
-// nodeId → 显示名。节点列表的 label 由后端走 nodeDisplayName 给全（池 label → nodes.label → nodeId），
-// OTA 任务列表只带 nodeId，靠这张表把 UUID 换成名字。池里已删/不在列表的节点回落原 id。
-const labelOf = computed(() => {
-  const m = {}
-  for (const n of nodes.value) m[n.nodeId] = n.label || n.nodeId
-  return m
-})
-
-// ==== 图表主题（echarts 读不到 CSS 变量，需随主题重算）====
-const { theme } = useTheme()
-const CH = reactive({ ...readChartTheme() })
-watch(theme, () => Object.assign(CH, readChartTheme()))
-
-// 「远端」是节点连上中心时的来源地址（由中心尽力还原）。显示 127.0.0.1 / 内网地址时，说明
-// 中心与节点之间还有一层本机或内网代理（反代 / 隧道），此时它只是"最后一跳"，不是节点地址。
-function remoteHint(addr) {
-  const a = String(addr || '')
-  if (!a) return '该节点未记录来源地址（HTTP 接入的节点不记录这一项）'
-  if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)/.test(a)) {
-    return '本机或内网地址：中心与节点之间存在代理（反向代理 / 隧道），这里显示的是最后一跳'
-  }
-  return '节点连接中心时的来源地址'
-}
-
-// 节点上报的能力清单（逗号分隔，如 "probe,report,config"；老版本节点不上报，为空串）。
-// 节点版本号由 n.version 直接展示——节点不自更新，升级部署后重新注册即为新版本。
-// 这里只在"未上报能力清单"时给一句排障提示：这类旧程序可能不认识控制台下发的运行时配置指令。
-const capsOf = (n) => String(n?.capabilities || '').split(',').map((s) => s.trim()).filter(Boolean)
-function capsHint(n) {
-  if (capsOf(n).length) return { tone: '', hint: '' }
-  return {
-    tone: 'warn',
-    hint: '旧版节点：未上报能力清单，运行时配置指令可能不被识别，建议升级节点程序',
-  }
-}
-
-// ===== 可用率展示辅助 =====
-// 后端 availability 是 0~1 的比值（与 SLA 的 0~100 不同），且 seconds=0 表示"窗口内该节点还不存在"
-const upt = (n) => uptimeMap.value[n.nodeId] || {}
-function fmtAvail(v) {
-  if (v == null) return '—'
-  return (Number(v) * 100).toFixed(2).replace(/\.?0+$/, '') + '%'
-}
-function upTone(v) {
-  if (v == null) return 'dim'
-  const p = Number(v) * 100
-  return p >= 99 ? 'up-ok' : p >= 95 ? 'up-warn' : 'up-bad'
-}
-// 秒 → 「1天3小时」这类人话；不足 1 分钟显示秒
-function humanDur(sec) {
-  const s = Number(sec) || 0
-  if (s <= 0) return '0'
-  if (s < 60) return `${s} 秒`
-  const d = Math.floor(s / 86400)
-  const h = Math.floor((s % 86400) / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const parts = []
-  if (d) parts.push(`${d} 天`)
-  if (h) parts.push(`${h} 小时`)
-  if (!d && m) parts.push(`${m} 分`)
-  return parts.join(' ') || '不到 1 分'
-}
-
-onMounted(() => {
-  loadAll()
-  loadMaint()
-})
-onUnmounted(() => { if (otaTimer) clearInterval(otaTimer) })
-
-function loadAll() {
-  load()
-  loadUptime()
-}
 
 async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    nodes.value = await fetchNodes()
-  } catch (e) {
-    error.value = e?.message || '加载失败'
-  } finally {
-    loading.value = false
-  }
+  ;[defs.value, unconfigured.value, status.value] = await Promise.all([api.fetchNodeDefs(), api.fetchUnconfigured(), api.fetchStatus()])
 }
-
-// 统计窗口 → 后端 days 参数（/admin/nodes/uptime 只认整数天，服务端 clamp 1~90）。
-// Umami 选择器给的是任意区间（含自定义/平移），这里统一折算成"最近多少天"：
-// 相对与自然周期都能整除，自定义区间按跨度取整，零跨度兜底 1 天。
-function uptimeDays() {
-  const r = resolveRange(uptimeRange.value)
-  return Math.min(90, Math.max(1, Math.round(r.hours / 24)))
+function edit(d, cand) {
+  form.value = d
+    ? { ...d, pools: d.pool.split(','), apiKey: '', wsKey: '' }
+    : { nodeId: cand?.nodeId || '', label: cand?.label || '', ws: !!cand?.viaWs, url: '', stack: 'DualStack', sortOrder: 0, pools: ['api'], apiKey: '', wsKey: '', enabled: true }
+  formOpen.value = true
 }
-
-async function loadUptime() {
-  try {
-    const resp = await fetchNodesUptime(uptimeDays())
-    const m = {}
-    for (const s of resp?.nodes || []) m[s.nodeId] = s
-    uptimeMap.value = m
-  } catch (e) {
-    // 可用率失败不该顶掉节点列表的报错位：单独提示，卡片上退化为"—"
-    uptimeMap.value = {}
-    error.value = e?.message || '可用率加载失败'
-  }
+async function save() {
+  const f = { ...form.value }
+  const body = { nodeId: f.nodeId, label: f.label, ws: f.ws, url: f.url, stack: f.stack, sortOrder: f.sortOrder, pools: f.pools, enabled: f.enabled }
+  if (f.apiKey) body.apiKey = f.apiKey
+  if (f.wsKey) body.wsKey = f.wsKey
+  await run(() => (f.id ? api.updateNodeDef(f.id, body) : api.createNodeDef(body)), '已保存')
+  formOpen.value = false
+  load()
 }
-
-async function openEvents(n) {
-  drawer.value = n
-  events.value = []
-  try {
-    events.value = await fetchNodeEvents(n.nodeId, 100)
-  } catch (e) {
-    // 拉取失败不能静默成"暂无事件"，否则会被误读为该节点从未有过事件
-    error.value = e?.message || '事件历史加载失败'
-  }
+async function quick(d, v) {
+  await run(() => api.updateNodeDef(d.id, { enabled: v }))
+  d.enabled = v
 }
-
-async function doExportEvents(n) {
-  exportingEvents.value = true
-  try {
-    await exportNodeEvents(n.nodeId, 30)
-  } catch (e) {
-    error.value = e?.message || '事件导出失败'
-  } finally {
-    exportingEvents.value = false
-  }
+async function del(d) {
+  if (!(await confirm(`从节点池删除 ${d.nodeId}？`))) return
+  await run(() => api.deleteNodeDef(d.id), '已删除')
+  load()
 }
-
-// ===== 可用率趋势 =====
-async function openUptime(n) {
-  uptPanel.value = { nodeId: n.nodeId, nodeLabel: n.label || n.nodeId, loading: true, data: null }
-  await reloadUptimePanel(n.nodeId)
+async function showEvents(n) {
+  events.value = await api.fetchNodeEvents(n.nodeId)
+  evOpen.value = true
 }
-
-// 抽屉可能在加载期间被关掉/切成别的节点：只在仍是同一节点时回填（切换窗口时走这里，
-// 不重置 loading，旧图留着直到新数据到达，避免"图表闪一下没了"）
-async function reloadUptimePanel(nodeId) {
-  try {
-    const data = await fetchNodeUptime(nodeId, uptimeDays())
-    // 回填时保留原有 nodeLabel（重建对象会丢），否则换窗口后标题会退回 UUID
-    if (uptPanel.value?.nodeId === nodeId) {
-      uptPanel.value = { nodeId, nodeLabel: uptPanel.value.nodeLabel || nodeId, loading: false, data }
-    }
-  } catch (e) {
-    uptPanel.value = null
-    error.value = e?.message || '可用率加载失败'
-  }
+async function delSnap(n) {
+  if (!(await confirm(`移除 ${n.nodeId} 的在线快照？（事件历史保留）`))) return
+  await run(() => api.deleteNodeSnapshot(n.nodeId), '已移除')
+  live.value = await api.fetchNodes()
 }
-
-// 快捷换统计窗口：节点卡片的可用率（loadUptime）与抽屉折线一起换成新窗口
-async function setUptimeRange(v) {
-  if (uptBusy.value || v?.key === uptimeRange.value?.key) return
-  uptimeRange.value = v
-  uptBusy.value = true
-  try {
-    await loadUptime()
-    const nid = uptPanel.value?.nodeId
-    if (nid) await reloadUptimePanel(nid)
-  } finally {
-    uptBusy.value = false
-  }
-}
-
-// 逐日可用率折线 + 当日宕机次数柱（双轴）：折线看稳定性趋势，柱看故障频次
-const uptOption = computed(() => {
-  const d = uptPanel.value?.data
-  const daily = d?.daily || []
-  return {
-    color: [CH.cyan, CH.yellow],
-    tooltip: {
-      trigger: 'axis',
-      backgroundColor: CH.tipBg, borderColor: CH.tipBorder, textStyle: { color: CH.tipText },
-    },
-    legend: { top: 0, textStyle: { color: CH.label, fontSize: 11 }, itemWidth: 14 },
-    grid: { left: 56, right: 44, top: 30, bottom: 28 },
-    xAxis: {
-      type: 'category',
-      data: daily.map((x) => x.date),
-      axisLine: { lineStyle: { color: CH.axis } },
-      axisLabel: { color: CH.label, hideOverlap: true },
-      splitLine: { show: false },
-    },
-    yAxis: [
-      {
-        type: 'value', name: '%', scale: true, max: 100,
-        axisLine: { lineStyle: { color: CH.axis } },
-        axisLabel: { color: CH.label, formatter: '{value}' },
-        splitLine: { lineStyle: { color: CH.grid } },
-      },
-      {
-        type: 'value', name: '次', minInterval: 1,
-        axisLine: { lineStyle: { color: CH.axis } },
-        axisLabel: { color: CH.label },
-        splitLine: { show: false },
-      },
-    ],
-    series: [
-      {
-        name: '可用率', type: 'line', showSymbol: true, symbolSize: 5,
-        lineStyle: { width: 2.5 }, areaStyle: { opacity: 0.08 },
-        data: daily.map((x) => (Number(x.availability) * 100).toFixed(3)),
-      },
-      { name: '宕机次数', type: 'bar', yAxisIndex: 1, barMaxWidth: 18, data: daily.map((x) => x.downCount || 0) },
-    ],
-  }
-})
-
-// ===== 维护窗口 =====
-async function loadMaint() {
-  try {
-    maintList.value = await fetchMaintenance()
-  } catch {
-    maintList.value = []
-  }
-}
-
-function openMaint() {
-  maint.show = true
-  maint.scope = 'global'
-  maint.repeatDaily = false
-  maint.startAt = ''
-  maint.endAt = ''
-  maint.reason = ''
-  maint.err = ''
-}
-
-// 形态切换会同时换掉两个输入的 type（datetime-local ↔ time），两种值格式不通用，
-// 必须在切换时清空，否则残留的 "2026-09-19T03:00" 会让 time 控件渲染成空但 v-model 仍有值。
-function onRepeatChange() {
-  maint.startAt = ''
-  maint.endAt = ''
-}
-
-function maintRange(w) {
-  if (w.repeatDaily) {
-    // 只展示"时刻"：后端存的是 UTC，必须经 fmtTime 转成本地时区再截时间部分，
-    // 否则会把 03:00（本地）显示成 19:00（UTC）。
-    const t = (v) => fmtTime(v).slice(11, 16)
-    return `每日 ${t(w.startAt)} ~ ${t(w.endAt)}`
-  }
-  return `${fmtTime(w.startAt)} ~ ${fmtTime(w.endAt)}`
-}
-
-async function submitMaint() {
-  if (!maint.startAt || !maint.endAt) { maint.err = '请填写开始与结束时间'; return }
-  maint.busy = true
-  maint.err = ''
-  try {
-    await createMaintenance({
-      scope: maint.scope, startAt: maint.startAt, endAt: maint.endAt,
-      repeatDaily: !!maint.repeatDaily, reason: maint.reason,
-    })
-    maint.show = false
-    await loadMaint()
-  } catch (e) {
-    maint.err = e?.message || '保存失败'
-  } finally {
-    maint.busy = false
-  }
-}
-
-async function removeMaint(w) {
-  const ok = await dialog.confirm({
-    title: '删除维护窗口',
-    message: `确定删除「${maintRange(w)}」这个维护窗口？删除后该时段的节点告警将恢复推送。`,
-    kind: 'danger',
-    confirmText: '删除',
-    cancelText: '取消',
-  })
-  if (!ok) return
-  try {
-    await deleteMaintenance(w.id)
-    await loadMaint()
-  } catch (e) {
-    error.value = e?.message || '删除失败'
-  }
-}
-
-// ===== OTA =====
-async function loadOta() {
-  try {
-    otaTasks.value = await fetchOtaTasks(50)
-  } catch {
-    otaTasks.value = []
-  }
-  // 有进行中的任务时 10s 轮询（节点重连/超时收敛后状态会变化），空闲即停
-  if (otaTasks.value.some((t) => t.status === 'dispatched')) {
-    if (!otaTimer) otaTimer = setInterval(loadOta, 10000)
-  } else if (otaTimer) {
-    clearInterval(otaTimer)
-    otaTimer = null
-  }
-}
-
-function openOta(n) {
-  ota.show = true
-  ota.nodeId = n.nodeId
-  ota.nodeLabel = n.label || n.nodeId
-  ota.mode = 'version'
-  ota.version = ''
-  ota.url = ''
-  ota.sha256 = ''
-  ota.err = ''
-  ota.msg = ''
-}
-
-async function submitOta() {
-  const payload = { sha256: ota.sha256 }
-  if (ota.mode === 'version') {
-    if (!ota.version) { ota.err = '请填写目标版本'; return }
-    payload.version = ota.version
-  } else {
-    if (!ota.url) { ota.err = '请填写下载地址'; return }
-    payload.url = ota.url
-  }
-  ota.busy = true; ota.err = ''; ota.msg = ''
-  try {
-    const d = await dispatchNodeOta(ota.nodeId, payload)
-    ota.msg = d.hint || '已下发'
-    await loadOta()
-  } catch (e) {
-    ota.err = e?.message || '下发失败'
-  } finally {
-    ota.busy = false
-  }
-}
+watch(tab, async (t) => t !== 'pool' && (live.value = await api.fetchNodes()))
+onMounted(load)
 </script>
 
-<style scoped>
-/* 旧版节点提示：贴在卡片上，按严重程度着色 */
-.node-card .node-note { font-size: 0.75rem; line-height: 1.4; word-break: break-all; }
-.node-card .node-note.ok { color: var(--ak-signal-success); }
-.node-card .node-note.warn { color: var(--ak-signal-info); }
-.node-card .node-note.err { color: var(--ak-signal-danger); }
-/* 可用率的高低三档（卡片与抽屉共用）；类名加 up- 前缀，
-   避免与旧版节点提示的 .warn 撞车（两者都可能出现在 .node-meta 上） */
-.node-card .node-meta .up-ok, .upt-sum .up-ok { color: var(--ak-signal-success); }
-.node-card .node-meta .up-warn, .upt-sum .up-warn { color: var(--ak-signal-warn); }
-.node-card .node-meta .up-bad, .upt-sum .up-bad { color: var(--ak-signal-danger); }
-
-/* ===== 维护窗口 ===== */
-.maint-form {
-  display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px;
-  padding: 12px 0 14px; border-bottom: 1px solid var(--ui-line); margin-bottom: 12px;
-}
-.maint-hint { font-size: .75rem; line-height: 1.5; margin: -6px 0 12px; }
-.upt-sum { display: flex; flex-wrap: wrap; gap: 16px; font-size: .82rem; margin: 12px 0 4px; }
-/* 趋势抽屉里的统计窗口切换行（紧跟标题栏，图上方） */
-.upt-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.upt-bar .dim { font-size: .72rem; }
-
-/* ===== OTA ===== */
-.ota-head {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  margin-bottom: 12px;
-}
-.ota-head .panel-title { margin: 0; }
-.ota-status {
-  font-size: .75rem; padding: 2px 8px; border-radius: 3px;
-  background: var(--ui-tint);
-}
-.ota-status.dispatched { background: color-mix(in srgb, var(--ak-signal-info) 18%, transparent); color: var(--ak-signal-info); }
-.ota-status.success { background: color-mix(in srgb, var(--ak-signal-success) 18%, transparent); color: var(--ak-signal-success); }
-.ota-status.failed { background: color-mix(in srgb, var(--ak-signal-danger) 18%, transparent); color: var(--ak-signal-danger); }
-.dlg-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
-.switch-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.switch-row .ak-label { min-width: 56px; }
-.ak-toggle {
-  border: var(--ak-line-hairline) solid var(--ui-line-ctl);
-  background: transparent;
-  color: var(--ak-text-secondary);
-  font-size: 0.72rem;
-  padding: 2px 10px;
-  border-radius: 10px;
-  cursor: pointer;
-}
-.ak-toggle.on { color: var(--ak-signal-success); border-color: currentColor; }
-
-.ev-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  z-index: 50;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-}
-.ev-panel {
-  width: min(640px, 100%);
-  background: var(--ak-surface-inverse);
-  border: var(--ak-line-hairline) solid var(--ui-line-strong);
-  border-top: 3px solid var(--ak-signal-info);
-  padding: 16px 18px;
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-}
-.ev-head { display: flex; align-items: center; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--ui-line); }
-</style>

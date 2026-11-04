@@ -1,186 +1,203 @@
-// ==================== ipw-boce /admin 接口封装 ====================
-import { http, downloadFile } from './http.js'
+// ==================== 后端接口封装 ====================
+import { http, API_BASE, getToken, ApiError } from './http.js'
 
-// 服务状态
+const enc = encodeURIComponent
+const winQ = (w = 24) => (typeof w === 'string' ? w : `hours=${w}`)
+
+// ---- 账号 ----
+export const login = (username, password, extra = {}) => http.post('/admin/login', { username, password, ...extra })
+export const sendRegisterCode = (email, username, extra = {}) => http.post('/admin/register/send-code', { email, username, ...extra })
+export const register = (p) => http.post('/admin/register', p)
 export const fetchStatus = () => http.get('/admin/status')
 
-// ===== 公开注册 / 邮箱验证码 =====
-export const sendRegisterCode = (email, username) =>
-  http.post('/admin/register/send-code', { email, username })
-export const register = ({ username, password, email, code }) =>
-  http.post('/admin/register', { username, password, email, code })
-// 登录后补验证（本人邮箱）：发码 / 提交
+// ---- 个人资料 ----
+export const fetchMe = () => http.get('/admin/me')
+export const updateMe = (patch) => http.patch('/admin/me', patch)
+export const changePassword = (oldPassword, newPassword) => http.patch('/admin/me/password', { oldPassword, newPassword })
 export const sendVerifyCode = () => http.post('/admin/me/verify/send')
 export const submitVerifyCode = (code) => http.post('/admin/me/verify', { code })
-
-// 节点快照 / 事件
-export const fetchNodes = () => http.get('/admin/nodes')
-export const fetchNodeEvents = (nodeId, limit = 100) =>
-  http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/events?limit=${limit}`)
-// 节点可用率（由 node_events 事件流还原离线区间算得，见 node_uptime.go）
-// 列表：全部节点（不含逐日明细）；detail：单节点（含 daily 供趋势图）
-export const fetchNodesUptime = (days = 7) => http.get(`/admin/nodes/uptime?days=${days}`)
-export const fetchNodeUptime = (nodeId, days = 7) =>
-  http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/uptime?days=${days}`)
-// 节点事件历史导出 CSV（浏览器直接下载，带鉴权头）
-export const exportNodeEvents = (nodeId, days = 30) =>
-  downloadFile(
-    `/admin/nodes/${encodeURIComponent(nodeId)}/events/export?days=${days}`,
-    `node-events-${nodeId}.csv`,
-  )
-
-// ===== 计划维护窗口（节点告警免打扰，见 maintenance.go）=====
-// 只屏蔽通知、不屏蔽事实：事件流/状态页/可用率统计不受影响
-export const fetchMaintenance = () => http.get('/admin/maintenance')
-// { scope?, startAt, endAt, repeatDaily?, reason? }；scope 空 = 全部节点
-export const createMaintenance = (w) => http.post('/admin/maintenance', w)
-export const deleteMaintenance = (id) => http.del(`/admin/maintenance/${id}`)
-// 节点简表（登录即可，脱敏：池内节点 + 在线/版本，无远端地址）——任务表单"指定节点"勾选用
-export const fetchNodesBrief = () => http.get('/admin/nodes/brief')
-
-// 我的用量（本人任务的 sched 样本 + 本人发起的 biz 拨测，按 apiType 聚合）
-export const fetchMyUsage = (hours = 24) => http.get(`/admin/me/usage?hours=${hours}`)
-// 测试本人 webhook（向自配地址推一条测试消息）
-export const testMyWebhook = () => http.post('/admin/me/webhook/test')
-// 个人 API Token：明文仅在生成响应里返回一次；重复生成使旧 token 立即失效
 export const createMyToken = () => http.post('/admin/me/token')
 export const revokeMyToken = () => http.del('/admin/me/token')
+export const testWebhook = () => http.post('/admin/me/webhook/test')
+export const fetchMyUsage = (h = 24) => http.get(`/admin/me/usage?hours=${h}`)
 
-// 统计（nodes 为节点 ID 数组，空/不传 = 全部节点）
-const nodesQS = (nodes) => (nodes && nodes.length ? `&nodes=${encodeURIComponent(nodes.join(','))}` : '')
-// 时间窗口参数：数字 = 相对窗口（hours=N，终点恒为“现在”）；
-// 字符串 = 原样拼接（start=/end= 绝对区间，见 utils/timeRange.js 与后端 timerange.go）。
-const winQ = (w, def = 24) => (typeof w === 'string' ? w : `hours=${w ?? def}`)
-export const fetchStatsSummary = (w = 24, nodes = []) =>
-  http.get(`/admin/stats/summary?${winQ(w)}${nodesQS(nodes)}`)
-export const fetchStatsTimeseries = (w = 24, nodes = []) =>
-  http.get(`/admin/stats/timeseries?${winQ(w)}${nodesQS(nodes)}`)
-// 数据可用范围：{ now, earliest, maxDays, retention }——时间范围选择器据此裁剪预设清单
-export const fetchTimeRange = () => http.get('/admin/stats/range')
+// ---- 站内信 ----
+export const fetchNotices = () => http.get('/admin/notices?limit=50')
+export const fetchUnread = () => http.get('/admin/notices/unread')
+export const markNoticesRead = (ids) => http.post('/admin/notices/read', ids?.length ? { ids } : {})
+export const clearNotices = () => http.del('/admin/notices')
 
-// 拨测明细（cat：sched=定时拨测 / biz=业务拨测）
-export const fetchProbes = ({ node, type, cat, since, target, limit = 100 } = {}) => {
-  const q = new URLSearchParams()
-  if (node) q.set('node', node)
-  if (type) q.set('type', type)
-  if (cat) q.set('cat', cat)
-  if (since) q.set('since', since)
-  if (target) q.set('target', target)
-  q.set('limit', limit)
-  return http.get(`/admin/probes?${q.toString()}`)
-}
+// ---- 节点 ----
+export const fetchNodes = () => http.get('/admin/nodes')
+export const fetchNodesBrief = () => http.get('/admin/nodes/brief')
+export const fetchNodeEvents = (id) => http.get(`/admin/nodes/${enc(id)}/events?limit=50`)
+export const deleteNodeSnapshot = (id) => http.del(`/admin/nodes/${enc(id)}`)
+export const fetchNodeDefs = () => http.get('/admin/node-defs')
+export const fetchUnconfigured = () => http.get('/admin/node-defs/online')
+export const createNodeDef = (n) => http.post('/admin/node-defs', n)
+export const updateNodeDef = (id, n) => http.put(`/admin/node-defs/${id}`, n)
+export const deleteNodeDef = (id) => http.del(`/admin/node-defs/${id}`)
 
-// 拨测明细导出 CSV：参数与列表完全一致（含权限范围），只是改为下载
-export const exportProbes = ({ node, type, cat, since, target, limit } = {}) => {
-  const q = new URLSearchParams()
-  if (node) q.set('node', node)
-  if (type) q.set('type', type)
-  if (cat) q.set('cat', cat)
-  if (since) q.set('since', since)
-  if (target) q.set('target', target)
-  if (limit) q.set('limit', limit)
-  const qs = q.toString()
-  return downloadFile(`/admin/probes/export${qs ? `?${qs}` : ''}`, 'probes.csv')
-}
-
-// 一键拨测（批量）
+// ---- 拨测 ----
 export const runBatchProbe = (apiType, raw, nodes, query = {}) => {
-  // raw 直接拼进路径（后端 /admin/nodes/probe/:apiType/*raw 按 middlewareHandler slug 语义
-  // 处理：detail/ssl 的目标完整 URL 含 '://'，gin 通配原样接收、去前导 / 还原）
-  const path = `/admin/nodes/probe/${apiType}/${raw}`
   const q = new URLSearchParams()
-  Object.entries(query).forEach(([k, v]) => { if (v !== '' && v != null) q.set(k, v) })
+  Object.entries(query).forEach(([k, v]) => v !== '' && v != null && q.set(k, v))
   const qs = q.toString()
-  return http.post(path + (qs ? `?${qs}` : ''), nodes && nodes.length ? { nodes } : {})
+  return http.post(`/admin/nodes/probe/${apiType}/${raw}${qs ? `?${qs}` : ''}`, nodes?.length ? { nodes } : {})
+}
+export const fetchProbes = (f = {}) => {
+  const q = new URLSearchParams()
+  Object.entries(f).forEach(([k, v]) => v && q.set(k, v))
+  return http.get(`/admin/probes?${q}`)
 }
 
-// 配置分发
+// ---- 统计 ----
+export const fetchStatsSummary = (w) => http.get(`/admin/stats/summary?${winQ(w)}`)
+export const fetchStatsTimeseries = (w) => http.get(`/admin/stats/timeseries?${winQ(w)}`)
+
+// ---- 托管配置 ----
 export const fetchNodeConfigs = () => http.get('/admin/node-configs')
-export const fetchNodeConfig = (nodeId) => http.get(`/admin/node-configs/${encodeURIComponent(nodeId)}`)
-export const putNodeConfig = (nodeId, obj) =>
-  http.put(`/admin/node-configs/${encodeURIComponent(nodeId)}`, obj)
-export const deleteNodeConfig = (nodeId) =>
-  http.del(`/admin/node-configs/${encodeURIComponent(nodeId)}`)
-// 查看某节点合并后的远端配置（global 底 + 节点覆盖）
-export const fetchResolvedConfig = (nodeId) => http.get(`/remote-config/${encodeURIComponent(nodeId)}`)
-// 把运行时配置改动合并进节点托管配置（持久化：重启后远端配置 > ENV > setting.json）
-export const mergeNodeHostedConfig = (nodeId, config) =>
-  http.post(`/admin/node-configs/${encodeURIComponent(nodeId)}/merge`, { config })
+export const fetchNodeConfig = (id) => http.get(`/admin/node-configs/${enc(id)}`)
+export const putNodeConfig = (id, obj) => http.put(`/admin/node-configs/${enc(id)}`, obj)
+export const deleteNodeConfig = (id) => http.del(`/admin/node-configs/${enc(id)}`)
 
-// 节点运行时配置（节点进程当前生效值，WS 优先 / HTTP 回退；区别于上面「托管配置」）
-export const fetchNodeRuntimeConfig = (nodeId) =>
-  http.get(`/admin/nodes/${encodeURIComponent(nodeId)}/config`)
-// payload: { action: 'patch' | 'refresh', config: {...}, persist: bool }
-export const applyNodeRuntimeConfig = (nodeId, payload) =>
-  http.post(`/admin/nodes/${encodeURIComponent(nodeId)}/config`, payload)
-
-// ===== 节点 OTA 升级（控制台下发，节点执行）=====
-// payload: { version?, url?, sha256? }（version 与 url 二选一）
-export const dispatchNodeOta = (nodeId, payload) =>
-  http.post(`/admin/nodes/${encodeURIComponent(nodeId)}/ota`, payload)
-// 最近 OTA 任务列表（节点重连上报新版本号即判定成功，见任务 hint）
-export const fetchOtaTasks = (limit = 50) => http.get(`/admin/ota-tasks?limit=${limit}`)
-
-// ===== 定时拨测任务 + SLA（source=sched）=====
+// ---- 任务 / SLA ----
 export const fetchTaskMeta = () => http.get('/admin/tasks/meta')
-export const fetchTasks = (tag) => http.get(`/admin/tasks${tag ? `?tag=${encodeURIComponent(tag)}` : ''}`)
-export const fetchTask = (id) => http.get(`/admin/tasks/${id}`)
+export const fetchTasks = () => http.get('/admin/tasks')
 export const createTask = (t) => http.post('/admin/tasks', t)
 export const updateTask = (id, t) => http.put(`/admin/tasks/${id}`, t)
 export const setTaskEnabled = (id, enabled) => http.patch(`/admin/tasks/${id}/enabled`, { enabled })
 export const deleteTask = (id) => http.del(`/admin/tasks/${id}`)
-// SLA 聚合：某任务在窗口内的可用率/延迟/错误率 + 最新样本特殊字段
-export const fetchTaskSla = (id, w = 24) => http.get(`/admin/tasks/${id}/sla?${winQ(w)}`)
-// 某任务的时序曲线（SLA 卡片延迟图）：{taskId,stepMinutes,series:[{time,samples,up,down,availability,avgMs}]}
-// node 传节点 id 时只返回该节点的曲线（多节点对比视图逐节点拉取叠加）
-export const fetchTaskSeries = (id, w = 24, node = '') =>
-  http.get(`/admin/tasks/${id}/series?${winQ(w)}${node ? `&node=${encodeURIComponent(node)}` : ''}`)
-// 曲线导出 CSV（同参数、同归属校验）
-export const exportTaskSeries = (id, w = 24, node = '') =>
-  downloadFile(
-    `/admin/tasks/${id}/series/export?${winQ(w)}${node ? `&node=${encodeURIComponent(node)}` : ''}`,
-    `sla-task-${id}.csv`,
-  )
-// 公开状态页分享（B3）：分享码即分享组——多选任务共用一个分享码；支持自定义分享码
-// shareTasks([ids], token?)：token 缺省随机 6 位 hex
-export const shareTasks = (ids, token) =>
-  http.post('/admin/tasks/share', { ids, token: token || undefined })
+export const fetchTaskSla = (id, w) => http.get(`/admin/tasks/${id}/sla?${winQ(w)}`)
+export const fetchTaskSeries = (id, w) => http.get(`/admin/tasks/${id}/series?${winQ(w)}`)
+export const fetchMineSeries = (w) => http.get(`/admin/tasks/mine/series?${winQ(w)}`)
+export const shareTasks = (ids, token) => http.post('/admin/tasks/share', { ids, token: token || undefined })
 export const unshareTasks = (ids) => http.del('/admin/tasks/share', { ids })
-// 我的定时任务时序（当前用户自己任务 source=sched 分桶）：{stepMinutes, series:[...]}
-export const fetchMineSeries = (w = 24) => http.get(`/admin/tasks/mine/series?${winQ(w)}`)
+export const fetchTaskShare = (id) => http.get(`/admin/tasks/${id}/share`)
+export const fetchPublicStatus = (token, h = 24) => http.get(`/api/public/status/${enc(token)}?hours=${h}`)
 
-// ===== 上游节点池（数据库托管，仅 admin）=====
-// 节点定义列表（含停用）
-export const fetchNodeDefs = () => http.get('/admin/node-defs')
-// 新增节点 {nodeId,label,url,ws,pool,stack,enabled,sortOrder}
-export const createNodeDef = (n) => http.post('/admin/node-defs', n)
-// 更新节点（按主键 id，未传字段保持原值）
-export const updateNodeDef = (id, patch) => http.put(`/admin/node-defs/${id}`, patch)
-export const deleteNodeDef = (id) => http.del(`/admin/node-defs/${id}`)
-// 已接入（WS 在线 / 在线快照）但库里没有节点定义的节点，供控制台补录下拉框
-export const fetchUnconfiguredNodes = () => http.get('/admin/node-defs/online')
-
-// ===== 用户管理（仅 admin）=====
+// ---- 用户 ----
 export const fetchUsers = () => http.get('/admin/users')
-export const createUser = (u) => http.post('/admin/users', u) // {username,password,role?,email?}
-export const updateUser = (id, patch) => http.patch(`/admin/users/${id}`, patch) // {email?,role?,enabled?}
+export const createUser = (u) => http.post('/admin/users', u)
+export const updateUser = (id, p) => http.patch(`/admin/users/${id}`, p)
 export const resetUserPassword = (id, password) => http.patch(`/admin/users/${id}/password`, { password })
 export const deleteUser = (id) => http.del(`/admin/users/${id}`)
 
-// ===== 个人资料（本人，登录即可）=====
-export const fetchMe = () => http.get('/admin/me')
-// PATCH /admin/me：{email?, webhookUrl?, webhookType?}，字段可选只更新传入项
-export const updateMeProfile = (patch) => http.patch('/admin/me', patch)
-export const updateMeEmail = (email) => http.patch('/admin/me', { email })
-export const changeMyPassword = (oldPassword, newPassword) =>
-  http.patch('/admin/me/password', { oldPassword, newPassword })
+// ---- 积分（用户） ----
+export const fetchPointsMe = () => http.get('/admin/points/me')
+export const fetchMyLedger = (offset = 0, limit = 30) => http.get(`/admin/points/ledger?offset=${offset}&limit=${limit}`)
+export const checkin = () => http.post('/admin/points/checkin')
+export const redeemPointsCode = (code) => http.post('/admin/points/redeem', { code })
+export const fetchProducts = () => http.get('/admin/shop/products')
+export const placeOrder = (productId, quantity, remark) => http.post('/admin/shop/orders', { productId, quantity, remark })
+export const fetchMyOrders = () => http.get('/admin/shop/orders')
 
-// ===== 站内信（本人，铃铛）=====
-// {list:[...], unread}
-export const fetchNotices = (limit = 50) => http.get(`/admin/notices?limit=${limit}`)
-// 仅取未读数
-export const fetchUnreadCount = () => http.get('/admin/notices/unread')
-// 标记已读：{ids?:[]}；缺省全已读；返回 {unread}
-export const markNoticesRead = (ids) => http.post('/admin/notices/read', ids && ids.length ? { ids } : {})
-// 清空本人全部通知
-export const clearNotices = () => http.del('/admin/notices')
+// ---- 积分（管理） ----
+export const fetchPointsSettings = () => http.get('/admin/points/admin/settings')
+export const savePointsSettings = (s) => http.put('/admin/points/admin/settings', s)
+export const fetchPointsOverview = () => http.get('/admin/points/admin/overview')
+export const adjustPoints = (p) => http.post('/admin/points/admin/adjust', p)
+export const fetchAllLedger = (f = {}) => {
+  const q = new URLSearchParams({ limit: 100, ...f })
+  return http.get(`/admin/points/admin/ledger?${q}`)
+}
+export const fetchAccounts = (q = '') => http.get(`/admin/points/admin/accounts?q=${enc(q)}`)
+export const fetchCodes = () => http.get('/admin/points/admin/codes')
+export const createCodes = (p) => http.post('/admin/points/admin/codes', p)
+export const toggleCode = (id, enabled) => http.patch(`/admin/points/admin/codes/${id}`, { enabled })
+export const deleteCode = (id) => http.del(`/admin/points/admin/codes/${id}`)
+export const fetchAdminProducts = () => http.get('/admin/shop/admin/products')
+export const createProduct = (p) => http.post('/admin/shop/admin/products', p)
+export const updateProduct = (id, p) => http.put(`/admin/shop/admin/products/${id}`, p)
+export const deleteProduct = (id) => http.del(`/admin/shop/admin/products/${id}`)
+export const resetProductSecret = (id) => http.post(`/admin/shop/admin/products/${id}/secret`)
+export const testProductWebhook = (id) => http.post(`/admin/shop/admin/products/${id}/test`)
+export const fetchCards = (id, state = '') => http.get(`/admin/shop/admin/products/${id}/cards?state=${state}`)
+export const importCards = (id, cards) => http.post(`/admin/shop/admin/products/${id}/cards`, { cards })
+export const deleteCard = (id) => http.del(`/admin/shop/admin/cards/${id}`)
+export const fetchAdminOrders = (f = {}) => {
+  const q = new URLSearchParams()
+  Object.entries(f).forEach(([k, v]) => v && q.set(k, v))
+  return http.get(`/admin/shop/admin/orders?${q}`)
+}
+export const deliverOrder = (id, content) => http.post(`/admin/shop/admin/orders/${id}/deliver`, { content })
+export const cancelOrder = (id, reason) => http.post(`/admin/shop/admin/orders/${id}/cancel`, { reason })
+export const retryOrder = (id) => http.post(`/admin/shop/admin/orders/${id}/retry`)
+
+// ---- 捐赠节点 ----
+export const fetchDonateMeta = () => http.get('/admin/donations/meta')
+export const fetchMyDonations = () => http.get('/admin/donations/mine')
+export const createDonation = (d) => http.post('/admin/donations', d)
+export const updateDonation = (id, d) => http.patch(`/admin/donations/${id}`, d)
+export const rotateDonationKey = (id) => http.post(`/admin/donations/${id}/rotate-key`)
+export const withdrawDonation = (id) => http.post(`/admin/donations/${id}/withdraw`)
+export const resetAgentToken = () => http.post('/admin/agent/token')
+
+// 系统设置 / 人机验证
+export const fetchPublicSite = () => http.get('/admin/public/site')
+export const fetchCaptcha = () => http.get('/admin/captcha')
+export const fetchSiteSettings = () => http.get('/admin/site-settings')
+export const saveSiteSettings = (s) => http.put('/admin/site-settings', s)
+export const sendTestMail = (to) => http.post('/admin/site-settings/test-mail', { to })
+// 弹窗图片上传：multipart，不能走 JSON 封装
+export async function uploadPopupImage(file) {
+  const fd = new FormData()
+  fd.append('file', file)
+  let resp
+  try {
+    resp = await fetch(API_BASE + '/admin/popup/image', { method: 'POST', headers: { Authorization: `Bearer ${getToken()}` }, body: fd })
+  } catch {
+    throw new ApiError(0, '网络错误，无法连接服务器')
+  }
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new ApiError(resp.status, data.statusMessage || `上传失败（${resp.status}）`)
+  return data
+}
+export const fetchAdminDonations = (f = {}) => {
+  const q = new URLSearchParams()
+  Object.entries(f).forEach(([k, v]) => v && q.set(k, v))
+  return http.get(`/admin/donations/admin?${q}`)
+}
+export const reviewDonation = (id, action, note) => http.post(`/admin/donations/admin/${id}/review`, { action, note })
+export const settleDonations = (date) => http.post('/admin/donations/admin/settle', date ? { date } : {})
+
+// ---- 节点运维 ----
+export const fetchNodesUptime = (days = 7) => http.get(`/admin/nodes/uptime?days=${days}`)
+export const fetchNodeUptime = (id, days = 7) => http.get(`/admin/nodes/${enc(id)}/uptime?days=${days}`)
+export const fetchNodeRuntimeConfig = (id) => http.get(`/admin/nodes/${enc(id)}/config`)
+export const applyNodeRuntimeConfig = (id, p) => http.post(`/admin/nodes/${enc(id)}/config`, p)
+export const mergeHostedConfig = (id, config) => http.post(`/admin/node-configs/${enc(id)}/merge`, { config })
+export const dispatchOta = (id, p) => http.post(`/admin/nodes/${enc(id)}/ota`, p)
+export const fetchOtaTasks = () => http.get('/admin/ota-tasks?limit=100')
+export const fetchMaintenance = () => http.get('/admin/maintenance')
+export const createMaintenance = (w) => http.post('/admin/maintenance', w)
+export const deleteMaintenance = (id) => http.del(`/admin/maintenance/${id}`)
+
+// ---- CSV 导出（带鉴权头，fetch 成 Blob 下载） ----
+export async function download(path) {
+  const resp = await fetch(API_BASE + path, { headers: { Authorization: `Bearer ${getToken()}` } })
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`
+    try {
+      const j = await resp.json()
+      msg = j.statusMessage || j.error?.message || msg
+    } catch {}
+    throw new ApiError(resp.status, msg)
+  }
+  const cd = resp.headers.get('Content-Disposition') || ''
+  const name = /filename="?([^";]+)"?/.exec(cd)?.[1] || 'export.csv'
+  const url = URL.createObjectURL(await resp.blob())
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+export const qs = (o = {}) => {
+  const q = new URLSearchParams()
+  Object.entries(o).forEach(([k, v]) => v !== '' && v != null && q.set(k, v))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}

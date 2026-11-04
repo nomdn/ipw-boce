@@ -1,66 +1,50 @@
 <template>
-  <div ref="el" class="chart-box" :style="boxStyle"></div>
+  <div ref="el" :style="{ height: height + 'px', width: '100%' }" />
 </template>
 
 <script setup>
-// 通用 ECharts 封装：传 option 即渲染，DOM 尺寸变化自动 resize
-import { ref, onMounted, onBeforeUnmount, watch, computed, shallowRef } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts/core'
-// ScatterChart：失败轮次标记（SlaView 趋势图顶部条带）使用；按需注册漏了会被 ECharts 静默丢弃
-import { LineChart, BarChart, PieChart, ScatterChart } from 'echarts/charts'
-import {
-  GridComponent, TooltipComponent, LegendComponent,
-  DataZoomComponent, TitleComponent,
-  MarkAreaComponent, MarkLineComponent, MarkPointComponent,
-} from 'echarts/components'
+import { LineChart, BarChart } from 'echarts/charts'
+import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import { useTheme } from '../composables/useTheme.js'
 
-echarts.use([
-  LineChart, BarChart, PieChart, ScatterChart,
-  GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, TitleComponent,
-  MarkAreaComponent, MarkLineComponent, MarkPointComponent,
-  CanvasRenderer,
-])
+echarts.use([LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer])
 
-const props = defineProps({
-  option: { type: Object, required: true },
-  height: { type: String, default: '' },
-})
-const boxStyle = computed(() => (props.height ? { height: props.height } : {}))
-
+const props = defineProps({ option: { type: Object, required: true }, height: { type: Number, default: 240 } })
 const el = ref(null)
-const chart = shallowRef(null)
-let ro = null
+const { theme } = useTheme()
+let chart
+let ro
 
 function render() {
-  if (!chart.value) return
-  chart.value.setOption(props.option, true)
-}
-function ensure() {
-  if (!chart.value && el.value) {
-    chart.value = echarts.init(el.value)
-    render()
+  if (!chart) return
+  const dark = theme.value === 'dark'
+  const axis = { axisLine: { lineStyle: { color: dark ? '#444' : '#ddd' } }, axisLabel: { color: dark ? '#aaa' : '#777' }, splitLine: { lineStyle: { color: dark ? '#2f2f2f' : '#f0f0f0' } } }
+  // 黑白灰阶色板：主线为前景色，其余依次变浅；失败相关系列可在 option 里单独指定红色
+  const palette = dark ? ['#ececec', '#8e8e8e', '#5d5d5d', '#b4b4b4', '#3f3f3f'] : ['#0d0d0d', '#8f8f8f', '#c4c4c4', '#5d5d5d', '#e0e0e0']
+  const opt = {
+    backgroundColor: 'transparent', color: palette, textStyle: { fontFamily: 'inherit' },
+    animationDuration: 600, animationEasing: 'cubicOut',
+    tooltip: { backgroundColor: dark ? '#2f2f2f' : '#fff', borderColor: dark ? '#383838' : '#e5e5e5', textStyle: { color: dark ? '#ececec' : '#0d0d0d' } },
+    ...props.option,
   }
+  if (opt.xAxis) opt.xAxis = { ...axis, ...opt.xAxis }
+  if (opt.yAxis) opt.yAxis = Array.isArray(opt.yAxis) ? opt.yAxis.map((y) => ({ ...axis, ...y })) : { ...axis, ...opt.yAxis }
+  chart.setOption(opt, true)
 }
-
-watch(() => props.option, render, { deep: true })
 
 onMounted(() => {
-  ensure()
-  if (el.value && typeof ResizeObserver !== 'undefined') {
-    ro = new ResizeObserver(() => chart.value?.resize())
-    ro.observe(el.value)
-  }
-  window.addEventListener('resize', onWinResize)
+  chart = echarts.init(el.value)
+  render()
+  ro = new ResizeObserver(() => chart?.resize())
+  ro.observe(el.value)
 })
 onBeforeUnmount(() => {
   ro?.disconnect()
-  window.removeEventListener('resize', onWinResize)
-  chart.value?.dispose()
-  chart.value = null
+  chart?.dispose()
 })
-function onWinResize() {
-  chart.value?.resize()
-}
-defineExpose({ getChart: () => chart.value })
+watch(() => props.option, render, { deep: true })
+watch(theme, render)
 </script>

@@ -1,89 +1,83 @@
-// ==================== 登录态（Pinia） ====================
-// 持久化 token + 当前用户元信息（username/role/email/userId），刷新后仍能恢复侧边菜单显隐。
-// 说明：角色仅用于前端菜单显隐；真正的权限收紧在后端 adminOnly 中间件。
+// 登录态：token + 用户元信息持久化（角色只用于菜单显隐，权限以后端为准）
 import { defineStore } from 'pinia'
-import { http, getToken, setToken, setOnUnauthorized } from '../api/http.js'
+import { getToken, setToken, setOnUnauthorized } from '../api/http.js'
+import * as api from '../api/boce.js'
 
 const META_KEY = 'ipw_boce_meta'
-const META_FIELDS = ['userId', 'username', 'role', 'email', 'emailVerified']
-
-function readMeta() {
+const readMeta = () => {
   try {
     return JSON.parse(localStorage.getItem(META_KEY) || '{}')
   } catch {
     return {}
   }
 }
-function writeMeta(obj) {
-  const meta = {}
-  for (const k of META_FIELDS) if (obj[k] !== undefined) meta[k] = obj[k]
-  localStorage.setItem(META_KEY, JSON.stringify(meta))
-}
-function clearMeta() {
-  localStorage.removeItem(META_KEY)
-}
 
 export const useAuthStore = defineStore('auth', {
   state: () => {
-    const meta = readMeta()
+    const m = readMeta()
     return {
       token: getToken(),
-      userId: meta.userId || null,
-      username: meta.username || '',
-      role: meta.role || '',
-      email: meta.email || '',
-      emailVerified: meta.emailVerified === undefined ? true : !!meta.emailVerified,
-      expiresAt: null,
+      userId: m.userId ?? null,
+      username: m.username || '',
+      role: m.role || '',
+      email: m.email || '',
+      emailVerified: m.emailVerified !== false,
+      points: 0,
+      currencyName: '积分',
     }
   },
   getters: {
     isAuthed: (s) => !!s.token,
-    isAdmin: (s) => (s.role ? s.role === 'admin' : true), // 无 role 的旧会话(升级前仅单一 admin)视为 admin
-    // 邮箱待验证：普通账号填了邮箱但未验证（限制 SLA）；admin/无邮箱不视为待验证
-    emailPending: (s) => !!s.email && s.emailVerified === false,
+    isAdmin: (s) => s.role === 'admin',
+    emailPending: (s) => !!s.email && s.emailVerified === false && s.role !== 'admin',
   },
   actions: {
-    async login(username, password) {
-      const data = await http.post('/admin/login', { username, password })
-      this.token = data.token
-      this.userId = data.userId ?? this.userId
-      this.username = data.username || username
-      this.role = data.role || 'user'
-      this.email = data.email || ''
-      this.emailVerified = data.emailVerified === undefined ? true : !!data.emailVerified
-      this.expiresAt = data.expiresAt || null
-      setToken(data.token)
-      writeMeta(this.$state)
+    persist() {
+      const { userId, username, role, email, emailVerified } = this
+      localStorage.setItem(META_KEY, JSON.stringify({ userId, username, role, email, emailVerified }))
+    },
+    async login(username, password, extra) {
+      const d = await api.login(username, password, extra)
+      this.token = d.token
+      setToken(d.token)
+      Object.assign(this, {
+        userId: d.userId,
+        username: d.username,
+        role: d.role || 'user',
+        email: d.email || '',
+        emailVerified: d.emailVerified !== false,
+      })
+      this.persist()
+      this.refreshPoints()
     },
     logout() {
       this.token = ''
-      this.userId = null
-      this.username = ''
-      this.role = ''
-      this.email = ''
-      this.emailVerified = true
-      this.expiresAt = null
       setToken('')
-      clearMeta()
+      localStorage.removeItem(META_KEY)
+      Object.assign(this, { userId: null, username: '', role: '', email: '', emailVerified: true, points: 0 })
     },
-    // 本人密码/邮箱在"个人资料"页更新后，同步前端登录态与本地元信息
-    refreshMeta(meta) {
-      if (meta.email !== undefined) this.email = meta.email
-      if (meta.emailVerified !== undefined) this.emailVerified = !!meta.emailVerified
-      if (meta.username !== undefined) this.username = meta.username
-      if (meta.role !== undefined) this.role = meta.role
-      writeMeta(this.$state)
+    refreshMeta(m) {
+      for (const k of ['email', 'emailVerified', 'username', 'role']) if (m[k] !== undefined) this[k] = m[k]
+      this.persist()
+    },
+    async refreshPoints() {
+      try {
+        const p = await api.fetchPointsMe()
+        this.points = p.balance
+        this.currencyName = p.rules?.currencyName || '积分'
+        return p
+      } catch {
+        return null
+      }
     },
   },
 })
 
-// 注入 401 处理：任何接口 401 即登出（不清路由，交给路由守卫跳登录）
 export function installAuthGuard(router) {
   const auth = useAuthStore()
   setOnUnauthorized(() => {
     auth.logout()
-    if (router.currentRoute.value.name !== 'login') {
-      router.push({ name: 'login', query: { redirect: router.currentRoute.value.fullPath } })
-    }
+    const cur = router.currentRoute.value
+    if (!cur.meta.public) router.push({ name: 'login', query: { redirect: cur.fullPath } })
   })
 }
